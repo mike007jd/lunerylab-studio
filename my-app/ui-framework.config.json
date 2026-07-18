@@ -1,0 +1,29 @@
+{
+  "requiredFiles": [
+    "../docs/UI_FRAMEWORK_STACK.md",
+    "../docs/design/.luna-dna-brief.md",
+    "../docs/design/surfaces/studio.md",
+    "../docs/design/surfaces/settings.md",
+    "../docs/design/surfaces/canvas.md",
+    "../docs/design/surfaces/library.md",
+    "components/design-system/README.md",
+    "components/design-system/index.ts",
+    "components/design-system/primitives/index.ts",
+    "components/design-system/grammar/tokens.ts",
+    "components/design-system/grammar/motion.ts",
+    "components/design-system/shell/index.ts",
+    "components/design-system/assistant/index.ts",
+    "components/design-system/surfaces/index.ts"
+  ],
+  "baselines": {
+    "rawColor": 24,
+    "arbitraryUtility": 142,
+    "bareButton": 0,
+    "nonSemanticPalette": 0,
+    "secondStylingSystem": 0,
+    "framerDurationLiteral": 0,
+    "framerEaseLiteral": 0,
+    "rawCubicBezier": 0,
+    "transitionAll": 1
+  }
+}

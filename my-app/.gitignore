@@ -1,0 +1,58 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next.js
+.next/
+out/
+
+# typescript incremental build cache (regenerable, ~450 KB)
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# production
+build/
+
+# env files
+.env
+.env.local
+.env.*.local
+
+# database
+prisma/dev.db
+prisma/dev.db-journal
+*.db
+*.db-journal
+
+# generated data
+data/uploads/
+data/generated/
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# turbo
+.turbo/
+.vercel
+
+# tauri
+src-tauri/target/
+desktop-dist/
+desktop-server/
+.desktop-dev/
+/engine/*
+!/engine/licenses/
+!/engine/licenses/*-LICENSE

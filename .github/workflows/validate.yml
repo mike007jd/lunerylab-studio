@@ -1,0 +1,71 @@
+name: validate
+
+# Private repository CI runs Web gates on Deck Linux and desktop gates on the
+# dedicated Apple Silicon runner. Fork PRs never execute on either persistent
+# machine; the independent lanes run in parallel.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_call: {}
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: Web product gates
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, deck-ci]
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: my-app
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+      - name: Run Web gates under the Deck host lock
+        run: |
+          mkdir -p "$HOME/.cache"
+          flock --verbose --wait 1800 "$HOME/.cache/deck-ci.lock" bash -eo pipefail <<'DECK_CI'
+            pnpm install --frozen-lockfile
+            pnpm prisma:generate
+            pnpm verify
+            # pnpm 10 still calls npm's retired legacy audit endpoint. Keep pnpm
+            # 10 for install/build compatibility and use the pinned current CLI
+            # only for these read-only bulk-advisory checks.
+            corepack pnpm@11.13.1 --pm-on-fail=ignore audit --prod --audit-level moderate
+            corepack pnpm@11.13.1 --pm-on-fail=ignore audit --audit-level moderate
+            pnpm build
+          DECK_CI
+
+  desktop:
+    name: Desktop Rust gates
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, ecommerceai]
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: my-app
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm desktop:check

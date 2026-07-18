@@ -1,0 +1,445 @@
+// Current schema baseline for the local-first desktop Studio.
+// There is no production database compatibility contract in this prelaunch
+// codebase; the checked-in baseline SQL exists so the desktop runtime can
+// initialize its local PGlite database from a known current shape.
+//
+//     pnpm exec prisma generate       # regenerate client (build runs this)
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum ProjectCategory {
+  STUDIO
+}
+
+enum JobSource {
+  STUDIO
+  TOOL
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  PARTIAL
+  FAILED
+}
+
+enum AssetKind {
+  REFERENCE
+  GENERATED
+}
+
+enum AssetModality {
+  IMAGE
+  VIDEO
+  MODEL_3D
+}
+
+enum ContentOrigin {
+  USER
+  TEMPLATE
+}
+
+enum CanvasSessionStatus {
+  EDITING
+  GENERATING
+  DONE
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Platform-level config (admin only)
+// ---------------------------------------------------------------------------
+
+model AppState {
+  id        String   @id @default("singleton")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Single implicit local owner.
+// ---------------------------------------------------------------------------
+
+model User {
+  id        String   @id
+  email     String   @unique
+  name      String?
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  settings       UserSettings?
+  projects       Project[]
+  jobs           GenerationJob[]
+  assets         Asset[]
+  canvasSessions CanvasSession[]
+  agentTasks     AgentTask[]
+}
+
+model UserSettings {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  defaultLocale     String   @default("en")
+  // No hardcoded default model: empty means "user has not picked a model yet".
+  // The product is local-first / BYOK / account-less, so generation must never
+  // silently fall back to a model the user did not choose.
+  defaultTextModel  String   @default("")
+  defaultImageModel String   @default("")
+  defaultVideoModel String   @default("")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Project
+// ---------------------------------------------------------------------------
+
+model Project {
+  id               String          @id @default(cuid())
+  userId           String
+  name             String
+  category         ProjectCategory
+  isTemplate       Boolean         @default(false)
+  templateKey      String?         @unique
+  sourceTemplateId String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs             GenerationJob[]
+  assets           Asset[]
+  canvasSessions   CanvasSession[]
+  referenceSets    ReferenceSet[]
+  sourceTemplate   Project?        @relation("ProjectTemplateCopies", fields: [sourceTemplateId], references: [id], onDelete: SetNull)
+  templateCopies   Project[]       @relation("ProjectTemplateCopies")
+
+  @@index([userId, category, createdAt])
+  @@index([userId, isTemplate, updatedAt])
+  @@index([sourceTemplateId])
+}
+
+// ---------------------------------------------------------------------------
+// Reference Set — project-scoped persistent creative context.
+//
+// ReferenceSet: named bundles of reference assets the user pins for repeated
+//            use ("Spring 2026 mood board", "Hero object 5-view"). One set
+//            can be marked default per project; the agent attaches it by
+//            default for image-edit-capable generation.
+// ---------------------------------------------------------------------------
+
+model ReferenceSet {
+  id          String              @id @default(cuid())
+  projectId   String
+  name        String
+  description String?
+  isDefault   Boolean             @default(false)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  project     Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assets      ReferenceSetAsset[]
+
+  @@index([projectId, createdAt])
+  @@index([projectId, isDefault])
+}
+
+/// Ordered membership of an asset in a reference set. Replaces the former
+/// `ReferenceSet.assetIds String[]`: a real FK to Asset (onDelete Cascade) means
+/// purging an asset removes its memberships automatically — no dangling ids —
+/// and `position` preserves the user's ordering.
+model ReferenceSetAsset {
+  id             String       @id @default(cuid())
+  referenceSetId String
+  assetId        String
+  position       Int
+  createdAt      DateTime     @default(now())
+  referenceSet   ReferenceSet @relation(fields: [referenceSetId], references: [id], onDelete: Cascade)
+  asset          Asset        @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([referenceSetId, assetId])
+  @@index([referenceSetId, position])
+  @@index([assetId])
+}
+
+// ---------------------------------------------------------------------------
+// Generation Job
+// ---------------------------------------------------------------------------
+
+model GenerationJob {
+  id                 String     @id @default(cuid())
+  userId             String
+  projectId          String?
+  agentTaskId        String?
+  source             JobSource
+  origin             ContentOrigin @default(USER)
+  toolType           String?
+  prompt             String
+  referenceCount     Int
+  requestedCount     Int
+  successCount       Int        @default(0)
+  status             JobStatus  @default(PENDING)
+  provider           String
+  model              String
+  /// Concrete runtime endpoint actually used (e.g. a local ComfyUI URL), when
+  /// the backend has one. Null for embedded/BYOK backends without a URL.
+  endpoint           String?
+  errorCode          String?
+  errorMessage       String?
+  type               String     @default("image")
+  idempotencyKey     String?    @unique
+  requestFingerprint String?
+  videoDuration      Int?
+  createdAt          DateTime   @default(now())
+  completedAt        DateTime?
+  user               User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project            Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  assets             Asset[]
+  agentTask          AgentTask? @relation(fields: [agentTaskId], references: [id], onDelete: SetNull)
+
+  @@index([userId, projectId, createdAt])
+  @@index([status])
+  @@index([projectId])
+  @@index([projectId, origin, createdAt])
+  @@index([agentTaskId])
+}
+
+// ---------------------------------------------------------------------------
+// Asset
+// ---------------------------------------------------------------------------
+
+model Asset {
+  id                 String          @id @default(cuid())
+  userId             String
+  projectId          String?
+  jobId              String
+  agentTaskId        String?
+  parentAssetId      String?
+  kind               AssetKind
+  origin             ContentOrigin     @default(USER)
+  /// Asset modality — IMAGE (default, existing rows) / VIDEO / MODEL_3D.
+  modality           AssetModality   @default(IMAGE)
+  storagePath        String
+  mimeType           String
+  byteSize           Int
+  width              Int?
+  height             Int?
+  /// Free-form format hint for non-image assets (e.g. "glb", "obj", "mp4").
+  format             String?
+  /// Duration in seconds for video assets, null otherwise.
+  durationSeconds    Float?
+  /// Free-form tags the user attaches for cross-project search.
+  tags               String[]        @default([])
+  /// Pinned to top in Library; favorite assets shortcut common reuse.
+  isFavorite         Boolean         @default(false)
+  /// Optional one-line note for the user's own bookkeeping.
+  note               String?
+  summary            String?
+  deletedAt          DateTime?
+  createdAt          DateTime        @default(now())
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project            Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  job                GenerationJob   @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  selectedInSessions CanvasSession[] @relation("CanvasSelectedAsset")
+  canvasLayers       CanvasLayer[]   @relation("CanvasLayerAsset")
+  agentTask          AgentTask?      @relation(fields: [agentTaskId], references: [id], onDelete: SetNull)
+  parentAsset        Asset?          @relation("AssetDerivatives", fields: [parentAssetId], references: [id], onDelete: SetNull)
+  derivatives        Asset[]         @relation("AssetDerivatives")
+  referenceSetLinks  ReferenceSetAsset[]
+
+  @@index([userId, projectId, kind, createdAt])
+  @@index([userId, origin, kind, createdAt])
+  @@index([jobId, createdAt])
+  @@index([projectId])
+  @@index([userId, modality, createdAt])
+  @@index([userId, isFavorite, createdAt])
+  @@index([userId, deletedAt, createdAt])
+  @@index([agentTaskId])
+  @@index([parentAssetId])
+}
+
+// ---------------------------------------------------------------------------
+// Canvas
+// ---------------------------------------------------------------------------
+
+model CanvasSession {
+  id              String              @id @default(cuid())
+  userId          String
+  projectId       String?
+  title           String
+  status          CanvasSessionStatus @default(EDITING)
+  zoom            Float               @default(1)
+  panX            Float               @default(0)
+  panY            Float               @default(0)
+  selectedAssetId String?
+  /// In-canvas drawing state (freehand strokes, text nodes, shapes, masks).
+  /// Stored as JSON so the renderer can hydrate it on page reload without
+  /// requiring a separate model for every annotation kind. Shape lives in
+  /// `lib/canvas/drawing-state.ts`.
+  drawingState    Json                @default("{}")
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project         Project?            @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  selectedAsset   Asset?              @relation("CanvasSelectedAsset", fields: [selectedAssetId], references: [id], onDelete: SetNull)
+  layers          CanvasLayer[]
+  snapshots       CanvasSnapshot[]
+  agentTasks      AgentTask[]
+  agentMessages   AgentMessage[]
+
+  @@index([userId, projectId, createdAt])
+  @@index([projectId])
+  @@index([selectedAssetId])
+}
+
+/// Named version snapshot of a canvas session. Captures the layer geometry +
+/// drawing state at a point in time so the user (or the agent) can roll back
+/// to a previous step or branch from it. Automatically written after each
+/// successful agent step; manually written via the "Save version" affordance.
+model CanvasSnapshot {
+  id           String        @id @default(cuid())
+  sessionId    String
+  /// Display label, e.g. "Before background change" or "Agent step 3".
+  label        String
+  /// True if the snapshot was authored by the agent runner; false for manual.
+  isAutomatic  Boolean       @default(false)
+  /// Full layer geometry array + drawing state JSON snapshot.
+  data         Json
+  createdAt    DateTime      @default(now())
+  session      CanvasSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  taskBaseline AgentTask?    @relation("AgentTaskBaseline")
+
+  @@index([sessionId, createdAt])
+}
+
+model CanvasLayer {
+  id          String        @id @default(cuid())
+  sessionId   String
+  assetId     String
+  agentTaskId String?
+  x           Float         @default(0)
+  y           Float         @default(0)
+  width       Float
+  height      Float
+  rotation    Float         @default(0)
+  zIndex      Int           @default(0)
+  locked      Boolean       @default(false)
+  hidden      Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  session     CanvasSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  asset       Asset         @relation("CanvasLayerAsset", fields: [assetId], references: [id], onDelete: Cascade)
+  agentTask   AgentTask?    @relation(fields: [agentTaskId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId, zIndex])
+  @@index([assetId, createdAt])
+  @@index([agentTaskId])
+}
+
+// ---------------------------------------------------------------------------
+// Luna task history. CanvasSession is the durable conversation boundary;
+// these rows store only user-visible messages, task state, tool summaries and
+// artifact references. Internal model reasoning is deliberately not stored.
+// ---------------------------------------------------------------------------
+
+enum AgentTaskStatus {
+  BLOCKED_CONFIGURATION
+  QUEUED
+  RUNNING
+  INTERRUPTED
+  COMPLETED
+  PARTIAL
+  FAILED
+  CANCELLED
+  UNDONE
+}
+
+enum AgentMessageRole {
+  USER
+  ASSISTANT
+}
+
+enum AgentStepStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model AgentTask {
+  id               String          @id @default(cuid())
+  userId           String
+  sessionId        String
+  status           AgentTaskStatus @default(QUEUED)
+  prompt           String
+  selectedLayerId  String?
+  textModelId      String?
+  uiContext        Json            @default("{}")
+  action           Json?
+  capabilityFix    Json?
+  error            Json?
+  beforeSnapshotId String?         @unique
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  completedAt      DateTime?
+  interruptedAt    DateTime?
+  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session          CanvasSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  beforeSnapshot   CanvasSnapshot? @relation("AgentTaskBaseline", fields: [beforeSnapshotId], references: [id], onDelete: SetNull)
+  messages         AgentMessage[]
+  steps            AgentTaskStep[]
+  jobs             GenerationJob[]
+  assets           Asset[]
+  layers           CanvasLayer[]
+
+  @@index([sessionId, createdAt])
+  @@index([userId, status, updatedAt])
+}
+
+model AgentMessage {
+  id        String           @id @default(cuid())
+  sessionId String
+  taskId    String?
+  role      AgentMessageRole
+  parts     Json
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  session   CanvasSession    @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  task      AgentTask?       @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId, createdAt])
+  @@index([taskId, createdAt])
+}
+
+model AgentTaskStep {
+  id           String          @id @default(cuid())
+  taskId       String
+  index        Int
+  toolCallId   String?
+  toolName     String
+  category     String
+  status       AgentStepStatus @default(PENDING)
+  summary      String
+  input        Json?
+  output       Json?
+  artifacts    Json            @default("{}")
+  startedAt    DateTime        @default(now())
+  completedAt  DateTime?
+  errorMessage String?
+  task         AgentTask       @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, index])
+  @@index([taskId, status])
+}

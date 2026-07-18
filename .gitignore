@@ -1,0 +1,88 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+.serena/
+.claude/
+.gitnexus/
+.playwright-mcp/
+.mcp.json
+*.swp
+*.swo
+*~
+.envrc
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependency directories
+node_modules/
+dist/
+
+# TypeScript / Tooling
+*.tsbuildinfo
+
+# General build outputs
+coverage/
+.turbo/
+.cache/
+*.log
+
+# Next.js
+my-app/.next/
+my-app/out/
+my-app/.vercel/
+
+# Testing / E2E
+my-app/coverage/
+my-app/test-results/
+my-app/playwright-report/
+my-app/blob-report/
+.playwright-cli/
+.nyc_output/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local credentials / certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+.npmrc
+.pypirc
+
+# Prisma / local DB files
+my-app/*.db
+my-app/*.sqlite
+my-app/*.sqlite3
+my-app/prisma/*.db
+my-app/prisma/**/*.db
+my-app/prisma/*.sqlite
+my-app/prisma/**/*.sqlite
+my-app/prisma/*.sqlite3
+my-app/prisma/**/*.sqlite3
+
+# Worktrees
+.worktrees/
+
+# Misc local artifacts
+output/
+tmp/
+.history/
+my-app/data/generated/
+my-app/data/uploads/
+.vercel

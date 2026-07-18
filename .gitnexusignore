@@ -1,0 +1,107 @@
+# Agent/runtime context is for tools and prompts, not source graph analysis.
+AGENT.md
+AGENTS.md
+CLAUDE.md
+CODEX_HANDOFF.md
+**/.claude/**
+**/.codex/**
+**/.cursor/**
+**/.windsurf/**
+**/.serena/**
+**/.roo/**
+**/.mcp/**
+**/memory.local.md
+**/MEMORY.local.md
+**/scratch.md
+**/notes.local.md
+**/prompt.local.md
+**/prompts.local.md
+**/*.prompt.local.md
+**/*.chat.md
+**/*.transcript.md
+
+# Generated and local runtime artifacts should not enter the code graph.
+node_modules/
+dist/
+build/
+coverage/
+.turbo/
+.cache/
+
+# Local tool and index state.
+.gitnexus/
+.gitnexusignore
+.claude/
+.serena/
+.playwright-mcp/
+.playwright-cli/
+.vercel/
+
+# Next.js and test outputs.
+my-app/node_modules/
+my-app/.next/
+my-app/out/
+my-app/.vercel/
+my-app/coverage/
+my-app/test-results/
+my-app/playwright-report/
+my-app/blob-report/
+
+# Uploaded/generated product data.
+my-app/data/generated/
+my-app/data/uploads/
+
+# Third-party static assets.
+my-app/public/tldraw-assets/
+
+# Tauri and desktop runtime outputs.
+my-app/src-tauri/target/
+my-app/desktop-dist/
+my-app/desktop-server/
+my-app/.desktop-dev/
+my-app/engine/
+
+# Cross-project generated output, dependency folders, caches, and local test artifacts.
+**/node_modules/**
+**/.next/**
+**/dist/**
+**/build/**
+**/Build/**
+**/coverage/**
+**/test-results/**
+**/playwright-report/**
+**/screenshots/**
+**/snapshots/**
+**/artifacts/**
+**/reports/**
+**/.cache/**
+**/tmp/**
+**/.tmp/**
+**/temp/**
+**/.turbo/**
+**/.venv/**
+**/venv/**
+**/__pycache__/**
+**/.pytest_cache/**
+**/target/**
+
+# Apple/Xcode local metadata and generated project containers.
+**/.build/**
+**/DerivedData/**
+**/*.xcodeproj/**
+**/*.xcworkspace/**
+**/xcuserdata/**
+**/*.xcuserstate
+**/*.xcresult
+**/*.xcresult/**
+
+# Local secrets and machine-specific credentials.
+**/.env
+**/.env.*
+!**/.env.example
+**/*.mobileprovision
+**/*.provisionprofile
+**/*.p12
+**/*.key
+**/*.pem
+**/*.p8

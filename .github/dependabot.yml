@@ -1,0 +1,23 @@
+# Dependabot config — keeps SHA-pinned GitHub Actions current.
+#
+# Why this exists:
+#   - Release workflows pin third-party actions to immutable commit SHAs rather
+#     than mutable tags because those jobs handle signing and publishing.
+#   - Dependabot opens weekly PRs for pinned actions so security updates remain
+#     reviewable without silently trusting a moved tag.
+#
+# Reviewers: every Dependabot PR must be inspected before merge. Treat the
+# action like any other dependency — read the changelog, verify the SHA
+# matches the release commit on GitHub before approving.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions

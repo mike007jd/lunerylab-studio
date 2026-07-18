@@ -1,0 +1,49 @@
+[package]
+name = "lunerylab-desktop"
+version = "1.0.0"
+description = "Lunery Lab Studio desktop shell"
+authors = ["Lunery Lab"]
+edition = "2021"
+
+[lib]
+name = "lunerylab_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+# Binary name matches productName (`Lunery Lab Studio`) — Tauri 2 derives the
+# bundled app name from productName but the binary itself was using a stale
+# legacy ident. Aligning makes log lines + crash reports consistent across
+# both the macOS .app and the Windows .exe.
+name = "lunerylab-studio"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+futures-util = "0.3.32"
+# Direct dep — `lib.rs:bridge_token` calls `getrandom::fill` for the desktop
+# bridge token. Cannot rely on the transitive copy from keyring/reqwest:
+# transitive deps aren't visible to our crate. Keep this aligned with the
+# version those stacks resolve to so cargo doesn't end up with two copies.
+getrandom = "0.4.2"
+keyring = "4.0.1"
+keyring-core = "1.0.0"
+reqwest = { version = "0.13.3", features = ["stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+sysinfo = "0.38.4"
+tauri = { version = "2.11.2", features = [] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# Unwind (not abort) so a panic on a detached bridge/worker thread — e.g. a
+# poisoned-mutex `.expect()` deep in model_residency — terminates only that
+# thread/connection instead of taking the whole desktop app down with it.
+# Costs a little binary size vs `abort`; acceptable for crash resilience.
+panic = "unwind"

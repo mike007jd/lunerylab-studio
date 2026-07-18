@@ -1,0 +1,88 @@
+{
+  "node": {
+    "version": "v22.23.1",
+    "asset": "node-v22.23.1-darwin-arm64.tar.xz",
+    "url": "https://nodejs.org/dist/v22.23.1/node-v22.23.1-darwin-arm64.tar.xz",
+    "sha256": "fb526811860f81dcac7dd8b2b55eca4accfc5d61c3b7c2508f2639faee8a738d",
+    "sha256Source": "https://nodejs.org/dist/v22.23.1/SHASUMS256.txt"
+  },
+  "assets": [
+    {
+      "name": "llama-b9209-bin-macos-arm64.tar.gz",
+      "tag": "b9209",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9209/llama-b9209-bin-macos-arm64.tar.gz",
+      "sha256": "bcc6eb8d9482ddd2885a52f6c25ded76eb655b70916c35bf70ab54f01b1d91bb",
+      "size": 8502313
+    },
+    {
+      "name": "llama-b9209-bin-win-cpu-x64.zip",
+      "tag": "b9209",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9209/llama-b9209-bin-win-cpu-x64.zip",
+      "sha256": "ee8669d00ad4e45a4aec26006fc0a511db01f53dca5f20daf97d5f5f907a84ab",
+      "size": 15928688
+    },
+    {
+      "name": "llama-b9209-bin-win-cuda-12.4-x64.zip",
+      "tag": "b9209",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9209/llama-b9209-bin-win-cuda-12.4-x64.zip",
+      "sha256": "af2e9fd15b18a1325c9f0eeaf29caf2f329196ee6783c2650b6072e516685529",
+      "size": 218538055
+    },
+    {
+      "name": "llama-b9209-bin-win-vulkan-x64.zip",
+      "tag": "b9209",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9209/llama-b9209-bin-win-vulkan-x64.zip",
+      "sha256": "78df07d58394ece8fd7911e44292018db766b678445d99df155998e85892aa6b",
+      "size": 32701643
+    },
+    {
+      "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+      "tag": "b9209",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9209/cudart-llama-bin-win-cuda-12.4-x64.zip",
+      "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+      "size": 391443627
+    },
+    {
+      "name": "sd-master-92a3b73-bin-Darwin-macOS-15.7.7-arm64.zip",
+      "tag": "master-709-92a3b73",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-709-92a3b73/sd-master-92a3b73-bin-Darwin-macOS-15.7.7-arm64.zip",
+      "sha256": "53cacbb050cb9c38168de76c3688e4ce02f3c58719da81cecf5ae37be33bf62b",
+      "size": 48594872
+    },
+    {
+      "name": "sd-master-92a3b73-bin-win-avx2-x64.zip",
+      "tag": "master-709-92a3b73",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-709-92a3b73/sd-master-92a3b73-bin-win-avx2-x64.zip",
+      "sha256": "530bf311f7879afa1bbdb0841b46de491050bf203ba449d6650717600b539794",
+      "size": 21195454
+    },
+    {
+      "name": "sd-master-92a3b73-bin-win-cuda12-x64.zip",
+      "tag": "master-709-92a3b73",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-709-92a3b73/sd-master-92a3b73-bin-win-cuda12-x64.zip",
+      "sha256": "dc36a0228e795ecd497f56a777971f389bb8feae75a51dce14292e79f23f821e",
+      "size": 352548814
+    },
+    {
+      "name": "sd-master-92a3b73-bin-win-vulkan-x64.zip",
+      "tag": "master-709-92a3b73",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-709-92a3b73/sd-master-92a3b73-bin-win-vulkan-x64.zip",
+      "sha256": "730c656ddfa1688bac6e7650d4e46d7f5335715dff00e8e86c7e07f4a1a191d2",
+      "size": 42275413
+    },
+    {
+      "name": "cudart-sd-bin-win-cu12-x64.zip",
+      "tag": "master-709-92a3b73",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-709-92a3b73/cudart-sd-bin-win-cu12-x64.zip",
+      "sha256": "fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d",
+      "size": 563452046
+    },
+    {
+      "name": "SwiftLM-b648-macos-arm64.tar.gz",
+      "tag": "b648",
+      "url": "https://github.com/SharpAI/SwiftLM/releases/download/b648/SwiftLM-b648-macos-arm64.tar.gz",
+      "sha256": "af3b37a53d1386b98c7fe6390c9881dfedcf142144bdcc9901136d2cf43d4fb8",
+      "size": 48619918
+    }
+  ]
+}
