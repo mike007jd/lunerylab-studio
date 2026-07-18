@@ -202,6 +202,12 @@ const zhTW = {
     "createProjectFailed": "建立專案失敗",
     "generatedImages": "成功生成 {count} 張圖片",
     "generationFailed": "生成失敗",
+    "generationErrors": {
+      "outOfMemory": "記憶體不足。請降低尺寸或生成張數，或改用較小的模型。",
+      "modelLoadFailed": "模型無法載入。請在設定中重新下載，或改用其他模型。",
+      "engineUnavailable": "本機 AI 已停止。請重新啟動應用程式後再試。",
+      "genericGuide": "請重試；若持續失敗，請重新啟動本機 AI 或改用其他模型。"
+    },
     "cancelFailed": "無法停止圖片生成，請再次點擊取消。",
     "earlierResults": "更早結果",
     "earlierResultsSummary": "還有 {count} 批更早結果可查看。",
