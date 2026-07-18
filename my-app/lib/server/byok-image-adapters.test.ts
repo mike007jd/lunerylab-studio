@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => {
     createOpenAICompatible: vi.fn(() => ({ imageModel: compatibleImageModel })),
     openAiImageModel,
     compatibleImageModel,
+    runReplicatePrediction: vi.fn(),
+    falQueueResult: vi.fn(),
   };
 });
 
@@ -29,10 +31,17 @@ vi.mock("@ai-sdk/openai-compatible", () => ({
   createOpenAICompatible: mocks.createOpenAICompatible,
 }));
 
+vi.mock("@/lib/server/byok-provider-clients", () => ({
+  runReplicatePrediction: mocks.runReplicatePrediction,
+  falQueueResult: mocks.falQueueResult,
+}));
+
 import {
   generateImagesOpenAiCompatible,
   generateImagesOpenAiEdit,
   generateImagesOpenAiRest,
+  generateImagesFal,
+  generateImagesReplicate,
   type ResolvedByokConfig,
 } from "@/lib/server/byok-image-adapters";
 
@@ -52,6 +61,8 @@ beforeEach(() => {
       },
     ],
   });
+  mocks.runReplicatePrediction.mockResolvedValue({ output: [] });
+  mocks.falQueueResult.mockResolvedValue({ images: [] });
 });
 
 describe("BYOK OpenAI image adapters", () => {
@@ -75,6 +86,25 @@ describe("BYOK OpenAI image adapters", () => {
       }),
     );
     expect(images).toEqual([{ bytes: Buffer.from([1, 2, 3]), mimeType: "image/png" }]);
+  });
+
+  it("does not send diffusion-only parameters to OpenAI image models", async () => {
+    await generateImagesOpenAiRest(config, {
+      prompt: "make a poster",
+      count: 1,
+      generationParameters: {
+        seed: 4242,
+        steps: 28,
+        cfg: 5.5,
+        negativePrompt: "blur",
+      },
+    });
+
+    const sdkInput = mocks.generateImage.mock.calls[0]?.[0];
+    expect(sdkInput).not.toHaveProperty("seed");
+    expect(sdkInput).not.toHaveProperty("steps");
+    expect(sdkInput).not.toHaveProperty("cfg");
+    expect(sdkInput).not.toHaveProperty("negativePrompt");
   });
 
   it("uses AI SDK edit prompt files for OpenAI image editing", async () => {
@@ -123,5 +153,58 @@ describe("BYOK OpenAI image adapters", () => {
         },
       }),
     );
+  });
+});
+
+describe("BYOK diffusion parameter capabilities", () => {
+  const parameters = {
+    seed: 4242,
+    steps: 28,
+    cfg: 5.5,
+    negativePrompt: "blur, watermark",
+  };
+
+  it("sends supported parameters to Replicate diffusion schemas", async () => {
+    await expect(generateImagesReplicate(
+      { ...config, modelId: "stability-ai/sdxl" },
+      { prompt: "poster", count: 1, generationParameters: parameters },
+    )).rejects.toThrow("returned no image URLs");
+
+    expect(mocks.runReplicatePrediction).toHaveBeenCalledWith(expect.objectContaining({
+      input: expect.objectContaining({
+        seed: 4242,
+        num_inference_steps: 28,
+        guidance_scale: 5.5,
+        negative_prompt: "blur, watermark",
+      }),
+    }));
+  });
+
+  it("omits unsupported parameters for arbitrary Replicate models", async () => {
+    await expect(generateImagesReplicate(
+      { ...config, modelId: "owner/custom-image-model" },
+      { prompt: "poster", count: 1, generationParameters: parameters },
+    )).rejects.toThrow("returned no image URLs");
+
+    const providerInput = mocks.runReplicatePrediction.mock.calls[0]?.[0]?.input;
+    expect(providerInput).not.toHaveProperty("seed");
+    expect(providerInput).not.toHaveProperty("num_inference_steps");
+    expect(providerInput).not.toHaveProperty("guidance_scale");
+    expect(providerInput).not.toHaveProperty("negative_prompt");
+  });
+
+  it("sends supported Fal controls but excludes negative prompts from Flux schemas", async () => {
+    await expect(generateImagesFal(
+      { ...config, modelId: "fal-ai/flux/dev" },
+      { prompt: "poster", count: 1, generationParameters: parameters },
+    )).rejects.toThrow("returned no images");
+
+    const body = mocks.falQueueResult.mock.calls[0]?.[0]?.body;
+    expect(body).toMatchObject({
+      seed: 4242,
+      num_inference_steps: 28,
+      guidance_scale: 5.5,
+    });
+    expect(body).not.toHaveProperty("negative_prompt");
   });
 });

@@ -127,6 +127,11 @@ export async function GET(request: NextRequest) {
       assets: page.map((asset) => ({
         ...toAssetDTO(asset),
         ...toVisibleAssetJobProvenance(asset),
+        generationSeed: asset.generationSeed,
+        generationSteps: asset.generationSteps,
+        generationCfg: asset.generationCfg,
+        negativePrompt: asset.negativePrompt,
+        generationModel: asset.generationModel,
         projectName: asset.project?.name ?? null,
         agentTaskSummary: asset.agentTask?.prompt ?? null,
       })),

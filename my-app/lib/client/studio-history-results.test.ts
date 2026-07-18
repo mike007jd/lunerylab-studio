@@ -29,6 +29,7 @@ function entry(id: string): GenerationEntry {
     projectId: null,
     referenceAssetIds: [],
     batchVariants: null,
+    generationParameters: {},
     assets: [],
     warnings: [],
     error: null,

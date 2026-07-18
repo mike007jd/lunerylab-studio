@@ -1,5 +1,10 @@
 import { ApiError } from "@/lib/server/errors";
 import { resolveOwnedProjectId as resolveProjectIdForOwner } from "@/lib/server/project-ownership";
+import {
+  GENERATION_PARAMETER_LIMITS,
+  normalizeGenerationParameters,
+  type GenerationParameters,
+} from "@/lib/generation-parameters";
 
 /** Max references (uploaded files + referenced asset ids) per generation. */
 export const MAX_GENERATION_REFERENCES = 4;
@@ -18,6 +23,44 @@ export function parseRequestedImageCount(raw: FormDataEntryValue | null): number
     });
   }
   return count;
+}
+
+function parseOptionalNumber(
+  formData: FormData,
+  field: "seed" | "steps" | "cfg",
+): number | undefined {
+  const raw = String(formData.get(field) ?? "").trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  const limits = GENERATION_PARAMETER_LIMITS[field];
+  const valid = field === "cfg" ? Number.isFinite(value) : Number.isSafeInteger(value);
+  if (!valid || value < limits.min || value > limits.max) {
+    throw new ApiError({
+      status: 400,
+      code: "invalid_generation_parameter",
+      message: `${field} must be between ${limits.min} and ${limits.max}.`,
+      retryable: false,
+    });
+  }
+  return value;
+}
+
+export function parseGenerationParameters(formData: FormData): GenerationParameters {
+  const negativePrompt = String(formData.get("negativePrompt") ?? "").trim();
+  if (negativePrompt.length > GENERATION_PARAMETER_LIMITS.negativePromptMaxLength) {
+    throw new ApiError({
+      status: 400,
+      code: "invalid_generation_parameter",
+      message: `negativePrompt must be at most ${GENERATION_PARAMETER_LIMITS.negativePromptMaxLength} characters.`,
+      retryable: false,
+    });
+  }
+  return normalizeGenerationParameters({
+    seed: parseOptionalNumber(formData, "seed"),
+    steps: parseOptionalNumber(formData, "steps"),
+    cfg: parseOptionalNumber(formData, "cfg"),
+    negativePrompt,
+  });
 }
 
 /**

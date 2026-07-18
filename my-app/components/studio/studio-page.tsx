@@ -74,6 +74,7 @@ import {
 } from "@/components/studio/studio-project-options";
 import { buildDefaultProjectName } from "@/lib/project-name";
 import { createProject as createProjectRequest } from "@/lib/client/projects";
+import type { GenerationParameters } from "@/lib/generation-parameters";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -149,6 +150,7 @@ export function StudioPage({
   const [aspectRatio, setAspectRatio] = useState<string>(
     () => findPresetById(searchParams.get("preset"))?.defaults?.aspectRatio ?? "1:1"
   );
+  const [generationParameters, setGenerationParameters] = useState<GenerationParameters>({});
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   // Local-first default: prefer the user's pick, then the snapshot, then the
   // catalog's local→BYOK→cloud effective default. There is NO hardcoded
@@ -267,6 +269,13 @@ export function StudioPage({
       selectProject: t("studio.selectProject"),
       noProjects: t("studio.noProjects"),
       newProject: t("studio.newProject"),
+      advanced: t("studio.advanced"),
+      seed: t("studio.seed"),
+      seedRandom: t("studio.seedRandom"),
+      steps: t("studio.steps"),
+      cfg: t("studio.cfg"),
+      automatic: t("studio.automatic"),
+      negativePrompt: t("studio.negativePrompt"),
     }),
     [t],
   );
@@ -437,6 +446,7 @@ export function StudioPage({
       projectId: string | null;
       referenceAssetIds: string[];
       uploadedFiles: File[];
+      generationParameters: GenerationParameters;
     }): Promise<ImageGenerationOutcome> => {
       const previous = imageRequestControlsRef.current.get(params.entryId);
       if (previous) {
@@ -473,6 +483,10 @@ export function StudioPage({
       form.append("count", String(params.count));
       form.append("aspectRatio", params.aspectRatio);
       form.append("modelId", params.modelId);
+      if (params.generationParameters.seed !== undefined) form.append("seed", String(params.generationParameters.seed));
+      if (params.generationParameters.steps !== undefined) form.append("steps", String(params.generationParameters.steps));
+      if (params.generationParameters.cfg !== undefined) form.append("cfg", String(params.generationParameters.cfg));
+      if (params.generationParameters.negativePrompt) form.append("negativePrompt", params.generationParameters.negativePrompt);
       if (params.projectId) form.append("projectId", params.projectId);
       if (params.presetId) form.append("presetId", params.presetId);
       for (const id of params.referenceAssetIds) {
@@ -491,11 +505,19 @@ export function StudioPage({
         });
 
         const outcome = resolveImageGenerationOutcome(data, t("studio.generationFailed"));
+        const firstAsset = outcome.assets[0];
         history.update(params.entryId, {
           status: outcome.status,
           assets: outcome.assets,
           warnings: outcome.warnings,
           error: outcome.error,
+          generationParameters: {
+            ...params.generationParameters,
+            ...(firstAsset?.generationSeed == null ? {} : { seed: firstAsset.generationSeed }),
+            ...(firstAsset?.generationSteps == null ? {} : { steps: firstAsset.generationSteps }),
+            ...(firstAsset?.generationCfg == null ? {} : { cfg: firstAsset.generationCfg }),
+            ...(firstAsset?.negativePrompt ? { negativePrompt: firstAsset.negativePrompt } : {}),
+          },
         });
         return outcome;
       } finally {
@@ -548,6 +570,7 @@ export function StudioPage({
         projectId: projectId || null,
         referenceAssetIds: [],
         batchVariants: null,
+        generationParameters: {},
       });
       setActiveVideoEntryId(entryId);
 
@@ -632,6 +655,7 @@ export function StudioPage({
             label: v.label,
             promptSuffix: v.promptSuffix,
           })) ?? null,
+        generationParameters,
       });
 
       const outcome = await runImageGenerationRequest({
@@ -647,6 +671,7 @@ export function StudioPage({
         // the persisted referenceAssetIds. Retries skip this and reuse the
         // already-uploaded ids only — which is why we do the upload first.
         uploadedFiles: referenceAssetIds.length === files.length ? [] : files,
+        generationParameters,
       });
       if (outcome.status === "failed") {
         setError(outcome.error ?? t("studio.generationFailed"));
@@ -685,6 +710,7 @@ export function StudioPage({
     imageOutputCount,
     imageRunMode,
     batchVariants,
+    generationParameters,
     runImageGenerationRequest,
     uploadReferenceAssets,
     handleCreateProject,
@@ -718,6 +744,7 @@ export function StudioPage({
             projectId: entry.projectId,
             referenceAssetIds: entry.referenceAssetIds,
             uploadedFiles: [],
+            generationParameters: entry.generationParameters ?? {},
           });
           if (outcome.status === "failed") {
             setError(outcome.error ?? t("studio.generationFailed"));
@@ -767,6 +794,14 @@ export function StudioPage({
     (entryId: string) => history.remove(entryId),
     [history],
   );
+
+  const handleReuseParameters = useCallback((entryId: string) => {
+    const entry = history.find(entryId);
+    if (!entry || entry.mode !== "image") return;
+    setGenerationParameters(entry.generationParameters ?? {});
+    setNotice(t("studio.parametersReused"));
+    textareaRef.current?.focus();
+  }, [history, t]);
 
   const handleCancelGeneration = useCallback(
     async (entryId: string) => {
@@ -1004,6 +1039,8 @@ export function StudioPage({
                 onCreateProject={handleCreateProjectVoid}
                 isCreatingProject={isCreatingProject}
                 isZh={isZh}
+                generationParameters={generationParameters}
+                onGenerationParametersChange={setGenerationParameters}
                 labels={optionsLabels}
               />
 
@@ -1155,6 +1192,7 @@ export function StudioPage({
           onSendToCanvas={handleGridSendToCanvas}
           onDismiss={handleDismissEntry}
           onCancel={handleGridCancel}
+          onReuseParameters={handleReuseParameters}
         />
 
       </section>

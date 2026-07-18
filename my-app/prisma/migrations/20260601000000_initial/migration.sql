@@ -156,6 +156,11 @@ CREATE TABLE "Asset" (
     "isFavorite" BOOLEAN NOT NULL DEFAULT false,
     "note" TEXT,
     "summary" TEXT,
+    "generationSeed" INTEGER,
+    "generationSteps" INTEGER,
+    "generationCfg" DOUBLE PRECISION,
+    "negativePrompt" TEXT,
+    "generationModel" TEXT,
     "deletedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 

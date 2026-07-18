@@ -196,6 +196,14 @@ const zhCN = {
       "refineDisabled": "连接模型后才能优化提示词。"
     },
     "options": "参数",
+    "advanced": "高级",
+    "seed": "种子",
+    "seedRandom": "随机",
+    "steps": "步数",
+    "cfg": "引导强度",
+    "automatic": "自动",
+    "negativePrompt": "负面提示词",
+    "parametersReused": "已复用生成参数",
     "model": "模型",
     "output": "输出",
     "projectCreated": "已创建：{name}",
@@ -217,6 +225,7 @@ const zhCN = {
     "results": {
       "heading": "结果",
       "regenerate": "重新生成",
+      "reuseSeed": "复用种子",
       "sendToCanvas": "送进 Canvas 精修",
       "dismiss": "移除",
       "running": "正在生成…",
@@ -636,6 +645,7 @@ const zhCN = {
     }
   },
   "assetActions": {
+    "generationDetails": "生成详情",
     "download": "下载",
     "useAsReference": "用作参考图",
     "openInCanvas": "送进 Canvas 精修",

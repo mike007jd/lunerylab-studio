@@ -25,6 +25,7 @@ import {
   firstNonEmptyFormString,
   getUploadedFiles,
   parseRequestedImageCount,
+  parseGenerationParameters,
   parseRepeatedFormStrings,
   resolveOwnedProjectId,
   trimFormString,
@@ -38,6 +39,7 @@ import {
   persistUploadedImageReferenceFiles,
 } from "@/lib/server/reference-assets";
 import { finishSdProgress, resolveSdRunId } from "@/lib/server/sd-progress";
+import { generationAssetProvenance } from "@/lib/generation-parameters";
 
 function toJobPayload(job: {
   id: string;
@@ -71,6 +73,17 @@ function generationResponse({
   return NextResponse.json({ job: toJobPayload(job), assets, warnings });
 }
 
+function toGeneratedAssetDTO(asset: Parameters<typeof toAssetDTO>[0]) {
+  return {
+    ...toAssetDTO(asset),
+    generationSeed: asset.generationSeed,
+    generationSteps: asset.generationSteps,
+    generationCfg: asset.generationCfg,
+    negativePrompt: asset.negativePrompt,
+    generationModel: asset.generationModel,
+  };
+}
+
 async function deleteStoredFiles(storagePaths: string[]) {
   await Promise.allSettled(storagePaths.map((storagePath) => deleteStoredFile(storagePath)));
 }
@@ -101,6 +114,7 @@ export async function POST(request: NextRequest) {
 
     const rawPrompt = trimFormString(formData, "prompt");
     const count = parseRequestedImageCount(formData.get("count"));
+    const generationParameters = parseGenerationParameters(formData);
     // Reject an unsupported ratio (e.g. "2:1") with 400 instead of silently
     // snapping to 1:1 — the request and the output must agree.
     const aspectRatioRaw = formData.get("aspectRatio");
@@ -188,6 +202,7 @@ export async function POST(request: NextRequest) {
       source,
       referenceAssetIds,
       files: files.map(uploadedFileFingerprint),
+      generationParameters,
     });
 
     const created = await createOrReplayGenerationJob({
@@ -211,7 +226,7 @@ export async function POST(request: NextRequest) {
       const { job: cachedJob, assets: cachedAssets } = created;
       const response = generationResponse({
         job: cachedJob,
-        assets: cachedJob.status === "RUNNING" ? [] : cachedAssets.map(toAssetDTO),
+        assets: cachedJob.status === "RUNNING" ? [] : cachedAssets.map(toGeneratedAssetDTO),
         warnings: [],
       });
       telemetry.done(response.status, { cached: true });
@@ -244,6 +259,7 @@ export async function POST(request: NextRequest) {
       isEdit: requiresEditModel,
       // User "Stop" / disconnect aborts the in-flight provider request.
       abortSignal: request.signal,
+      generationParameters,
     });
     assertGenerationRequestActive(request);
 
@@ -271,7 +287,7 @@ export async function POST(request: NextRequest) {
       async (tx) => {
         assertGenerationRequestActive(request);
         const assets = await Promise.all(
-          storedImages.map((stored) =>
+          storedImages.map((stored, index) =>
             tx.asset.create({
               data: {
                 userId: user.id,
@@ -283,6 +299,10 @@ export async function POST(request: NextRequest) {
                 byteSize: stored.byteSize,
                 width: stored.width,
                 height: stored.height,
+                ...generationAssetProvenance(
+                  generation.images[index]?.generationParameters,
+                  generation.model,
+                ),
               },
             }),
           ),
@@ -307,7 +327,7 @@ export async function POST(request: NextRequest) {
 
     const response = generationResponse({
       job: updatedJob,
-      assets: createdAssets.map(toAssetDTO),
+      assets: createdAssets.map(toGeneratedAssetDTO),
       warnings: [...resolvedModel.warnings, ...generation.warnings],
     });
     await finishSdProgress(runId, "completed");

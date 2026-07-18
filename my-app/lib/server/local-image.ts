@@ -36,6 +36,7 @@ import type { GenerateImageInput, GenerateImageResult } from "@/lib/server/gener
 import { findHfModelEntry } from "@/lib/hf-model-catalog";
 import { findImportedModel } from "@/lib/server/imported-model-registry";
 import { localImageDimensions } from "@/lib/server/generation-dimensions";
+import { normalizeGenerationParameters, randomGenerationSeed } from "@/lib/generation-parameters";
 
 // ---------------------------------------------------------------------------
 // Model-family workflow profiles
@@ -110,6 +111,7 @@ function buildTxt2ImgWorkflow({
   checkpointName,
   prompt,
   seed,
+  negativePrompt,
   profile,
   width,
   height,
@@ -117,6 +119,7 @@ function buildTxt2ImgWorkflow({
   checkpointName: string;
   prompt: string;
   seed?: number;
+  negativePrompt?: string;
   profile: ComfyWorkflowProfile;
   width: number;
   height: number;
@@ -139,7 +142,7 @@ function buildTxt2ImgWorkflow({
     "7": {
       class_type: "CLIPTextEncode",
       inputs: {
-        text: "",
+        text: negativePrompt ?? "",
         clip: ["4", 1],
       },
     },
@@ -406,7 +409,7 @@ export async function generateImagesLocal(
     });
   }
 
-  const images: Array<{ bytes: Buffer; mimeType: string }> = [];
+  const images: GenerateImageResult["images"] = [];
   const warnings: string[] = [];
   const checkpointName = await resolveComfyCheckpointName(input.modelId);
 
@@ -420,6 +423,12 @@ export async function generateImagesLocal(
     });
   }
   const profile = COMFY_PROFILES[family];
+  const requestedParameters = normalizeGenerationParameters(input.generationParameters ?? {});
+  const appliedProfile = {
+    ...profile,
+    steps: requestedParameters.steps ?? profile.steps,
+    cfg: requestedParameters.cfg ?? profile.cfg,
+  };
   const { width, height } = comfySize(input.aspectRatio, profile.baseDim);
 
   const abortSignal = input.abortSignal;
@@ -433,10 +442,19 @@ export async function generateImagesLocal(
 
   const generateOne = async (index: number) => {
     let promptId: string | null = null;
+    const seed = requestedParameters.seed ?? randomGenerationSeed();
     try {
       promptId = await queueWorkflow(
         endpoint,
-        buildTxt2ImgWorkflow({ checkpointName, prompt: input.prompt, profile, width, height }),
+        buildTxt2ImgWorkflow({
+          checkpointName,
+          prompt: input.prompt,
+          seed,
+          negativePrompt: requestedParameters.negativePrompt,
+          profile: appliedProfile,
+          width,
+          height,
+        }),
         abortSignal,
       );
       activePromptIds.add(promptId);
@@ -448,7 +466,17 @@ export async function generateImagesLocal(
       }
       const historyEntry = await pollHistory(endpoint, promptId, abortSignal);
       const bytes = await fetchOutputImage(endpoint, historyEntry, abortSignal);
-      images.push({ bytes, mimeType: "image/png" });
+      images.push({
+        bytes,
+        mimeType: "image/png",
+        generationParameters: {
+          seed,
+          steps: appliedProfile.steps,
+          cfg: appliedProfile.cfg,
+          negativePrompt: requestedParameters.negativePrompt ?? null,
+          modelId: input.modelId ?? checkpointName,
+        },
+      });
     } catch (error) {
       warnings.push(
         `candidate_${index + 1}: ${error instanceof ApiError ? error.code : "generation_error"}`,

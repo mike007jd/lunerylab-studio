@@ -52,6 +52,11 @@ interface AssetCardProps {
   prompt?: string | null;
   provider?: string | null;
   model?: string | null;
+  generationSeed?: number | null;
+  generationSteps?: number | null;
+  generationCfg?: number | null;
+  negativePrompt?: string | null;
+  generationModel?: string | null;
   projectName?: string | null;
   agentTaskId?: string | null;
   agentTaskSummary?: string | null;
@@ -95,6 +100,11 @@ export function AssetCard({
   prompt,
   provider,
   model,
+  generationSeed,
+  generationSteps,
+  generationCfg,
+  negativePrompt,
+  generationModel,
   projectName,
   agentTaskId,
   agentTaskSummary,
@@ -130,6 +140,9 @@ export function AssetCard({
   // Keep provider/model out of the dense card; the preview exposes them as
   // provenance for users who need to reproduce a result.
   const providerModel = isTemplate ? "" : [provider, model].filter(Boolean).join(" · ");
+  const hasGenerationParameters = !isTemplate && [generationSeed, generationSteps, generationCfg, negativePrompt, generationModel].some(
+    (value) => value !== null && value !== undefined && value !== "",
+  );
   const projectLabel = projectName?.trim() ?? "";
   const hasWorkflowMeta = Boolean(promptText || projectLabel);
 
@@ -364,6 +377,23 @@ export function AssetCard({
               ) : null}
             </div>
           </div>
+          {hasGenerationParameters ? (
+            <div className="rounded-lg border border-(--border-subtle) bg-(--bg-surface) p-3 text-xs">
+              <p className="font-medium text-(--text-primary)">{t("assetActions.generationDetails")}</p>
+              <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4">
+                {generationSeed != null ? <div><dt className="text-(--text-muted)">{t("studio.seed")}</dt><dd className="mt-0.5 text-(--text-primary)">{generationSeed}</dd></div> : null}
+                {generationSteps != null ? <div><dt className="text-(--text-muted)">{t("studio.steps")}</dt><dd className="mt-0.5 text-(--text-primary)">{generationSteps}</dd></div> : null}
+                {generationCfg != null ? <div><dt className="text-(--text-muted)">{t("studio.cfg")}</dt><dd className="mt-0.5 text-(--text-primary)">{generationCfg}</dd></div> : null}
+                {generationModel ? <div><dt className="text-(--text-muted)">{t("studio.model")}</dt><dd className="mt-0.5 break-all text-(--text-primary)">{generationModel}</dd></div> : null}
+              </dl>
+              {negativePrompt ? (
+                <div className="mt-2">
+                  <p className="text-(--text-muted)">{t("studio.negativePrompt")}</p>
+                  <p className="mt-0.5 whitespace-pre-wrap text-(--text-primary)">{negativePrompt}</p>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           {openInCanvasError ? (
             <p role="alert" className="text-sm text-destructive">
               {openInCanvasError}

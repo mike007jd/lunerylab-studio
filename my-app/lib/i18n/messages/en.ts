@@ -196,6 +196,14 @@ const en = {
       "refineDisabled": "Connect a model before refining prompts."
     },
     "options": "Options",
+    "advanced": "Advanced",
+    "seed": "Seed",
+    "seedRandom": "Random",
+    "steps": "Steps",
+    "cfg": "CFG",
+    "automatic": "Auto",
+    "negativePrompt": "Negative prompt",
+    "parametersReused": "Generation settings reused",
     "model": "Model",
     "output": "Output",
     "projectCreated": "Created: {name}",
@@ -217,6 +225,7 @@ const en = {
     "results": {
       "heading": "Results",
       "regenerate": "Regenerate",
+      "reuseSeed": "Reuse seed",
       "sendToCanvas": "Send to Canvas",
       "dismiss": "Dismiss",
       "running": "Generating…",
@@ -636,6 +645,7 @@ const en = {
     }
   },
   "assetActions": {
+    "generationDetails": "Generation details",
     "download": "Download",
     "useAsReference": "Use as reference",
     "openInCanvas": "Send to Canvas",
