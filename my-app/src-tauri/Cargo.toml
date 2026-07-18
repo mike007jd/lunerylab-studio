@@ -1,6 +1,6 @@
 [package]
 name = "lunerylab-desktop"
-version = "1.0.0"
+version = "0.1.0"
 description = "Lunery Lab Studio desktop shell"
 authors = ["Lunery Lab"]
 edition = "2021"
