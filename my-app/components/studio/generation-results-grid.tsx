@@ -56,6 +56,8 @@ interface GenerationResultsGridProps {
   onDismiss: (entryId: string) => void;
   /** Cancel the exact in-flight local image run represented by this entry. */
   onCancel?: (entryId: string) => void;
+  /** Reuse the recorded seed and generation controls in the composer. */
+  onReuseParameters?: (entryId: string) => void;
   /** Native sd-cli progress keyed by Studio history entry id. */
   progressByEntry?: Record<string, SdProgress | undefined>;
   /** Whether a generation is currently in-flight (disables retry buttons). */
@@ -98,6 +100,7 @@ export const GenerationResultsGrid = memo(function GenerationResultsGrid({
   onSendToCanvas,
   onDismiss,
   onCancel,
+  onReuseParameters,
   progressByEntry = {},
   busy = false,
   className,
@@ -152,6 +155,7 @@ export const GenerationResultsGrid = memo(function GenerationResultsGrid({
     return {
       heading: t("studio.results.heading"),
       regenerate: t("studio.results.regenerate"),
+      reuseSeed: t("studio.results.reuseSeed"),
       sendToCanvas: t("studio.results.sendToCanvas"),
       download: t("common.download"),
       dismiss: t("studio.results.dismiss"),
@@ -251,18 +255,31 @@ export const GenerationResultsGrid = memo(function GenerationResultsGrid({
                     ) : null}
                   </div>
                 </div>
-                {showFailureCard ? (
-                  <Button
-                    type="button"
-                    onClick={() => onDismiss(entry.id)}
-                    aria-label={labels.dismiss}
-                    variant="ghostMuted"
-                    size="icon-xs"
-                    className="shrink-0 hover:bg-(--bg-elevated)"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </Button>
-                ) : null}
+                <div className="flex shrink-0 items-center gap-1">
+                  {entry.mode === "image" && entry.generationParameters?.seed !== undefined && onReuseParameters ? (
+                    <Button
+                      type="button"
+                      onClick={() => onReuseParameters(entry.id)}
+                      variant="ghostMuted"
+                      size="xs"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      {labels.reuseSeed}
+                    </Button>
+                  ) : null}
+                  {showFailureCard ? (
+                    <Button
+                      type="button"
+                      onClick={() => onDismiss(entry.id)}
+                      aria-label={labels.dismiss}
+                      variant="ghostMuted"
+                      size="icon-xs"
+                      className="hover:bg-(--bg-elevated)"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  ) : null}
+                </div>
               </header>
 
               {/* Body */}

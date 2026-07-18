@@ -53,6 +53,11 @@ export interface LibraryAsset {
   parentAssetId?: string | null;
   summary?: string | null;
   deletedAt?: string | null;
+  generationSeed?: number | null;
+  generationSteps?: number | null;
+  generationCfg?: number | null;
+  negativePrompt?: string | null;
+  generationModel?: string | null;
 }
 
 interface LibraryAssetTabsProps {
@@ -589,6 +594,11 @@ export function LibraryAssetTabs({
                       prompt={asset.prompt}
                       provider={asset.provider}
                       model={asset.model}
+                      generationSeed={asset.generationSeed}
+                      generationSteps={asset.generationSteps}
+                      generationCfg={asset.generationCfg}
+                      negativePrompt={asset.negativePrompt}
+                      generationModel={asset.generationModel}
                       projectName={showProjectContext ? asset.projectName : null}
                       agentTaskId={asset.agentTaskId}
                       agentTaskSummary={asset.agentTaskSummary}

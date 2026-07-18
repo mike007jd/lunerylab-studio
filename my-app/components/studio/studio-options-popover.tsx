@@ -21,6 +21,13 @@ import type { StylePreset } from "@/lib/presets/style-presets";
 import type { ProjectOption } from "@/components/studio/studio-constants";
 import { VideoControls } from "@/components/studio/video-controls";
 import { formatGenerationOptionsSummary } from "@/lib/client/generation-presentation";
+import { AdvancedDisclosure } from "@/components/ui/advanced-disclosure";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  GENERATION_PARAMETER_LIMITS,
+  type GenerationParameters,
+} from "@/lib/generation-parameters";
 
 function FieldLabel({ children }: { children: ReactNode }) {
   return (
@@ -180,6 +187,8 @@ interface StudioOptionsPopoverProps {
   onCreateProject: () => void;
   isCreatingProject: boolean;
   isZh: boolean;
+  generationParameters: GenerationParameters;
+  onGenerationParametersChange: (parameters: GenerationParameters) => void;
   labels: {
     options: string;
     model: string;
@@ -192,6 +201,13 @@ interface StudioOptionsPopoverProps {
     selectProject: string;
     noProjects: string;
     newProject: string;
+    advanced: string;
+    seed: string;
+    seedRandom: string;
+    steps: string;
+    cfg: string;
+    automatic: string;
+    negativePrompt: string;
   };
 }
 
@@ -217,6 +233,8 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
   onCreateProject,
   isCreatingProject,
   isZh,
+  generationParameters,
+  onGenerationParametersChange,
   labels,
 }: StudioOptionsPopoverProps) {
   const outputCount = selectedPreset?.batchVariants?.length ?? candidateCount;
@@ -296,6 +314,70 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
                 {outputCount} {labels.variants}
               </div>
             </div>
+
+            <AdvancedDisclosure title={labels.advanced}>
+              <div className="grid grid-cols-3 gap-2">
+                <label className="space-y-1">
+                  <FieldLabel>{labels.seed}</FieldLabel>
+                  <Input
+                    type="number"
+                    min={GENERATION_PARAMETER_LIMITS.seed.min}
+                    max={GENERATION_PARAMETER_LIMITS.seed.max}
+                    value={generationParameters.seed ?? ""}
+                    placeholder={labels.seedRandom}
+                    onChange={(event) => onGenerationParametersChange({
+                      ...generationParameters,
+                      seed: event.target.value ? Number(event.target.value) : undefined,
+                    })}
+                    className="h-8 text-xs"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <FieldLabel>{labels.steps}</FieldLabel>
+                  <Input
+                    type="number"
+                    min={GENERATION_PARAMETER_LIMITS.steps.min}
+                    max={GENERATION_PARAMETER_LIMITS.steps.max}
+                    value={generationParameters.steps ?? ""}
+                    placeholder={labels.automatic}
+                    onChange={(event) => onGenerationParametersChange({
+                      ...generationParameters,
+                      steps: event.target.value ? Number(event.target.value) : undefined,
+                    })}
+                    className="h-8 text-xs"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <FieldLabel>{labels.cfg}</FieldLabel>
+                  <Input
+                    type="number"
+                    min={GENERATION_PARAMETER_LIMITS.cfg.min}
+                    max={GENERATION_PARAMETER_LIMITS.cfg.max}
+                    step="0.5"
+                    value={generationParameters.cfg ?? ""}
+                    placeholder={labels.automatic}
+                    onChange={(event) => onGenerationParametersChange({
+                      ...generationParameters,
+                      cfg: event.target.value ? Number(event.target.value) : undefined,
+                    })}
+                    className="h-8 text-xs"
+                  />
+                </label>
+              </div>
+              <label className="block space-y-1">
+                <FieldLabel>{labels.negativePrompt}</FieldLabel>
+                <Textarea
+                  value={generationParameters.negativePrompt ?? ""}
+                  maxLength={GENERATION_PARAMETER_LIMITS.negativePromptMaxLength}
+                  rows={2}
+                  onChange={(event) => onGenerationParametersChange({
+                    ...generationParameters,
+                    negativePrompt: event.target.value || undefined,
+                  })}
+                  className="min-h-16 resize-none text-xs"
+                />
+              </label>
+            </AdvancedDisclosure>
           </div>
         ) : null}
 

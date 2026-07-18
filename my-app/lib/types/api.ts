@@ -38,6 +38,11 @@ export interface AssetDTO {
   deletedAt: string | null;
   createdAt: string;
   url: string;
+  generationSeed?: number | null;
+  generationSteps?: number | null;
+  generationCfg?: number | null;
+  negativePrompt?: string | null;
+  generationModel?: string | null;
 }
 
 export interface ProjectDTO {

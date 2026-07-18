@@ -5,6 +5,7 @@ vi.mock("server-only", () => ({}));
 import { parseRequestedAspectRatio } from "@/lib/server/byok-shared";
 import {
   assertReferenceLimit,
+  parseGenerationParameters,
   parseRequestedImageCount,
 } from "@/lib/server/generate-request";
 import { clampBboxToImage } from "@/lib/server/image-compose";
@@ -68,6 +69,32 @@ describe("parseRequestedImageCount", () => {
         expect((error as ApiError).status).toBe(400);
         expect((error as ApiError).code).toBe("invalid_generation_count");
       }
+    }
+  });
+});
+
+describe("parseGenerationParameters", () => {
+  it("accepts reproducible image parameters and trims the negative prompt", () => {
+    const formData = new FormData();
+    formData.set("seed", "4242");
+    formData.set("steps", "28");
+    formData.set("cfg", "5.5");
+    formData.set("negativePrompt", "  blur, watermark  ");
+
+    expect(parseGenerationParameters(formData)).toEqual({
+      seed: 4242,
+      steps: 28,
+      cfg: 5.5,
+      negativePrompt: "blur, watermark",
+    });
+  });
+
+  it("keeps omitted parameters automatic and rejects values outside the engine envelope", () => {
+    expect(parseGenerationParameters(new FormData())).toEqual({});
+    for (const [field, value] of [["seed", "-1"], ["steps", "151"], ["cfg", "31"]] as const) {
+      const formData = new FormData();
+      formData.set(field, value);
+      expect(() => parseGenerationParameters(formData)).toThrow(ApiError);
     }
   });
 });

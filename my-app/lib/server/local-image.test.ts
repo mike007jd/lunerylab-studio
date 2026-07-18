@@ -91,14 +91,29 @@ describe("generateImagesLocal", () => {
       }),
     );
 
-    const result = await generateImagesLocal(makeInput(), "http://comfy");
+    const result = await generateImagesLocal(makeInput({
+      generationParameters: {
+        seed: 4242,
+        steps: 24,
+        cfg: 5.5,
+        negativePrompt: "blur, watermark",
+      },
+    }), "http://comfy");
     expect(result.provider).toBe("local-comfyui");
     expect(result.images).toHaveLength(1);
 
     const ws = queuedWorkflow!;
-    expect(ws["3"]!.inputs).toMatchObject({ steps: 30, cfg: 7, sampler_name: "dpmpp_2m", scheduler: "karras" });
+    expect(ws["3"]!.inputs).toMatchObject({ seed: 4242, steps: 24, cfg: 5.5, sampler_name: "dpmpp_2m", scheduler: "karras" });
+    expect(ws["7"]!.inputs).toMatchObject({ text: "blur, watermark" });
     // 16:9 from SDXL base 1024.
     expect(ws["5"]!.inputs).toMatchObject({ width: 1408, height: 792 });
+    expect(result.images[0]?.generationParameters).toEqual({
+      seed: 4242,
+      steps: 24,
+      cfg: 5.5,
+      negativePrompt: "blur, watermark",
+      modelId: "sd_xl_base_1.0",
+    });
   });
 
   it("cancels the ComfyUI job on abort and surfaces request_aborted", async () => {

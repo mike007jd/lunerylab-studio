@@ -1,6 +1,9 @@
+import type { AppliedGenerationParameters, GenerationParameters } from "@/lib/generation-parameters";
+
 export interface GeneratedImage {
   bytes: Buffer;
   mimeType: string;
+  generationParameters?: AppliedGenerationParameters;
 }
 
 export interface GenerateImageInput {
@@ -12,6 +15,7 @@ export interface GenerateImageInput {
   aspectRatio?: string;
   references?: Buffer[];
   isEdit?: boolean;
+  generationParameters?: GenerationParameters;
   /**
    * Caller cancel signal (user "Stop" / request abort). Threaded into the
    * provider request so a stop actually interrupts the in-flight call instead of

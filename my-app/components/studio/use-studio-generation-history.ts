@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AssetDTO } from "@/lib/types/api";
+import type { GenerationParameters } from "@/lib/generation-parameters";
 
 // Lightweight in-page history survives refreshes; Library remains canonical.
 // Running entries are not persisted because they cannot survive the page lifecycle.
@@ -48,6 +49,7 @@ export interface GenerationEntry {
   projectId: string | null;
   referenceAssetIds: string[];
   batchVariants: GenerationBatchVariant[] | null;
+  generationParameters: GenerationParameters;
   /** Resolved assets returned by the API on success. */
   assets: AssetDTO[];
   /** Warning strings from the active backend (model fallback etc.). */
@@ -105,6 +107,10 @@ function loadInitialEntries(): GenerationEntry[] {
     // ghost spinners after a refresh. Cap length defensively.
     return parsed
       .filter((e): e is GenerationEntry => !!e && typeof e === "object" && e.status !== "running")
+      .map((entry) => ({
+        ...entry,
+        generationParameters: entry.generationParameters ?? {},
+      }))
       .slice(0, STUDIO_HISTORY_LIMIT);
   } catch {
     return [];
@@ -173,6 +179,7 @@ export function useStudioGenerationHistory(): UseStudioGenerationHistoryResult {
       projectId: input.projectId,
       referenceAssetIds: input.referenceAssetIds,
       batchVariants: input.batchVariants,
+      generationParameters: input.generationParameters,
       assets: [],
       warnings: [],
       error: null,

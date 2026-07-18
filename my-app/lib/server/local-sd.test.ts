@@ -36,6 +36,12 @@ describe("local sd-cpp generation args", () => {
         prompt: "a product photo",
         count: 1,
         aspectRatio: "16:9",
+        generationParameters: {
+          seed: 4242,
+          steps: 12,
+          cfg: 3.5,
+          negativePrompt: "blur, watermark",
+        },
       }),
     ).rejects.toThrow("Embedded sd.cpp produced no images");
 
@@ -61,6 +67,13 @@ describe("local sd-cpp generation args", () => {
     expect(args).toContain("--offload-to-cpu");
     expect(args.slice(args.indexOf("-W"), args.indexOf("-W") + 2)).toEqual(["-W", "1408"]);
     expect(args.slice(args.indexOf("-H"), args.indexOf("-H") + 2)).toEqual(["-H", "792"]);
+    expect(args.slice(args.indexOf("-s"), args.indexOf("-s") + 2)).toEqual(["-s", "4242"]);
+    expect(args.slice(args.indexOf("--steps"), args.indexOf("--steps") + 2)).toEqual(["--steps", "12"]);
+    expect(args.slice(args.indexOf("--cfg-scale"), args.indexOf("--cfg-scale") + 2)).toEqual(["--cfg-scale", "3.5"]);
+    expect(args.slice(args.indexOf("--negative-prompt"), args.indexOf("--negative-prompt") + 2)).toEqual([
+      "--negative-prompt",
+      "blur, watermark",
+    ]);
     expect(args).not.toContain("--clip_l");
     expect(args).not.toContain("--t5xxl");
     expect(body.runId).toBe("run-flux-2");

@@ -246,6 +246,11 @@ model Asset {
   /// Optional one-line note for the user's own bookkeeping.
   note               String?
   summary            String?
+  generationSeed     Int?
+  generationSteps    Int?
+  generationCfg      Float?
+  negativePrompt     String?
+  generationModel    String?
   deletedAt          DateTime?
   createdAt          DateTime        @default(now())
   user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)

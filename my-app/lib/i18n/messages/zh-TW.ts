@@ -196,6 +196,14 @@ const zhTW = {
       "refineDisabled": "連接模型後才能優化提示詞。"
     },
     "options": "參數",
+    "advanced": "進階",
+    "seed": "種子",
+    "seedRandom": "隨機",
+    "steps": "步數",
+    "cfg": "引導強度",
+    "automatic": "自動",
+    "negativePrompt": "負面提示詞",
+    "parametersReused": "已重用生成參數",
     "model": "模型",
     "output": "輸出",
     "projectCreated": "已建立：{name}",
@@ -211,6 +219,7 @@ const zhTW = {
     "results": {
       "heading": "結果",
       "regenerate": "重新生成",
+      "reuseSeed": "重用種子",
       "sendToCanvas": "送進 Canvas 精修",
       "dismiss": "移除",
       "running": "正在生成…",
@@ -630,6 +639,7 @@ const zhTW = {
     }
   },
   "assetActions": {
+    "generationDetails": "生成詳情",
     "download": "下載",
     "useAsReference": "用作參考圖",
     "openInCanvas": "送進 Canvas 精修",

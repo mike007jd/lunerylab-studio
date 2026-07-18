@@ -22,6 +22,7 @@ import { findHfModelEntry } from "@/lib/hf-model-catalog";
 import { findImportedModel, modelCachePath } from "@/lib/server/imported-model-registry";
 import type { GenerateImageInput, GenerateImageResult } from "@/lib/server/generation-types";
 import { localImageDimensions } from "@/lib/server/generation-dimensions";
+import { normalizeGenerationParameters, randomGenerationSeed } from "@/lib/generation-parameters";
 
 /** Per-image wall-clock cap sent to the Rust executor (it clamps to [30,1800]). */
 const PER_IMAGE_TIMEOUT_SECS = 300;
@@ -74,6 +75,9 @@ async function buildArgs(opts: {
   prompt: string;
   outPath: string;
   seed: number;
+  steps: number;
+  cfg: number;
+  negativePrompt: string;
   ratio: string | undefined;
 }): Promise<{ args: string[] } | { error: string }> {
   const entry = findHfModelEntry(opts.modelId);
@@ -101,6 +105,7 @@ async function buildArgs(opts: {
     "-W", String(w),
     "-H", String(h),
     "-s", String(opts.seed),
+    "--negative-prompt", opts.negativePrompt,
     "-o", opts.outPath,
     "-v",
     ...extra,
@@ -115,9 +120,9 @@ async function buildArgs(opts: {
         "--vae", FLUX1_COMPANIONS["ae.safetensors"],
         "--clip_l", FLUX1_COMPANIONS["clip_l.safetensors"],
         "--t5xxl", FLUX1_COMPANIONS["t5xxl_fp16.safetensors"],
-        "--cfg-scale", "1.0",
+        "--cfg-scale", String(opts.cfg),
         "--sampling-method", "euler",
-        "--steps", "4",
+        "--steps", String(opts.steps),
         ...common([]),
       ],
     };
@@ -129,9 +134,9 @@ async function buildArgs(opts: {
         "--diffusion-model", modelFile,
         "--vae", FLUX2_COMPANIONS["full_encoder_small_decoder.safetensors"],
         "--llm", FLUX2_COMPANIONS["Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf"],
-        "--cfg-scale", "1.0",
+        "--cfg-scale", String(opts.cfg),
         "--sampling-method", "euler",
-        "--steps", "28",
+        "--steps", String(opts.steps),
         "--diffusion-fa",
         "--offload-to-cpu",
         ...common([]),
@@ -139,10 +144,8 @@ async function buildArgs(opts: {
     };
   }
 
-  const steps = opts.modelId === "sdxl-base-1.0" ? "30" : "20";
-  const cfg = "7.0";
   return {
-    args: ["-m", modelFile, "--cfg-scale", cfg, "--sampling-method", "euler", "--steps", steps, ...common([])],
+    args: ["-m", modelFile, "--cfg-scale", String(opts.cfg), "--sampling-method", "euler", "--steps", String(opts.steps), ...common([])],
   };
 }
 
@@ -211,18 +214,28 @@ export async function generateImagesLocalSd(
   const tmpBase = path.join(os.tmpdir(), `lunery-sd-${randomUUID()}`);
   const outPaths: string[] = [];
   const runs: string[][] = [];
+  const runParameters: Array<{ seed: number; steps: number; cfg: number; negativePrompt: string }> = [];
+  const requestedParameters = normalizeGenerationParameters(input.generationParameters ?? {});
+  const defaultSteps = modelId === "flux1-schnell-q4" ? 4 : modelId === "flux2-dev-q4" ? 28 : modelId === "sdxl-base-1.0" ? 30 : 20;
+  const defaultCfg = modelId.startsWith("flux") ? 1 : 7;
   for (let i = 0; i < input.count; i += 1) {
     const outPath = `${tmpBase}-${i}.png`;
-    const seed = Math.floor(Math.random() * 2 ** 31);
-    const built = await buildArgs({ modelId, prompt: input.prompt, outPath, seed, ratio: input.aspectRatio });
+    const resolved = {
+      seed: requestedParameters.seed ?? randomGenerationSeed(),
+      steps: requestedParameters.steps ?? defaultSteps,
+      cfg: requestedParameters.cfg ?? defaultCfg,
+      negativePrompt: requestedParameters.negativePrompt ?? "",
+    };
+    const built = await buildArgs({ modelId, prompt: input.prompt, outPath, ...resolved, ratio: input.aspectRatio });
     if ("error" in built) {
       throw new ApiError({ status: 400, code: "invalid_request", message: built.error, retryable: false });
     }
     outPaths.push(outPath);
     runs.push(built.args);
+    runParameters.push(resolved);
   }
 
-  const images: Array<{ bytes: Buffer; mimeType: string }> = [];
+  const images: GenerateImageResult["images"] = [];
   const warnings: string[] = [];
   let results: SdRunResult[] = [];
   // When the caller aborts (Agent Stop / request deadline), tell the bridge to
@@ -308,7 +321,18 @@ export async function generateImagesLocalSd(
       if (r?.ok) {
         try {
           const bytes = await fs.readFile(outPaths[i]!); // safe: i < outPaths.length loop bound guarantees presence
-          images.push({ bytes, mimeType: "image/png" });
+          const applied = runParameters[i]!;
+          images.push({
+            bytes,
+            mimeType: "image/png",
+            generationParameters: {
+              seed: applied.seed,
+              steps: applied.steps,
+              cfg: applied.cfg,
+              negativePrompt: applied.negativePrompt || null,
+              modelId,
+            },
+          });
         } catch {
           warnings.push(`candidate_${i + 1}: output_unreadable`);
         }

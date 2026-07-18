@@ -84,6 +84,11 @@ interface LibrarySearchResponse {
     prompt?: string | null;
     provider?: string | null;
     model?: string | null;
+    generationSeed?: number | null;
+    generationSteps?: number | null;
+    generationCfg?: number | null;
+    negativePrompt?: string | null;
+    generationModel?: string | null;
     projectName?: string | null;
   }>;
   nextCursor: string | null;
@@ -104,6 +109,11 @@ function toLibraryAsset(asset: LibrarySearchResponse["assets"][number]): Library
     prompt: asset.prompt ?? null,
     provider: asset.provider ?? null,
     model: asset.model ?? null,
+    generationSeed: asset.generationSeed ?? null,
+    generationSteps: asset.generationSteps ?? null,
+    generationCfg: asset.generationCfg ?? null,
+    negativePrompt: asset.negativePrompt ?? null,
+    generationModel: asset.generationModel ?? null,
     agentTaskId: asset.agentTaskId ?? null,
     agentTaskSummary: asset.agentTaskSummary ?? null,
     parentAssetId: asset.parentAssetId ?? null,
