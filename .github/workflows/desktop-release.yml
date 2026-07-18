@@ -112,6 +112,20 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-release-
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
+      - name: Enable Windows long paths
+        # The bundled Next.js standalone server carries deeply nested pnpm
+        # (`.pnpm/<pkg>@<hash>/node_modules/...`) paths. Combined with the
+        # runner checkout prefix (`D:\a\lunerylab-studio\lunerylab-studio\`)
+        # these exceed the 260-char MAX_PATH, so makensis fails to open files
+        # while building the NSIS installer. Enabling long-path support lets
+        # NSIS 3.11 (long-path aware) and git read them.
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          git config --system core.longpaths true
+          Write-Host "LongPathsEnabled set to 1; git core.longpaths enabled."
+
       - name: Install dependencies
         working-directory: my-app
         run: pnpm install --frozen-lockfile
