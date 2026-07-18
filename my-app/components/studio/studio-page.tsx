@@ -11,6 +11,7 @@ import {
   type PresetCategory,
 } from "@/lib/presets/style-presets";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
+import { toActionableGenerationError } from "@/lib/client/generation-errors";
 import { sendAssetToCanvas } from "@/lib/client/canvas-sessions";
 import { addCanvasEntrySource } from "@/lib/client/creation-flow";
 import {
@@ -657,11 +658,11 @@ export function StudioPage({
         if (isRequestAbortedError(generateError)) {
           history.update(entryId, { status: "canceled", error: null });
         } else {
-          const message = toErrorMessage(generateError, t("studio.generationFailed"));
+          const message = toActionableGenerationError(generateError, t("studio.generationFailed"), t);
           history.update(entryId, { status: "failed", error: message });
         }
       } else {
-        setError(toErrorMessage(generateError, t("studio.generationFailed")));
+        setError(toActionableGenerationError(generateError, t("studio.generationFailed"), t));
       }
     } finally {
       isSubmittingRef.current = false;
@@ -728,7 +729,7 @@ export function StudioPage({
               ? { status: "canceled", error: null }
               : {
                   status: "failed",
-                  error: toErrorMessage(regenError, t("studio.generationFailed")),
+                  error: toActionableGenerationError(regenError, t("studio.generationFailed"), t),
                 },
           );
         } finally {
