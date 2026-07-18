@@ -11,7 +11,7 @@
 Lunery Lab Studio is the Tauri 2 desktop shell distributed through the sibling
 marketing website. The product is:
 
-- Free, MIT open-source, no monetization layer.
+- Free, Apache-2.0 open-source, no monetization layer.
 - Single-user, **account-less** — no backend identity, no entitlement service.
 - Distributed via GitHub Releases (macOS `.dmg` + `.app` and Windows NSIS
   `.exe` artifacts built by `.github/workflows/desktop-release.yml`; no Linux

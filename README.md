@@ -42,7 +42,7 @@ website deployment are maintained separately.
 - Framer Motion
 - Prisma with PostgreSQL
 - Local-first / BYOK desktop direction; Vercel AI SDK is allowed as a library, but Vercel AI Gateway is not a target service
-- No account / auth layer — single-user, account-less, MIT open-source
+- No account / auth layer — single-user, account-less, Apache-2.0 open-source
 
 What exists in code:
 
@@ -95,4 +95,5 @@ hygiene notes.
 
 ## License
 
-This repository is licensed under MIT. See [LICENSE](LICENSE).
+This repository is licensed under the Apache License 2.0. See [LICENSE](LICENSE)
+and [NOTICE](NOTICE).

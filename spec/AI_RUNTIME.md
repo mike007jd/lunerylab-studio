@@ -101,7 +101,7 @@ Model supply has two explicit layers:
   **Desktop (Tauri 2) = the real Studio.**
 - Primary surface: image generation (high frequency). Video is secondary
   (low frequency, expensive — keep choices few).
-- **Free, MIT open-source, single-user, account-less.** No monetization
+- **Free, Apache-2.0 open-source, single-user, account-less.** No monetization
   layer — no Pro / team license / billing / credits / license-key. Do not
   reintroduce a paid-tier UX.
 - Avoid enterprise / power-user features unless explicitly requested.
