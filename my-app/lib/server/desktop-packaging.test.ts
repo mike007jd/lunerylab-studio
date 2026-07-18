@@ -99,7 +99,11 @@ describe("desktop installer packaging", () => {
     expect(workflow).toContain("run: pnpm desktop:build");
     expect(workflow).toContain("runner: macos-latest");
     expect(workflow).toContain("runner: windows-latest");
-    expect(workflow).not.toContain("APPLE_CERTIFICATE");
+    // Hosted runners import the Developer ID certificate into an ephemeral
+    // keychain under RUNNER_TEMP and delete the decoded .p12 before building.
+    expect(workflow).toContain("Import Apple Developer certificate into a temporary keychain");
+    expect(workflow).toContain('security create-keychain -p "$keychain_password" "$keychain"');
+    expect(workflow).toContain('rm -f "$RUNNER_TEMP/certificate.p12"');
     expect(validateWorkflow).toContain(
       "runs-on: macos-latest",
     );

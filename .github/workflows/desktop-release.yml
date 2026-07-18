@@ -116,11 +116,14 @@ jobs:
         working-directory: my-app
         run: pnpm install --frozen-lockfile
 
-      - name: Require signing secrets for tag releases (fail closed)
-        # A tag push publishes public installers, so it must NOT ship unsigned.
-        # If the platform's signing secrets are absent, fail here rather than
-        # emitting an installer users have to bypass Gatekeeper/SmartScreen to
-        # run. workflow_dispatch (dev, build-only) is exempt and still builds.
+      - name: Require signing secrets for tag releases
+        # A tag push publishes public installers. macOS must NOT ship unsigned:
+        # Gatekeeper blocks unsigned apps outright, so missing Apple secrets
+        # fail the release. Windows Authenticode is optional at launch — with
+        # no certificate the installer publishes unsigned (SmartScreen warning)
+        # instead of blocking the release. workflow_dispatch (dev, build-only)
+        # is exempt and still builds.
+        id: signing
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
@@ -128,6 +131,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           SIGNING_CREDENTIAL_OWNER: ${{ vars.SIGNING_CREDENTIAL_OWNER }}
@@ -135,21 +140,15 @@ jobs:
           WINDOWS_EXPECTED_PUBLISHER: ${{ vars.WINDOWS_EXPECTED_PUBLISHER }}
         run: |
           set -euo pipefail
-          missing=()
           if [ "${{ matrix.os }}" = "macos-latest" ]; then
-            for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID SIGNING_CREDENTIAL_OWNER NOTARIZATION_CREDENTIAL_ROTATED_AT; do
+            missing=()
+            for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD SIGNING_CREDENTIAL_OWNER NOTARIZATION_CREDENTIAL_ROTATED_AT; do
               [ -n "${!name:-}" ] || missing+=("$name")
             done
-          else
-            for name in WINDOWS_CERTIFICATE WINDOWS_CERTIFICATE_PASSWORD SIGNING_CREDENTIAL_OWNER WINDOWS_EXPECTED_PUBLISHER; do
-              [ -n "${!name:-}" ] || missing+=("$name")
-            done
-          fi
-          if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::Refusing to publish an unsigned ${{ matrix.label }} installer. Missing secrets: ${missing[*]}"
-            exit 1
-          fi
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            if [ ${#missing[@]} -ne 0 ]; then
+              echo "::error::Refusing to publish an unsigned ${{ matrix.label }} installer. Missing secrets: ${missing[*]}"
+              exit 1
+            fi
             node <<'NODE'
           const raw = process.env.NOTARIZATION_CREDENTIAL_ROTATED_AT;
           const rotatedAt = new Date(`${raw}T00:00:00Z`);
@@ -158,8 +157,39 @@ jobs:
             throw new Error("NOTARIZATION_CREDENTIAL_ROTATED_AT must be a valid YYYY-MM-DD date within the last 180 days.");
           }
           NODE
+            echo "Signing secrets present for ${{ matrix.label }}."
+          else
+            if [ -n "${WINDOWS_CERTIFICATE:-}" ] && [ -n "${WINDOWS_CERTIFICATE_PASSWORD:-}" ] && [ -n "${WINDOWS_EXPECTED_PUBLISHER:-}" ]; then
+              echo "sign_windows=true" >> "$GITHUB_OUTPUT"
+              echo "Windows signing certificate present; installer will be Authenticode-signed."
+            else
+              echo "sign_windows=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::No Windows signing certificate configured; publishing an unsigned Windows installer."
+            fi
           fi
-          echo "Signing secrets present for ${{ matrix.label }}."
+
+      - name: Import Apple Developer certificate into a temporary keychain
+        # Hosted runners have no signing identity in the keychain; import the
+        # Developer ID certificate from secrets per the official Tauri CI flow
+        # (https://v2.tauri.app/distribute/sign/macos, checked 2026-07-18).
+        if: matrix.os == 'macos-latest' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security find-identity -v -p codesigning "$keychain"
 
       - name: Build + bundle installer (signed + notarized when secrets present)
         working-directory: my-app
@@ -176,6 +206,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: pnpm desktop:build
 
       - name: Verify macOS signature + notarization
@@ -199,7 +231,7 @@ jobs:
           hdiutil verify "$dmg"
 
       - name: Sign Windows installer (Authenticode) + verify
-        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/')
+        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/') && steps.signing.outputs.sign_windows == 'true'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -266,10 +298,12 @@ jobs:
 
   release:
     # Publish exactly one Release per tag, after every variant has built.
+    # Installers are published on this repository's Releases page — the
+    # canonical download location for the open-source app.
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
-      contents: read
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Collect every staged installer
@@ -281,17 +315,11 @@ jobs:
 
       - name: Publish GitHub Release
         env:
-          # Public installers live in a clean releases-only repository so the
-          # website can depend on one stable download contract.
-          GH_TOKEN: ${{ secrets.LUNERY_RELEASES_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
-          REPO: mike007jd/LuneryLab-Releases
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::Missing LUNERY_RELEASES_TOKEN for $REPO release publishing."
-            exit 1
-          fi
           # Publish SHA-256 checksums alongside the installers so downloads can be
           # verified against the release.
           ( cd dist && sha256sum -- * > SHA256SUMS.txt )
@@ -299,7 +327,7 @@ jobs:
           ## Install
 
           - **macOS (Apple Silicon)** — download the `.dmg`, open it, and drag Lunery Lab Studio to Applications, then launch it normally. The build is signed with an Apple Developer ID and notarized.
-          - **Windows (x64)** — download the `.exe` installer and run it. The installer is Authenticode-signed. The launch Windows installer runs on CPU and works everywhere.
+          - **Windows (x64)** — download the `.exe` installer and run it. The launch Windows installer runs on CPU and works everywhere. If SmartScreen warns about an unrecognized app, verify your download against `SHA256SUMS.txt`, then choose "More info → Run anyway".
 
           Verify your download against `SHA256SUMS.txt`.
 

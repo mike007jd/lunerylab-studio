@@ -60,7 +60,7 @@ For rendered UI changes, also run the app locally and verify the affected surfac
 
 ## Release
 
-Desktop installers are built from `.github/workflows/desktop-release.yml` on `v*` tags. Public launch assets are published from the clean releases-only repository `mike007jd/LuneryLab-Releases`, and the public download page links to stable GitHub Releases asset names:
+Desktop installers are built from `.github/workflows/desktop-release.yml` on `v*` tags and published on this repository's GitHub Releases page under stable asset names:
 
 - `Lunery-Lab-Studio-macOS-arm64.dmg`
 - `Lunery-Lab-Studio-Windows-x64.exe`

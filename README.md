@@ -64,7 +64,7 @@ workspace. To uninstall completely, remove the application and then delete the
 
 ## Distribution and downloads
 
-- Public installers are published from `mike007jd/LuneryLab-Releases`; the public website owns the download links.
+- Public installers are published on this repository's [Releases](../../releases) page.
 - macOS Apple Silicon: `Lunery-Lab-Studio-macOS-arm64.dmg`
 - Windows x64: `Lunery-Lab-Studio-Windows-x64.exe` currently uses CPU-only
   inference. Windows GPU acceleration is on the roadmap.

@@ -115,11 +115,19 @@ Configure every custom secret referenced by
 - `APPLE_ID`: Apple account submitted to `notarytool`.
 - `APPLE_PASSWORD`: app-specific Apple password submitted to `notarytool`.
 - `APPLE_TEAM_ID`: Apple Developer team used for notarization.
+- `APPLE_CERTIFICATE`: base64-encoded Developer ID Application certificate
+  (`.p12` export) imported into a temporary keychain on the hosted runner.
+- `APPLE_CERTIFICATE_PASSWORD`: export password for `APPLE_CERTIFICATE`.
+
+Optional secrets (Windows Authenticode; when absent, tag builds publish an
+unsigned Windows installer with a workflow warning instead of failing):
+
 - `WINDOWS_CERTIFICATE`: base64-encoded Windows code-signing `.pfx` imported
   only for the signing step.
 - `WINDOWS_CERTIFICATE_PASSWORD`: password for `WINDOWS_CERTIFICATE`.
-- `LUNERY_RELEASES_TOKEN`: token allowed to create and update releases in
-  `mike007jd/LuneryLab-Releases`.
+
+Releases publish to this repository's own Releases page using the built-in
+`GITHUB_TOKEN`; no cross-repository release token exists anymore.
 
 The workflow also references `GITHUB_TOKEN` to authenticate pinned sidecar
 asset lookups. GitHub creates that token automatically for each workflow run;
@@ -133,7 +141,8 @@ Required GitHub Actions variables:
   rotation date in `YYYY-MM-DD`; tag builds fail when it is missing, in the
   future, or older than 180 days.
 - `WINDOWS_EXPECTED_PUBLISHER`: the expected publisher text in the Windows
-  certificate subject; CI rejects any other signer.
+  certificate subject; CI rejects any other signer. Only required once the
+  optional Windows signing secrets are configured.
 
 Ownership and rotation:
 
