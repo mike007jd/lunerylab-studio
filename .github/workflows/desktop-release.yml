@@ -18,7 +18,7 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  # Quality gate: run the reusable self-hosted web and desktop lanes before
+  # Quality gate: run the reusable hosted web and desktop lanes before
   # building any installer, so a tag push can never ship a build that fails CI.
   validate:
     permissions:
@@ -29,7 +29,7 @@ jobs:
   # the published installer's version can't drift from the release tag. On
   # workflow_dispatch (no tag) this is a no-op, keeping the build-only path alive.
   version-check:
-    runs-on: [self-hosted, macOS, ARM64, ecommerceai]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -66,18 +66,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            runner: [self-hosted, macOS, ARM64, ecommerceai]
+          - os: macos-latest
+            runner: macos-latest
             accel: metal
             label: macos-arm64
             asset: Lunery-Lab-Studio-macOS-arm64.dmg
-            bundleGlob: my-app/src-tauri/target/release/bundle/dmg/*.dmg
+            bundleDir: my-app/src-tauri/target/release/bundle/dmg
+            bundlePattern: "*.dmg"
           - os: windows-latest
             runner: windows-latest
             accel: cpu
             label: windows-x64-cpu
             asset: Lunery-Lab-Studio-Windows-x64.exe
-            bundleGlob: my-app/src-tauri/target/release/bundle/nsis/*-setup.exe
+            bundleDir: my-app/src-tauri/target/release/bundle/nsis
+            bundlePattern: "*-setup.exe"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -97,6 +99,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
+
+      - name: Cache Cargo registry and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            my-app/src-tauri/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('my-app/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install dependencies
         working-directory: my-app
@@ -122,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=()
-          if [ "${{ matrix.os }}" = "macos-14" ]; then
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
             for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID SIGNING_CREDENTIAL_OWNER NOTARIZATION_CREDENTIAL_ROTATED_AT; do
               [ -n "${!name:-}" ] || missing+=("$name")
             done
@@ -135,7 +149,7 @@ jobs:
             echo "::error::Refusing to publish an unsigned ${{ matrix.label }} installer. Missing secrets: ${missing[*]}"
             exit 1
           fi
-          if [ "${{ matrix.os }}" = "macos-14" ]; then
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
             node <<'NODE'
           const raw = process.env.NOTARIZATION_CREDENTIAL_ROTATED_AT;
           const rotatedAt = new Date(`${raw}T00:00:00Z`);
@@ -165,13 +179,13 @@ jobs:
         run: pnpm desktop:build
 
       - name: Verify macOS signature + notarization
-        if: matrix.os == 'macos-14' && startsWith(github.ref, 'refs/tags/')
+        if: matrix.os == 'macos-latest' && startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
-          dmg=$(ls ${{ matrix.bundleGlob }} | head -n1)
+          dmg=$(find "${{ matrix.bundleDir }}" -maxdepth 1 -type f -name '${{ matrix.bundlePattern }}' -print -quit)
           app=$(find my-app/src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)
           [ -n "$app" ] || { echo "::error::No macOS app bundle found."; exit 1; }
           echo "Verifying $app and $dmg"
@@ -235,9 +249,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          src=$(ls ${{ matrix.bundleGlob }} | head -n1)
+          src=$(find "${{ matrix.bundleDir }}" -maxdepth 1 -type f -name '${{ matrix.bundlePattern }}' -print -quit)
           if [ -z "$src" ]; then
-            echo "No installer found for ${{ matrix.label }} at ${{ matrix.bundleGlob }}" >&2
+            echo "No installer found for ${{ matrix.label }} in ${{ matrix.bundleDir }}" >&2
             exit 1
           fi
           cp "$src" "dist/${{ matrix.asset }}"
@@ -256,7 +270,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
-    runs-on: [self-hosted, macOS, ARM64, ecommerceai]
+    runs-on: ubuntu-latest
     steps:
       - name: Collect every staged installer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -274,14 +288,13 @@ jobs:
           REPO: mike007jd/LuneryLab-Releases
         run: |
           set -euo pipefail
-          export PATH="/opt/homebrew/bin:$PATH"
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::error::Missing LUNERY_RELEASES_TOKEN for $REPO release publishing."
             exit 1
           fi
           # Publish SHA-256 checksums alongside the installers so downloads can be
           # verified against the release.
-          ( cd dist && shasum -a 256 * > SHA256SUMS.txt )
+          ( cd dist && sha256sum -- * > SHA256SUMS.txt )
           cat > notes.md <<'EOF'
           ## Install
 
