@@ -23,6 +23,7 @@ import { findImportedModel, modelCachePath } from "@/lib/server/imported-model-r
 import type { GenerateImageInput, GenerateImageResult } from "@/lib/server/generation-types";
 import { localImageDimensions } from "@/lib/server/generation-dimensions";
 import { normalizeGenerationParameters, randomGenerationSeed } from "@/lib/generation-parameters";
+import { mapLocalSdErrorCode } from "@/lib/server/local-sd-errors";
 
 /** Per-image wall-clock cap sent to the Rust executor (it clamps to [30,1800]). */
 const PER_IMAGE_TIMEOUT_SECS = 300;
@@ -57,6 +58,16 @@ function timeoutForModel(modelId: string): number {
 interface SdRunResult {
   ok: boolean;
   error: string | null;
+}
+
+function localSdApiError(rawError: string, context: string): ApiError {
+  const detail = rawError.trim().slice(0, 300) || "Unknown engine error";
+  return new ApiError({
+    status: 502,
+    code: mapLocalSdErrorCode(detail),
+    message: `${context}: ${detail}`,
+    retryable: true,
+  });
 }
 
 const ABORT_ERROR = new ApiError({
@@ -285,12 +296,7 @@ export async function generateImagesLocalSd(
       });
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
-        throw new ApiError({
-          status: 502,
-          code: "provider_error",
-          message: `Embedded sd.cpp engine error (${res.status}): ${txt.slice(0, 300)}`,
-          retryable: true,
-        });
+        throw localSdApiError(txt, `Embedded sd.cpp engine error (${res.status})`);
       }
       results = ((await res.json()) as { results: SdRunResult[] }).results;
       if (!Array.isArray(results) || results.length !== outPaths.length) {
@@ -304,12 +310,10 @@ export async function generateImagesLocalSd(
     } catch (error) {
       if (error instanceof ApiError) throw error;
       if (isAbortError(error, abortSignal)) throw ABORT_ERROR;
-      throw new ApiError({
-        status: 502,
-        code: "provider_error",
-        message: `Embedded sd.cpp engine unreachable: ${error instanceof Error ? error.message : "unknown"}`,
-        retryable: true,
-      });
+      throw localSdApiError(
+        `engine unreachable: ${error instanceof Error ? error.message : "unknown"}`,
+        "Embedded sd.cpp engine unavailable",
+      );
     }
 
     if (results.some((result) => /\bcancel(?:ed|led)\b/i.test(result.error ?? ""))) {
@@ -337,14 +341,8 @@ export async function generateImagesLocalSd(
           warnings.push(`candidate_${i + 1}: output_unreadable`);
         }
       } else {
-        // Translate common errno strings the bridge surfaces (e.g. "No such
-        // file or directory", "ENOENT") into actionable text so the user knows
-        // they likely deleted the model file between Settings download and now.
         const raw = (r?.error ?? "generation_error").slice(0, 200);
-        const friendly = /enoent|no such file/i.test(raw)
-          ? "model_file_missing — open Settings → Local models to redownload"
-          : raw;
-        warnings.push(`candidate_${i + 1}: ${friendly}`);
+        warnings.push(`candidate_${i + 1}: ${mapLocalSdErrorCode(raw)}: ${raw}`);
       }
     }
   } finally {
@@ -354,12 +352,7 @@ export async function generateImagesLocalSd(
   }
 
   if (images.length === 0) {
-    throw new ApiError({
-      status: 502,
-      code: "provider_error",
-      message: `Embedded sd.cpp produced no images. ${warnings.join("; ")}`.slice(0, 500),
-      retryable: true,
-    });
+    throw localSdApiError(warnings.join("; "), "Embedded sd.cpp produced no images");
   }
 
   return {

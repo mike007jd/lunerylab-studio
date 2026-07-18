@@ -210,6 +210,12 @@ const zhCN = {
     "createProjectFailed": "创建项目失败",
     "generatedImages": "成功生成 {count} 张图片",
     "generationFailed": "生成失败",
+    "generationErrors": {
+      "outOfMemory": "内存不足。请降低尺寸或生成张数，或换用更小的模型。",
+      "modelLoadFailed": "模型无法加载。请在设置中重新下载，或换用其他模型。",
+      "engineUnavailable": "本地 AI 已停止。请重启应用后再试。",
+      "genericGuide": "请重试；若持续失败，请重启本地 AI 或换用其他模型。"
+    },
     "cancelFailed": "无法停止图片生成，请再次点击取消。",
     "earlierResults": "更早结果",
     "earlierResultsSummary": "还有 {count} 批更早结果可查看。",

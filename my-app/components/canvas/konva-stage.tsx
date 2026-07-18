@@ -40,9 +40,14 @@ export type MaskExportResult =
   | { ok: true; blob: Blob }
   | { ok: false; reason: "no-markers" | "rotated-layer" | "unavailable" };
 
+export type CanvasCompositionExportResult =
+  | { ok: true; blob: Blob; width: number; height: number }
+  | { ok: false; reason: "empty" | "unavailable" };
+
 export interface KonvaStageHandle {
   flushDrawingState: () => void;
   getMaskForLayer: (layerId: string) => Promise<MaskExportResult>;
+  exportComposition: () => Promise<CanvasCompositionExportResult>;
 }
 
 interface KonvaStageProps {
@@ -278,6 +283,61 @@ export function KonvaStage({
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
       return blob ? { ok: true, blob } : { ok: false, reason: "unavailable" };
     },
+    exportComposition: async () => {
+      const stage = stageNodeRef.current;
+      const exportNodes = layers
+        .filter((layer) => !layer.hidden)
+        .map((layer) => assetNodesRef.current.get(layer.id))
+        .filter((node): node is Konva.Image => Boolean(node));
+      if (!stage || exportNodes.length === 0) return { ok: false, reason: "empty" };
+      if (exportNodes.some((node) => !node.image())) return { ok: false, reason: "unavailable" };
+
+      const originalPosition = stage.position();
+      const originalScale = stage.scale();
+      const excluded = stage.find(".canvas-export-excluded");
+      const nodeEffects = exportNodes.map((node) => ({
+        node,
+        strokeWidth: node.strokeWidth(),
+        shadowOpacity: node.shadowOpacity(),
+      }));
+      try {
+        stage.position({ x: 0, y: 0 });
+        stage.scale({ x: 1, y: 1 });
+        excluded.forEach((node) => node.hide());
+        nodeEffects.forEach(({ node }) => {
+          node.strokeWidth(0);
+          node.shadowOpacity(0);
+        });
+        stage.draw();
+
+        const boxes = exportNodes.map((node) => node.getClientRect({
+          skipShadow: true,
+          skipStroke: true,
+        }));
+        const minX = Math.floor(Math.min(...boxes.map((box) => box.x)));
+        const minY = Math.floor(Math.min(...boxes.map((box) => box.y)));
+        const maxX = Math.ceil(Math.max(...boxes.map((box) => box.x + box.width)));
+        const maxY = Math.ceil(Math.max(...boxes.map((box) => box.y + box.height)));
+        const width = Math.max(1, maxX - minX);
+        const height = Math.max(1, maxY - minY);
+        const canvas = stage.toCanvas({ x: minX, y: minY, width, height, pixelRatio: 1 });
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+        return blob
+          ? { ok: true, blob, width, height }
+          : { ok: false, reason: "unavailable" };
+      } catch {
+        return { ok: false, reason: "unavailable" };
+      } finally {
+        excluded.forEach((node) => node.show());
+        nodeEffects.forEach(({ node, strokeWidth, shadowOpacity }) => {
+          node.strokeWidth(strokeWidth);
+          node.shadowOpacity(shadowOpacity);
+        });
+        stage.position(originalPosition);
+        stage.scale(originalScale);
+        stage.draw();
+      }
+    },
   }), [layers, onDrawingStateChange]);
 
   useEffect(() => {
@@ -387,7 +447,7 @@ export function KonvaStage({
         onTouchEnd={finishMask}
       >
         <Layer>
-          <Rect x={-100000} y={-100000} width={200000} height={200000} fill={palette.background} listening={false} />
+          <Rect name="canvas-export-excluded" x={-100000} y={-100000} width={200000} height={200000} fill={palette.background} listening={false} />
           {visibleLayers.map((item) => (
             <AssetNode
               key={item.id}
@@ -407,6 +467,7 @@ export function KonvaStage({
           {drawing.freehandLines.map((line) => (
             <Line
               key={line.id}
+              name="canvas-export-excluded"
               points={line.points}
               stroke={line.stroke}
               strokeWidth={line.strokeWidth}
@@ -418,6 +479,7 @@ export function KonvaStage({
           ))}
           <Transformer
             ref={transformerRef}
+            name="canvas-export-excluded"
             rotateEnabled
             keepRatio
             enabledAnchors={["top-left", "top-right", "bottom-left", "bottom-right"]}

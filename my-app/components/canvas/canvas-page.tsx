@@ -24,6 +24,7 @@ import {
   mergePolledLayers,
 } from "@/components/canvas/drawing-state-lifecycle";
 import { CanvasRouteState } from "@/components/canvas/canvas-route-state";
+import { CanvasExportPopover } from "@/components/canvas/canvas-export-popover";
 import { COPY } from "@/components/canvas/canvas-copy";
 import {
   PATCH_DEBOUNCE_MS,
@@ -61,6 +62,27 @@ import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
 import { useCreativeCapabilityReadiness } from "@/hooks/use-creative-capability-readiness";
 import { resolveCanvasReturnTarget } from "@/lib/client/creation-flow";
+import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
+
+interface CanvasExportResponse {
+  exports: Array<{
+    id: string;
+    url: string;
+    presetId: string;
+    downloadName: string;
+  }>;
+}
+
+function downloadCanvasExports(exports: CanvasExportResponse["exports"]): void {
+  for (const item of exports) {
+    const anchor = document.createElement("a");
+    anchor.href = item.url;
+    anchor.download = item.downloadName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }
+}
 
 function CanvasStageLoading() {
   const { locale } = useI18n();
@@ -130,6 +152,7 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
   // Re-key session loading for retry without a full document reload.
   const [reloadToken, setReloadToken] = useState(0);
   const [exitPending, setExitPending] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
   const exitPendingRef = useRef(false);
 
   const stageRef = useRef<KonvaStageHandle | null>(null);
@@ -740,6 +763,46 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
     );
   }, [selectedLayerId, sendChatMessage, copy, chat.isRunning]);
 
+  const exportCanvas = useCallback(async (
+    mode: "original" | "platforms",
+    presetIds: string[] = [],
+  ): Promise<boolean> => {
+    if (exportBusy) return false;
+    const composition = await stageRef.current?.exportComposition();
+    if (!composition?.ok) {
+      toast.error(composition?.reason === "empty" ? copy.exportEmptyTooltip : copy.exportUnavailable);
+      return false;
+    }
+    setExportBusy(true);
+    try {
+      const formData = new FormData();
+      formData.append("source", composition.blob, `canvas-${sessionId}.png`);
+      formData.append("mode", mode);
+      presetIds.forEach((presetId) => formData.append("presetIds", presetId));
+      const response = await fetchJson<CanvasExportResponse>(
+        `/api/canvas/sessions/${encodeURIComponent(sessionId)}/export`,
+        { method: "POST", body: formData },
+      );
+      downloadCanvasExports(response.exports);
+      toast.success(copy.exportComplete);
+      return true;
+    } catch (exportError) {
+      toast.error(toErrorMessage(exportError, copy.exportFailed));
+      return false;
+    } finally {
+      setExportBusy(false);
+    }
+  }, [copy, exportBusy, sessionId]);
+
+  const handleExportOriginal = useCallback(
+    () => exportCanvas("original"),
+    [exportCanvas],
+  );
+  const handleExportPlatforms = useCallback(
+    (presetIds: string[]) => exportCanvas("platforms", presetIds),
+    [exportCanvas],
+  );
+
   // These two tools currently have a Fal-only server implementation. Gate on
   // a connected Fal catalog row instead of any image model, which
   // would advertise actions that deterministically fail for local/OpenAI-only
@@ -799,6 +862,16 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
           <ArrowLeft className="h-3.5 w-3.5" />
           {returnLabel}
         </Button>
+        <div className="pointer-events-auto">
+          <CanvasExportPopover
+            disabled={!layers.some((layer) => !layer.hidden)}
+            busy={exportBusy}
+            isChinese={locale.startsWith("zh")}
+            copy={copy}
+            onExportOriginal={handleExportOriginal}
+            onExportPlatforms={handleExportPlatforms}
+          />
+        </div>
         {/* Fixed width prevents save-status changes from shifting the toolbar. */}
         <div
           className="pointer-events-none flex h-7 items-center gap-1.5 rounded-md px-2 text-xs"

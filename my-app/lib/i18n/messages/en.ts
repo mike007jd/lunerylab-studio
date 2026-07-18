@@ -210,6 +210,12 @@ const en = {
     "createProjectFailed": "Create project failed",
     "generatedImages": "Generated {count} images",
     "generationFailed": "Generation failed",
+    "generationErrors": {
+      "outOfMemory": "Not enough memory. Lower the size or image count, or use a smaller model.",
+      "modelLoadFailed": "This model could not load. Download it again in Settings, or choose another model.",
+      "engineUnavailable": "Local AI stopped. Restart the app, then try again.",
+      "genericGuide": "Try again. If it continues, restart Local AI or choose another model."
+    },
     "cancelFailed": "Could not stop image generation. Try Cancel again.",
     "earlierResults": "Earlier results",
     "earlierResultsSummary": "{count} earlier batches remain available.",
