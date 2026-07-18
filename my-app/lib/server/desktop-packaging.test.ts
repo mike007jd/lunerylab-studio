@@ -97,15 +97,20 @@ describe("desktop installer packaging", () => {
     ].join("\n");
 
     expect(workflow).toContain("run: pnpm desktop:build");
-    expect(workflow).toContain("runner: [self-hosted, macOS, ARM64, ecommerceai]");
-    expect(workflow).not.toContain("APPLE_CERTIFICATE");
+    expect(workflow).toContain("runner: macos-latest");
+    expect(workflow).toContain("runner: windows-latest");
+    // Hosted runners import the Developer ID certificate into an ephemeral
+    // keychain under RUNNER_TEMP and delete the decoded .p12 before building.
+    expect(workflow).toContain("Import Apple Developer certificate into a temporary keychain");
+    expect(workflow).toContain('security create-keychain -p "$keychain_password" "$keychain"');
+    expect(workflow).toContain('rm -f "$RUNNER_TEMP/certificate.p12"');
     expect(validateWorkflow).toContain(
-      "runs-on: [self-hosted, macOS, ARM64, ecommerceai]",
+      "runs-on: macos-latest",
     );
     expect(validateWorkflow).toContain("pnpm verify");
     expect(validateWorkflow).toContain("corepack pnpm@11.13.1 --pm-on-fail=ignore audit");
     expect(validateWorkflow).toContain("pnpm desktop:check");
-    expect(validateWorkflow).not.toContain("cache: pnpm");
+    expect(validateWorkflow).toContain("cache: pnpm");
     expect(workflow).not.toContain("tauri-apps/tauri-action");
     expect(controlledSources).not.toMatch(/\bosascript\b|tell application|set bounds of window/i);
   });

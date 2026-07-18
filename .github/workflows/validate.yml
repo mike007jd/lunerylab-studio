@@ -1,14 +1,11 @@
 name: validate
 
-# Private repository CI runs Web gates on Deck Linux and desktop gates on the
-# dedicated Apple Silicon runner. Fork PRs never execute on either persistent
-# machine; the independent lanes run in parallel.
+# Pull requests and main use the same isolated GitHub-hosted gates.
 on:
   pull_request:
-    branches: [main]
   push:
     branches: [main]
-  workflow_call: {}
+  workflow_call:
 
 concurrency:
   group: validate-${{ github.workflow }}-${{ github.ref }}
@@ -18,33 +15,9 @@ permissions:
   contents: read
 
 jobs:
-  fork-pr:
-    name: Fork PR lightweight gates
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: my-app
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        with:
-          version: 10
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22.23.1
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm prisma:generate
-      - run: pnpm typecheck
-      - run: pnpm lint
-      - run: pnpm test:unit
-      - run: pnpm ui:check
-
   web:
     name: Web product gates
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, deck-ci]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
       run:
@@ -53,30 +26,28 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
-          version: 10
-          dest: ${{ runner.temp }}/setup-pnpm
+          version: 10.15.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.23.1
-      - name: Run Web gates under the Deck host lock
-        run: |
-          mkdir -p "$HOME/.cache"
-          flock --verbose --wait 1800 "$HOME/.cache/deck-ci.lock" bash -eo pipefail <<'DECK_CI'
-            pnpm install --frozen-lockfile
-            pnpm prisma:generate
-            pnpm verify
-            # pnpm 10 still calls npm's retired legacy audit endpoint. Keep pnpm
-            # 10 for install/build compatibility and use the pinned current CLI
-            # only for these read-only bulk-advisory checks.
-            corepack pnpm@11.13.1 --pm-on-fail=ignore audit --prod --audit-level moderate
-            corepack pnpm@11.13.1 --pm-on-fail=ignore audit --audit-level moderate
-            pnpm build
-          DECK_CI
+          cache: pnpm
+          cache-dependency-path: my-app/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate Prisma client
+        run: pnpm prisma:generate
+      - name: Run Web product gates
+        run: pnpm verify
+      - name: Audit production dependencies
+        run: corepack pnpm@11.13.1 --pm-on-fail=ignore audit --prod --audit-level moderate
+      - name: Audit all dependencies
+        run: corepack pnpm@11.13.1 --pm-on-fail=ignore audit --audit-level moderate
+      - name: Build application
+        run: pnpm build
 
   desktop:
     name: Desktop Rust gates
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64, ecommerceai]
+    runs-on: macos-latest
     timeout-minutes: 60
     defaults:
       run:
@@ -85,10 +56,24 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
-          version: 10
+          version: 10.15.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.23.1
+          cache: pnpm
+          cache-dependency-path: my-app/pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm desktop:check
+      - name: Cache Cargo registry and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            my-app/src-tauri/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('my-app/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run desktop Rust gates
+        run: pnpm desktop:check

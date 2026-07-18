@@ -83,12 +83,10 @@ forcing an unsigned macOS package for local QA. Both macOS paths verify the DMG,
 mounted app, `/Applications` link, arrow background, and fixed icon positions;
 the generated `*-layout.png` is the headless layout evidence.
 
-Pull-request and `main` validation runs on the repository-specific Apple
-Silicon runner with the repository-specific self-hosted labels required by the
-release workflow.
-Untrusted fork PRs never execute on that persistent machine. The runner
-serializes the web product gates and desktop Rust gates, so CI does not consume
-GitHub-hosted macOS or Linux minutes.
+Pull-request and `main` validation use isolated GitHub-hosted runners. Web
+product gates run on `ubuntu-latest`; desktop Rust gates run on the Apple
+Silicon `macos-latest` image. Fork and same-repository pull requests execute the
+same two jobs, with pnpm and Cargo caches restored through GitHub Actions.
 
 ## Release Signing (fail-closed)
 
@@ -103,16 +101,37 @@ Windows installers are Authenticode-signed and timestamped; each release ships
 The macOS release order is fail-closed: sign/notarize/staple the `.app`, create
 the DMG from that final app, sign/notarize/staple the DMG, then run signature,
 Gatekeeper, stapler, mounted-layout, and `hdiutil verify` gates. The workflow
-uses the Developer ID identity already installed in the dedicated self-hosted
-runner's login keychain. CI receives notarization credentials from encrypted
+expects the Developer ID identity named by the workflow to be available to the
+ephemeral release job. CI receives notarization credentials from encrypted
 GitHub secrets and never writes them into the runner checkout.
 
-Required GitHub secrets (set on the CI repository):
+### New repository GitHub secrets
 
-- macOS: `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` (app-specific
-  password), `APPLE_TEAM_ID`.
-- Windows: `WINDOWS_CERTIFICATE` (base64 .pfx), `WINDOWS_CERTIFICATE_PASSWORD`.
-- Publishing: `LUNERY_RELEASES_TOKEN` for the releases repository.
+Configure every custom secret referenced by
+`.github/workflows/desktop-release.yml` in the new repository:
+
+- `APPLE_SIGNING_IDENTITY`: exact Apple Developer ID Application identity used
+  by Tauri, sidecar signing, and signature verification.
+- `APPLE_ID`: Apple account submitted to `notarytool`.
+- `APPLE_PASSWORD`: app-specific Apple password submitted to `notarytool`.
+- `APPLE_TEAM_ID`: Apple Developer team used for notarization.
+- `APPLE_CERTIFICATE`: base64-encoded Developer ID Application certificate
+  (`.p12` export) imported into a temporary keychain on the hosted runner.
+- `APPLE_CERTIFICATE_PASSWORD`: export password for `APPLE_CERTIFICATE`.
+
+Optional secrets (Windows Authenticode; when absent, tag builds publish an
+unsigned Windows installer with a workflow warning instead of failing):
+
+- `WINDOWS_CERTIFICATE`: base64-encoded Windows code-signing `.pfx` imported
+  only for the signing step.
+- `WINDOWS_CERTIFICATE_PASSWORD`: password for `WINDOWS_CERTIFICATE`.
+
+Releases publish to this repository's own Releases page using the built-in
+`GITHUB_TOKEN`; no cross-repository release token exists anymore.
+
+The workflow also references `GITHUB_TOKEN` to authenticate pinned sidecar
+asset lookups. GitHub creates that token automatically for each workflow run;
+the repository owner does not create a secret with that name.
 
 Required GitHub Actions variables:
 
@@ -122,7 +141,8 @@ Required GitHub Actions variables:
   rotation date in `YYYY-MM-DD`; tag builds fail when it is missing, in the
   future, or older than 180 days.
 - `WINDOWS_EXPECTED_PUBLISHER`: the expected publisher text in the Windows
-  certificate subject; CI rejects any other signer.
+  certificate subject; CI rejects any other signer. Only required once the
+  optional Windows signing secrets are configured.
 
 Ownership and rotation:
 
