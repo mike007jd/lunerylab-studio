@@ -15,7 +15,7 @@ import { generateImages } from "@/lib/server/image-generate";
 import { resolveImageModelForGeneration } from "@/lib/server/resolve-image-model";
 import { resolveGeneratedLayerSize } from "@/lib/canvas/generated-layer-size";
 import { buildLayerPlacementPlan } from "@/lib/canvas/layer-placement";
-import { withUserStorageQuota } from "@/lib/server/file-validation";
+import { withAssetWriteTransaction } from "@/lib/server/file-validation";
 import {
   deleteStoredFile,
   writeFilesOrCleanup,
@@ -29,7 +29,7 @@ import {
 import { loadImageReferenceFiles } from "@/lib/server/reference-assets";
 import { assertReferenceLimit } from "@/lib/server/generate-request";
 import { parseRequestedAspectRatio } from "@/lib/server/byok-shared";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 const GRID_GAP = 24;
 const GRID_ORIGIN = { x: 48, y: 48 };
@@ -127,72 +127,68 @@ export function buildGenerateImageTool(ctx: AgentToolContext): Tool {
         // transaction so a mid-write failure can never leave a successful asset
         // or layer attached to a FAILED job (or vice versa). On any failure the
         // transaction rolls back and we delete the orphaned files.
-        const { createdAssets, createdLayers } = await withUserStorageQuota(
-          ctx.userId,
-          storedImages.reduce((sum, s) => sum + s.byteSize, 0),
-          async (tx) => {
-            const assets = await Promise.all(
-              storedImages.map((stored) =>
-                tx.asset.create({
-                  data: {
-                    userId: ctx.userId,
-                    projectId: ctx.projectId,
-                    jobId: job.id,
-                    kind: "GENERATED",
-                    storagePath: stored.storagePath,
-                    mimeType: stored.mimeType,
-                    byteSize: stored.byteSize,
-                    width: stored.width,
-                    height: stored.height,
-                  },
-                }),
-              ),
-            );
+        const { createdAssets, createdLayers } = await withAssetWriteTransaction(async (tx) => {
+          const assets = await Promise.all(
+            storedImages.map((stored) =>
+              tx.asset.create({
+                data: {
+                  userId: ctx.userId,
+                  projectId: ctx.projectId,
+                  jobId: job.id,
+                  kind: "GENERATED",
+                  storagePath: stored.storagePath,
+                  mimeType: stored.mimeType,
+                  byteSize: stored.byteSize,
+                  width: stored.width,
+                  height: stored.height,
+                },
+              }),
+            ),
+          );
 
-            const topZ = await tx.canvasLayer.aggregate({
-              where: { sessionId: ctx.sessionId },
-              _max: { zIndex: true },
-            });
-            const placement = buildLayerPlacementPlan({
-              assetIds: assets.map((a) => a.id),
-              startZIndex: topZ._max.zIndex ?? -1,
-              layerWidth: layerSize.width,
-              layerHeight: layerSize.height,
-              columns: finalCount <= 2 ? finalCount : 2,
-              gridGap: GRID_GAP,
-              origin: GRID_ORIGIN,
-            });
+          const topZ = await tx.canvasLayer.aggregate({
+            where: { sessionId: ctx.sessionId },
+            _max: { zIndex: true },
+          });
+          const placement = buildLayerPlacementPlan({
+            assetIds: assets.map((a) => a.id),
+            startZIndex: topZ._max.zIndex ?? -1,
+            layerWidth: layerSize.width,
+            layerHeight: layerSize.height,
+            columns: finalCount <= 2 ? finalCount : 2,
+            gridGap: GRID_GAP,
+            origin: GRID_ORIGIN,
+          });
 
-            const layers = await Promise.all(
-              placement.map((item) =>
-                tx.canvasLayer.create({
-                  data: {
-                    sessionId: ctx.sessionId,
-                    assetId: item.assetId,
-                    width: layerSize.width,
-                    height: layerSize.height,
-                    x: item.x,
-                    y: item.y,
-                    zIndex: item.zIndex,
-                  },
-                }),
-              ),
-            );
+          const layers = await Promise.all(
+            placement.map((item) =>
+              tx.canvasLayer.create({
+                data: {
+                  sessionId: ctx.sessionId,
+                  assetId: item.assetId,
+                  width: layerSize.width,
+                  height: layerSize.height,
+                  x: item.x,
+                  y: item.y,
+                  zIndex: item.zIndex,
+                },
+              }),
+            ),
+          );
 
-            await completeGenerationJob({
-              jobId: job.id,
-              model: generation.model,
-              provider: generation.provider,
-              endpoint: generation.endpoint,
-              successCount: assets.length,
-              requestedCount: finalCount,
-              emptyResultMessage: `${generation.provider} returned no generated images.`,
-              client: tx,
-            });
+          await completeGenerationJob({
+            jobId: job.id,
+            model: generation.model,
+            provider: generation.provider,
+            endpoint: generation.endpoint,
+            successCount: assets.length,
+            requestedCount: finalCount,
+            emptyResultMessage: `${generation.provider} returned no generated images.`,
+            client: tx,
+          });
 
-            return { createdAssets: assets, createdLayers: layers };
-          },
-        ).catch(async (error) => {
+          return { createdAssets: assets, createdLayers: layers };
+        }).catch(async (error) => {
           await Promise.allSettled(storedImages.map((s) => deleteStoredFile(s.storagePath)));
           throw error;
         });

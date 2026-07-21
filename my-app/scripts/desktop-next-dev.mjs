@@ -31,7 +31,7 @@ const modelsDir = absoluteEnvPath("LUNERY_MODELS_DIR", join(profileRoot, "models
 const logDir = absoluteEnvPath("LUNERY_LOG_DIR", join(profileRoot, "logs"));
 const runtimeDir = absoluteEnvPath("LUNERY_RUNTIME_DIR", join(profileRoot, "runtime"));
 const pgliteDir = absoluteEnvPath("LUNERY_PGLITE_DIR", join(dataDir, "pglite"));
-const mediaDir = absoluteEnvPath("ECOM_STORAGE_DIR", join(dataDir, "media"));
+const mediaDir = absoluteEnvPath("LUNERY_MEDIA_DIR", join(dataDir, "media"));
 
 await Promise.all([
   mkdir(configDir, { recursive: true }),
@@ -68,7 +68,7 @@ const child = spawn(
       LUNERY_LOG_DIR: logDir,
       LUNERY_RUNTIME_DIR: runtimeDir,
       LUNERY_PGLITE_DIR: pgliteDir,
-      ECOM_STORAGE_DIR: mediaDir,
+      LUNERY_MEDIA_DIR: mediaDir,
       LUNERY_PRISMA_MIGRATIONS_DIR: join(appRoot, "prisma", "migrations"),
     },
   },

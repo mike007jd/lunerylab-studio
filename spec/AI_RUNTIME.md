@@ -78,7 +78,7 @@ Model supply has two explicit layers:
   local desktop dev defaults to `~/.lunerylab/studio-dev`. The profile shape is
   `config/`, `data/pglite/`, `data/media/`, `models/`, `logs/`, and
   `runtime/`. New writes must use `LUNERY_HOME` / `LUNERY_CONFIG_DIR` /
-  `LUNERY_DATA_DIR` / `LUNERY_PGLITE_DIR` / `ECOM_STORAGE_DIR` /
+  `LUNERY_DATA_DIR` / `LUNERY_PGLITE_DIR` / `LUNERY_MEDIA_DIR` /
   `LUNERY_MODELS_DIR` / `LUNERY_LOG_DIR` / `LUNERY_RUNTIME_DIR` as resolved by
   `my-app/lib/server/lunery-profile.ts` and `my-app/src-tauri/src/profile.rs`.
   Legacy locations (`~/Library/Application Support/com.lunerylab.studio`,

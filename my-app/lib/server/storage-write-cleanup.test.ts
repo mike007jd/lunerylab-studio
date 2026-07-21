@@ -11,9 +11,8 @@ let tmpDir: string;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-cleanup-"));
-  // Local filesystem driver rooted at the temp dir (absolute path required).
-  vi.stubEnv("ECOM_STORAGE_DIR", tmpDir);
-  vi.stubEnv("STORAGE_DRIVER", "local");
+  // Local filesystem rooted at the temp dir (absolute path required).
+  vi.stubEnv("LUNERY_MEDIA_DIR", tmpDir);
   fs.mkdirSync(path.join(tmpDir, "generated"), { recursive: true });
 });
 
@@ -36,15 +35,42 @@ describe("writeFilesOrCleanup (#7)", () => {
     vi.unstubAllEnvs();
     const home = path.join(tmpDir, "home");
     vi.stubEnv("HOME", home);
-    vi.stubEnv("STORAGE_DRIVER", "local");
 
     expect(storage.resolveStoragePath("generated/sample.png")).toBe(
       path.join(home, ".lunerylab", "studio", "data", "media", "generated", "sample.png"),
     );
   });
 
+  it("reports local-only media capability", () => {
+    expect(storage.isBlobStorage()).toBe(false);
+  });
+
+  it("keeps pure local read/write/delete and not-found behavior", async () => {
+    const stored = await storage.restoreStoredFile({
+      storagePath: "generated/local-only.png",
+      bytes: Buffer.from("png-bytes"),
+      mimeType: "image/png",
+    });
+    expect(stored.absolutePath).toBeTruthy();
+    expect(fs.existsSync(stored.absolutePath!)).toBe(true);
+
+    const read = await storage.readStoredFile(stored.storagePath);
+    expect(read.file.toString()).toBe("png-bytes");
+    expect(read.mimeType).toBe("image/png");
+
+    const meta = await storage.getStoredFileMetadata(stored.storagePath);
+    expect(meta).toEqual({ byteSize: "png-bytes".length, mimeType: "image/png" });
+
+    await storage.deleteStoredFile(stored.storagePath);
+    expect(fs.existsSync(stored.absolutePath!)).toBe(false);
+    await expect(storage.readStoredFile(stored.storagePath)).rejects.toMatchObject({
+      status: 404,
+      code: "stored_file_not_found",
+    });
+  });
+
   it("normalizes a configured root without using a dynamic filesystem trace", () => {
-    vi.stubEnv("ECOM_STORAGE_DIR", `${tmpDir}${path.sep}`);
+    vi.stubEnv("LUNERY_MEDIA_DIR", `${tmpDir}${path.sep}`);
     expect(storage.resolveStoragePath("generated/sample.png")).toBe(
       path.join(tmpDir, "generated", "sample.png"),
     );

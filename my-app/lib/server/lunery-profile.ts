@@ -52,5 +52,5 @@ export function luneryPgliteDir(): string {
 }
 
 export function luneryMediaDir(): string {
-  return envPath("ECOM_STORAGE_DIR") ?? path.join(luneryDataDir(), "media");
+  return envPath("LUNERY_MEDIA_DIR") ?? path.join(luneryDataDir(), "media");
 }

@@ -43,8 +43,8 @@ For desktop Studio, `.env.local` can keep `DATABASE_URL` empty. Desktop runtime
 starts PGlite and overrides `DATABASE_URL`. Copying `.env.example` keeps
 optional runtime overrides documented.
 
-Do not set `ECOM_ENABLE_WEB_WORKSPACE_API=1` unless you intentionally want the
-dangerous web workspace escape hatch. Desktop never needs it.
+Workspace APIs are desktop-only. Browser and non-desktop local servers receive
+`403 workspace_api_disabled`; there is no web escape hatch.
 
 ## Run Studio (preferred)
 
@@ -106,7 +106,7 @@ enforces the full signed and notarized artifact chain.
 - Installing an old `/Applications/Lunery Lab Studio.app` and validating that
   instead of the checkout. After code changes, use `pnpm desktop:dev` (or a
   fresh local build) and confirm the process path belongs to this repo.
-- Setting `ECOM_STORAGE_DIR` to a relative path — it must be absolute when set.
+- Setting `LUNERY_MEDIA_DIR` to a relative path — it must be absolute when set.
 - Hunting Postgres for desktop — not required; PGlite is the desktop database.
 - Reading/writing legacy app-data locations — use `~/.lunerylab/studio-dev` in
   local desktop dev.

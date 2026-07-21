@@ -6,15 +6,6 @@ import sharp from "sharp";
 
 vi.mock("server-only", () => ({}));
 
-const blobMocks = vi.hoisted(() => ({
-  put: vi.fn(),
-  get: vi.fn(),
-  head: vi.fn(),
-  del: vi.fn(),
-}));
-
-vi.mock("@vercel/blob", () => blobMocks);
-
 import { writeGeneratedImage, writeReferenceFile } from "@/lib/server/storage";
 
 let tmpDir: string;
@@ -22,37 +13,7 @@ let tmpDir: string;
 beforeEach(() => {
   vi.clearAllMocks();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "image-dimensions-"));
-  vi.stubEnv("ECOM_STORAGE_DIR", tmpDir);
-  vi.stubEnv("STORAGE_DRIVER", "local");
-});
-
-it("preserves trusted image metadata when storage is backed by Vercel Blob", async () => {
-  vi.stubEnv("STORAGE_DRIVER", "blob");
-  vi.stubEnv("BLOB_READ_WRITE_TOKEN", "test-token");
-  blobMocks.put.mockImplementation(async (storagePath: string) => ({
-    pathname: storagePath,
-    contentType: "application/octet-stream",
-  }));
-  const bytes = await sharp({
-    create: {
-      width: 1920,
-      height: 1080,
-      channels: 3,
-      background: "#7d4cff",
-    },
-  })
-    .png()
-    .toBuffer();
-
-  const generated = await writeGeneratedImage({ bytes, projectId: "project-1" });
-
-  expect(generated).toMatchObject({
-    mimeType: "image/png",
-    width: 1920,
-    height: 1080,
-    byteSize: bytes.byteLength,
-  });
-  expect(generated.absolutePath).toBeUndefined();
+  vi.stubEnv("LUNERY_MEDIA_DIR", tmpDir);
 });
 
 afterEach(() => {

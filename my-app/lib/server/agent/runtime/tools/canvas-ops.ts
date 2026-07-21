@@ -12,8 +12,8 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { prisma } from "@/lib/server/prisma";
 import { CANVAS_LAYER_ORDER_BY } from "@/lib/server/canvas-layer-order";
-import { loadAgentLayer } from "@/lib/server/agent/v2/layer-access";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 export function buildMoveLayerTool(ctx: AgentToolContext): Tool {
   return tool({

@@ -2,6 +2,12 @@
 
 Library is the browsing and retrieval surface for generated assets.
 
+## Ownership
+
+- Owner: `my-app/components/library`
+- Route: `/library`
+- Role: generated asset browsing surface
+
 ## Role
 
 Library should make past work easy to scan, search, preview, and reopen.

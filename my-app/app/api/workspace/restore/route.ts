@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ApiError, jsonError } from "@/lib/server/errors";
+import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 import { restoreWorkspaceBackup, type WorkspaceBackup } from "@/lib/server/workspace-backup";
 
 /**
@@ -10,6 +11,7 @@ import { restoreWorkspaceBackup, type WorkspaceBackup } from "@/lib/server/works
  */
 export async function POST(request: NextRequest) {
   try {
+    await requireLocalWorkspaceOwner();
     const body = (await request.json().catch(() => null)) as
       | { backup?: WorkspaceBackup; confirm?: unknown }
       | null;

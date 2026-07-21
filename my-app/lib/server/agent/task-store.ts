@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { ApiError } from "@/lib/server/errors";
 import { prisma } from "@/lib/server/prisma";
 import { requireWritableCanvasSession } from "@/lib/server/canvas-session-access";
-import type { AgentRunResult, AgentStep } from "@/lib/server/agent/v2/types";
+import type { AgentRunResult, AgentStep } from "@/lib/server/agent/runtime/types";
 
 export interface PersistedAgentMessage {
   id: string;

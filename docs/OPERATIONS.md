@@ -25,10 +25,8 @@ routes redirect to the standalone website.
 Minimum local variables:
 
 - `DATABASE_URL`: PostgreSQL connection string.
-- `ECOM_STORAGE_DIR`: optional absolute path for local media storage. Omit it
+- `LUNERY_MEDIA_DIR`: optional absolute path for local media storage. Omit it
   to use the visible Lunery profile media directory.
-- `BLOB_READ_WRITE_TOKEN`: required only when blob storage is selected.
-- `ECOM_STORAGE_DRIVER`: optional `local` or `blob` override.
 
 Desktop bridge variables are set by the desktop runtime, not by users in normal
 operation:
@@ -203,6 +201,9 @@ Leftover local copies of those legacy dirs may be deleted.
 - Keep system and operational docs in `/docs`.
 - Keep fresh-machine run instructions in `docs/DEV_SETUP.md`; link from
   root README, `my-app/README.md`, and `.github/CONTRIBUTING.md`.
+- Keep transitive dependency override rationale in
+  [PNPM_OVERRIDES.md](PNPM_OVERRIDES.md); `my-app/pnpm-workspace.yaml` is the
+  authoritative pin list.
 - Keep historical audit/plan files out of the repo unless they are explicitly
   referenced by active docs or code.
 - Use relative links inside repository docs.

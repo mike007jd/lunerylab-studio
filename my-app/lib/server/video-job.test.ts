@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
   generateVideoByok: vi.fn(),
   writeGeneratedVideo: vi.fn(),
   deleteStoredFile: vi.fn(),
-  withUserStorageQuota: vi.fn(),
+  withAssetWriteTransaction: vi.fn(),
   completeGenerationJob: vi.fn(),
   failRunningGenerationJob: vi.fn(),
   assetDeleteMany: vi.fn(),
@@ -19,7 +19,7 @@ vi.mock("@/lib/server/storage", () => ({
   deleteStoredFile: mocks.deleteStoredFile,
 }));
 vi.mock("@/lib/server/file-validation", () => ({
-  withUserStorageQuota: mocks.withUserStorageQuota,
+  withAssetWriteTransaction: mocks.withAssetWriteTransaction,
 }));
 vi.mock("@/lib/server/generation-job", () => ({
   completeGenerationJob: mocks.completeGenerationJob,
@@ -43,10 +43,10 @@ beforeEach(() => {
     mimeType: "video/mp4",
     byteSize: 10,
   });
-  // Asset creation and job completion now run inside the quota transaction, so
+  // Asset creation and job completion run inside the write transaction, so
   // the mock must invoke the callback with a fake tx client.
   mocks.txAssetCreate.mockResolvedValue({ id: "asset-1" });
-  mocks.withUserStorageQuota.mockImplementation(async (_userId, _bytes, write) =>
+  mocks.withAssetWriteTransaction.mockImplementation(async (write) =>
     write({ asset: { create: mocks.txAssetCreate } }),
   );
   mocks.completeGenerationJob.mockResolvedValue({});

@@ -46,7 +46,7 @@ const stalePhraseFiles = [
     ],
   },
   {
-    file: "lib/server/agent/v2/tools/generate-3d.ts",
+    file: "lib/server/agent/runtime/tools/generate-3d.ts",
     patterns: [/Preference order:/, /Meshy \/ Tripo \/ fal \/ Replicate/],
   },
   {

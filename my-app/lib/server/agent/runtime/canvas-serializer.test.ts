@@ -5,7 +5,7 @@ vi.mock("server-only", () => ({}));
 import {
   renderCanvasSnapshot,
   type CanvasSnapshot,
-} from "@/lib/server/agent/v2/canvas-serializer";
+} from "@/lib/server/agent/runtime/canvas-serializer";
 
 function largeSnapshot(layerCount = 80): CanvasSnapshot {
   const layers = Array.from({ length: layerCount }, (_, index) => ({

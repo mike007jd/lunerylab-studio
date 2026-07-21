@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 vi.mock("server-only", () => ({}));
 vi.mock("@/lib/server/prisma", () => ({
@@ -12,7 +12,7 @@ vi.mock("@/lib/server/prisma", () => ({
 }));
 
 import { prisma } from "@/lib/server/prisma";
-import { buildSetLayerVisibilityTool } from "@/lib/server/agent/v2/tools/canvas-ops";
+import { buildSetLayerVisibilityTool } from "@/lib/server/agent/runtime/tools/canvas-ops";
 
 interface VisibilityInput {
   layerId: string;

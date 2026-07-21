@@ -15,7 +15,6 @@ interface StorageBreakdown {
   modelsBytes: number;
   logsBytes: number;
   freeDiskBytes: number;
-  quotaBytes: number;
 }
 
 interface ReconcileResult {

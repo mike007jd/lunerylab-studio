@@ -4,22 +4,21 @@ import { prisma } from "@/lib/server/prisma";
 import { deleteStoredFile } from "@/lib/server/storage";
 
 /**
- * Permanently remove assets: delete the database rows (freeing quota) and the
- * underlying stored files (freeing disk), and reconcile any ReferenceSet that
- * pointed at them.
+ * Permanently remove assets: delete the database rows and the underlying stored
+ * files (freeing disk), and reconcile any ReferenceSet that pointed at them.
  *
- * Soft delete (deletedAt) only hides an asset; the row still counts toward quota
- * and the file still occupies disk. This is the path that actually reclaims
- * both. It is deliberately the ONLY place that hard-deletes asset media.
+ * Soft delete (deletedAt) only hides an asset; the file still occupies disk.
+ * This is the path that actually reclaims storage. It is deliberately the ONLY
+ * place that hard-deletes asset media.
  *
  * Safety:
  *   - Scoped to a single userId — never touches another owner's rows.
  *   - A stored file is unlinked only when no OTHER surviving asset references the
  *     same storagePath, so shared/bundled media is never removed out from under
  *     a still-live asset.
- *   - Rows are removed in a single deleteMany (quota freed atomically); their
- *     ReferenceSetAsset memberships cascade away via FK. File deletion runs after
- *     and is best-effort (a failed unlink leaves a reconcilable orphan, never a
+ *   - Rows are removed in a single deleteMany; their ReferenceSetAsset
+ *     memberships cascade away via FK. File deletion runs after and is
+ *     best-effort (a failed unlink leaves a reconcilable orphan, never a
  *     dangling DB row).
  */
 export interface AssetPurgeResult {

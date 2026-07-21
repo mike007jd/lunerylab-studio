@@ -1,7 +1,7 @@
 import "server-only";
 
 import { ApiError } from "@/lib/server/errors";
-import { isImageAssetLike, withUserStorageQuota } from "@/lib/server/file-validation";
+import { isImageAssetLike, withAssetWriteTransaction } from "@/lib/server/file-validation";
 import { prisma } from "@/lib/server/prisma";
 import {
   deleteStoredFile,
@@ -153,27 +153,24 @@ export async function persistUploadedImageReferenceFiles({
   if (stored.length === 0) return [];
 
   try {
-    await withUserStorageQuota(
-      userId,
-      stored.reduce((total, file) => total + file.byteSize, 0),
-      (tx) =>
-        Promise.all(
-          stored.map((file) =>
-            tx.asset.create({
-              data: {
-                userId,
-                projectId: projectId || undefined,
-                jobId,
-                kind: "REFERENCE",
-                storagePath: file.storagePath,
-                mimeType: file.mimeType,
-                byteSize: file.byteSize,
-                width: file.width,
-                height: file.height,
-              },
-            }),
-          ),
+    await withAssetWriteTransaction((tx) =>
+      Promise.all(
+        stored.map((file) =>
+          tx.asset.create({
+            data: {
+              userId,
+              projectId: projectId || undefined,
+              jobId,
+              kind: "REFERENCE",
+              storagePath: file.storagePath,
+              mimeType: file.mimeType,
+              byteSize: file.byteSize,
+              width: file.width,
+              height: file.height,
+            },
+          }),
         ),
+      ),
     );
   } catch (error) {
     // Storage write succeeded but the DB rows didn't — clean up the files.

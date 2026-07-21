@@ -24,20 +24,20 @@ vi.mock("@/lib/server/runtime-supply", () => ({
   resolveStudioRuntimeSupply: mocks.resolveStudioRuntimeSupply,
 }));
 
-vi.mock("@/lib/server/agent/v2/resolve-language-model", () => ({
+vi.mock("@/lib/server/agent/runtime/resolve-language-model", () => ({
   resolveAgentLanguageModel: mocks.resolveAgentLanguageModel,
 }));
 
-vi.mock("@/lib/server/agent/v2/canvas-serializer", () => ({
+vi.mock("@/lib/server/agent/runtime/canvas-serializer", () => ({
   buildCanvasSnapshot: mocks.buildCanvasSnapshot,
   renderCanvasSnapshot: mocks.renderCanvasSnapshot,
 }));
 
-vi.mock("@/lib/server/agent/v2/system-prompt", () => ({
+vi.mock("@/lib/server/agent/runtime/system-prompt", () => ({
   buildAgentSystemPrompt: () => "system prompt",
 }));
 
-vi.mock("@/lib/server/agent/v2/tool-registry", () => ({
+vi.mock("@/lib/server/agent/runtime/tool-registry", () => ({
   buildAgentToolset: mocks.buildAgentToolset,
 }));
 
@@ -57,8 +57,8 @@ vi.mock("@/lib/server/canvas-snapshot", () => ({
   saveCanvasSnapshot: mocks.saveCanvasSnapshot,
 }));
 
-import { runAgentV2 } from "@/lib/server/agent/v2/executor";
-import type { AgentRunInput } from "@/lib/server/agent/v2/types";
+import { runAgent } from "@/lib/server/agent/runtime/executor";
+import type { AgentRunInput } from "@/lib/server/agent/runtime/types";
 
 const baseInput: AgentRunInput = {
   userId: "user-1",
@@ -98,7 +98,7 @@ beforeEach(() => {
   mocks.saveCanvasSnapshot.mockResolvedValue(undefined);
 });
 
-describe("runAgentV2", () => {
+describe("runAgent", () => {
   it("forwards only real model text deltas while the response is running", async () => {
     mocks.streamText.mockReturnValue({
       fullStream: (async function* () {
@@ -109,7 +109,7 @@ describe("runAgentV2", () => {
     });
     const onTextDelta = vi.fn();
 
-    const result = await runAgentV2({ ...baseInput, onTextDelta });
+    const result = await runAgent({ ...baseInput, onTextDelta });
 
     expect(onTextDelta.mock.calls.flat()).toEqual(["Hello", " there"]);
     expect(result.assistantMessage).toBe("Hello there");
@@ -121,7 +121,7 @@ describe("runAgentV2", () => {
       text: Promise.resolve("   "),
     });
 
-    const result = await runAgentV2(baseInput);
+    const result = await runAgent(baseInput);
 
     expect(result.assistantMessage).toBe("The model did not return a final response. Please retry.");
     expect(result.error).toEqual({
@@ -134,7 +134,7 @@ describe("runAgentV2", () => {
   it("fails deterministic actions when the expected tool execute handler is absent", async () => {
     mocks.buildAgentToolset.mockReturnValue({ remove_background: {} });
 
-    const result = await runAgentV2({
+    const result = await runAgent({
       ...baseInput,
       action: { type: "remove_background", layerId: "layer-1" },
     });
@@ -160,7 +160,7 @@ describe("runAgentV2", () => {
     const execute = vi.fn().mockResolvedValue({ ok: true, summary: "Removed background of layer layer-1." });
     mocks.buildAgentToolset.mockReturnValue({ remove_background: { execute } });
 
-    const result = await runAgentV2({
+    const result = await runAgent({
       ...baseInput,
       action: { type: "remove_background", layerId: "layer-1" },
     });
@@ -195,7 +195,7 @@ describe("runAgentV2", () => {
       },
     });
 
-    const result = await runAgentV2({ ...baseInput, locale: "zh-CN" });
+    const result = await runAgent({ ...baseInput, locale: "zh-CN" });
 
     expect(result.assistantMessage).toBe(
       "暂无可用的生成后端。请在设置中配置 Provider 或本地 Runtime。",
@@ -214,7 +214,7 @@ describe("runAgentV2", () => {
       capabilityFix: { panel: "provider_connections", reason: "no llm" },
     });
 
-    const result = await runAgentV2(baseInput);
+    const result = await runAgent(baseInput);
 
     expect(mocks.resolveAgentLanguageModel).not.toHaveBeenCalled();
     expect(mocks.streamText).not.toHaveBeenCalled();

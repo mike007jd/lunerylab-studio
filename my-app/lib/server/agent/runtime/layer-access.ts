@@ -2,7 +2,7 @@ import "server-only";
 
 import { prisma } from "@/lib/server/prisma";
 import { isImageAssetLike } from "@/lib/server/file-validation";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 async function findAgentLayer(ctx: AgentToolContext, layerId: string) {
   return prisma.canvasLayer.findFirst({

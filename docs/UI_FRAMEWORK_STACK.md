@@ -74,33 +74,32 @@ itself.
 
 ## Directory Contract
 
-`my-app/components/design-system/primitives`
-
-- Re-export local shadcn primitives and repo primitives.
-- No visual ownership beyond composition.
-- No raw Tailwind values.
-
 `my-app/components/design-system/grammar`
 
 - Named token, density, motion, and copy-pattern constants.
 - Framework language lives here before it is repeated across surfaces.
+- Import with deep paths such as `@/components/design-system/grammar/tokens`.
 
 `my-app/components/design-system/shell`
 
-- App/surface layout wrappers.
+- Console content-frame classes and layout rhythm helpers.
 - Owns page rhythm, width, section spacing, and high-level responsive behavior.
+- Import with `@/components/design-system/shell`.
 
-`my-app/components/design-system/assistant`
+`my-app/components/ui`
 
-- Assistant UI boundary.
-- Keeps assistant-ui presentation/runtime primitives separate from the backend
-  agent contract.
+- Local shadcn primitives. Feature code imports these modules directly.
+- No unused barrel re-export layer under `design-system/`.
 
-`my-app/components/design-system/surfaces`
+`docs/design/surfaces`
 
-- Surface registry and ownership notes.
+- Surface ownership contracts (studio, canvas, settings, library).
 - A surface graduates here only when it has a stable shell, states, and
   interaction grammar.
+
+`my-app/components/studio/agent-chat`
+
+- Assistant UI presentation/runtime boundary over the canvas-agent contract.
 
 ## Assistant Boundary
 
@@ -116,8 +115,8 @@ assistant-ui is the presentation/runtime layer over that contract.
 
 ## Surface Rules
 
-Studio is the primary product surface. Canvas, Settings, Library, and Showcase
-support the Studio flow.
+Studio is the primary product surface. Canvas, Settings, and Library support
+the Studio flow.
 
 Every production surface needs:
 
@@ -145,7 +144,7 @@ pnpm build
 - no non-semantic palette utilities;
 - no raw visual values inside `components/design-system`;
 - no increase over the current raw-value baseline in existing app/components;
-- the design invariants below (ledger: `.ai/loops/design-invariants.md`).
+- the design invariants below (also enforced inline by `pnpm ui:check`).
 
 ## Design Invariants
 

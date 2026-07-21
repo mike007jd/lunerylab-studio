@@ -76,7 +76,7 @@ pub(crate) fn profile_dirs() -> Result<ProfileDirs, String> {
     let config = env_abs_path("LUNERY_CONFIG_DIR")?.unwrap_or_else(|| root.join("config"));
     let data = env_abs_path("LUNERY_DATA_DIR")?.unwrap_or_else(|| root.join("data"));
     let pglite = env_abs_path("LUNERY_PGLITE_DIR")?.unwrap_or_else(|| data.join("pglite"));
-    let media = env_abs_path("ECOM_STORAGE_DIR")?.unwrap_or_else(|| data.join("media"));
+    let media = env_abs_path("LUNERY_MEDIA_DIR")?.unwrap_or_else(|| data.join("media"));
     let models = env_abs_path("LUNERY_MODELS_DIR")?.unwrap_or_else(|| root.join("models"));
     let logs = env_abs_path("LUNERY_LOG_DIR")?.unwrap_or_else(|| root.join("logs"));
     let runtime = env_abs_path("LUNERY_RUNTIME_DIR")?.unwrap_or_else(|| root.join("runtime"));

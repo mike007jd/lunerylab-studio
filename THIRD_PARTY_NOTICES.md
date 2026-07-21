@@ -117,7 +117,6 @@ holds their own key and pays the provider directly.
 | [Prisma](https://github.com/prisma/prisma) | Apache-2.0 | ORM + schema migrations. |
 | [PostgreSQL](https://www.postgresql.org/) | PostgreSQL License | Application database. |
 | [zod](https://github.com/colinhacks/zod) | MIT | Runtime schema validation. |
-| [@vercel/blob](https://github.com/vercel/storage) | Apache-2.0 | Optional cloud asset storage. |
 
 ## Tooling
 

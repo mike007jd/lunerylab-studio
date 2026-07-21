@@ -6,7 +6,7 @@ import { toAssetDTO } from "@/lib/server/dto";
 import {
   assertRequestContentLength,
   validateFiles,
-  withUserStorageQuota,
+  withAssetWriteTransaction,
 } from "@/lib/server/file-validation";
 import { deleteStoredFile, writeFilesOrCleanup, writeGeneratedImage } from "@/lib/server/storage";
 import { parseRequestedAspectRatio } from "@/lib/server/byok-shared";
@@ -281,46 +281,42 @@ export async function POST(request: NextRequest) {
     // transaction, so we can never end up with successful assets attached to a
     // FAILED job (or a SUCCEEDED job with no assets). Files are deleted if the
     // transaction rolls back.
-    const { createdAssets, updatedJob } = await withUserStorageQuota(
-      user.id,
-      storedImages.reduce((total, stored) => total + stored.byteSize, 0),
-      async (tx) => {
-        assertGenerationRequestActive(request);
-        const assets = await Promise.all(
-          storedImages.map((stored, index) =>
-            tx.asset.create({
-              data: {
-                userId: user.id,
-                projectId: projectId || undefined,
-                jobId: job.id,
-                kind: "GENERATED",
-                storagePath: stored.storagePath,
-                mimeType: stored.mimeType,
-                byteSize: stored.byteSize,
-                width: stored.width,
-                height: stored.height,
-                ...generationAssetProvenance(
-                  generation.images[index]?.generationParameters,
-                  generation.model,
-                ),
-              },
-            }),
-          ),
-        );
-        assertGenerationRequestActive(request);
-        const completed = await completeGenerationJob({
-          jobId: job.id,
-          model: generation.model,
-          provider: generation.provider,
-          endpoint: generation.endpoint,
-          successCount: assets.length,
-          requestedCount: count,
-          emptyResultMessage: `${generation.provider} returned no generated images.`,
-          client: tx,
-        });
-        return { createdAssets: assets, updatedJob: completed };
-      },
-    ).catch(async (error) => {
+    const { createdAssets, updatedJob } = await withAssetWriteTransaction(async (tx) => {
+      assertGenerationRequestActive(request);
+      const assets = await Promise.all(
+        storedImages.map((stored, index) =>
+          tx.asset.create({
+            data: {
+              userId: user.id,
+              projectId: projectId || undefined,
+              jobId: job.id,
+              kind: "GENERATED",
+              storagePath: stored.storagePath,
+              mimeType: stored.mimeType,
+              byteSize: stored.byteSize,
+              width: stored.width,
+              height: stored.height,
+              ...generationAssetProvenance(
+                generation.images[index]?.generationParameters,
+                generation.model,
+              ),
+            },
+          }),
+        ),
+      );
+      assertGenerationRequestActive(request);
+      const completed = await completeGenerationJob({
+        jobId: job.id,
+        model: generation.model,
+        provider: generation.provider,
+        endpoint: generation.endpoint,
+        successCount: assets.length,
+        requestedCount: count,
+        emptyResultMessage: `${generation.provider} returned no generated images.`,
+        client: tx,
+      });
+      return { createdAssets: assets, updatedJob: completed };
+    }).catch(async (error) => {
       await deleteStoredFiles(storedImages.map((stored) => stored.storagePath));
       throw error;
     });

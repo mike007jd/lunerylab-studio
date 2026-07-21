@@ -11,8 +11,8 @@ import { z } from "zod";
 import {
   CANVAS_SNAPSHOT_LAYER_LIMIT,
   projectCanvasSnapshot,
-} from "@/lib/server/agent/v2/canvas-serializer";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+} from "@/lib/server/agent/runtime/canvas-serializer";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 export function buildObserveCanvasTool(ctx: AgentToolContext): Tool {
   return tool({

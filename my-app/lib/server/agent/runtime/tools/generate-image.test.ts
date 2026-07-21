@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 vi.mock("server-only", () => ({}));
 
@@ -37,7 +37,7 @@ vi.mock("@/lib/server/reference-assets", () => ({
   loadImageReferenceFiles: mocks.loadImageReferenceFiles,
 }));
 
-import { buildGenerateImageTool } from "@/lib/server/agent/v2/tools/generate-image";
+import { buildGenerateImageTool } from "@/lib/server/agent/runtime/tools/generate-image";
 
 interface GenerateImageToolInput {
   prompt: string;

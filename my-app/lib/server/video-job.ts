@@ -14,7 +14,7 @@
 import "server-only";
 import { ApiError } from "@/lib/server/errors";
 import { deleteStoredFile, writeGeneratedVideo } from "@/lib/server/storage";
-import { withUserStorageQuota } from "@/lib/server/file-validation";
+import { withAssetWriteTransaction } from "@/lib/server/file-validation";
 import { generateVideoByok } from "@/lib/server/byok-video";
 import type { VideoRuntimeTarget } from "@/lib/server/video-runtime";
 import {
@@ -86,7 +86,7 @@ export async function runVideoJob(input: RunVideoJobInput): Promise<void> {
     // Asset creation AND the job's terminal state commit in the same
     // transaction so we never leave a successful asset under a FAILED job (or an
     // asset whose row was deleted but file kept). On rollback we delete the file.
-    await withUserStorageQuota(input.userId, stored.byteSize, async (tx) => {
+    await withAssetWriteTransaction(async (tx) => {
       await tx.asset.create({
         data: {
           userId: input.userId,

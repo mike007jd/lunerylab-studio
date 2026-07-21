@@ -3,7 +3,7 @@
  *
  * Agent edit invariant #4: edits never destroy the original. The result is
  * written as a NEW asset + a NEW top-z canvas layer while the source layer is
- * hidden. This skeleton (write file → quota-checked asset create with rollback →
+ * hidden. This skeleton (write file → transactional asset create with rollback →
  * hide original + create top-z layer with rollback) used to be implemented
  * twice — once here for inpaint/background-remove (image-edit.ts) and once,
  * minus the layer-create rollback, in edit-layer.ts. Centralising it keeps the
@@ -13,9 +13,9 @@
 
 import "server-only";
 import { prisma } from "@/lib/server/prisma";
-import { withUserStorageQuota } from "@/lib/server/file-validation";
+import { withAssetWriteTransaction } from "@/lib/server/file-validation";
 import { deleteStoredFile, writeGeneratedImage } from "@/lib/server/storage";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 export interface ReplacementSourceLayer {
   id: string;
@@ -35,7 +35,7 @@ export async function saveResultAsReplacementLayer(
     bytes: finalBytes,
     projectId: ctx.projectId ?? undefined,
   });
-  const createdAsset = await withUserStorageQuota(ctx.userId, stored.byteSize, (tx) =>
+  const createdAsset = await withAssetWriteTransaction((tx) =>
     tx.asset.create({
       data: {
         userId: ctx.userId,

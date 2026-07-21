@@ -5,9 +5,9 @@ import { purgeAssets } from "@/lib/server/asset-purge";
 
 /**
  * Empty Trash: permanently purge every soft-deleted asset for the workspace
- * owner, reclaiming both disk (files) and quota (rows). This is the destructive
- * counterpart to the soft DELETE on /api/assets/[id]; the UI must confirm before
- * calling it.
+ * owner, reclaiming disk (files) and removing the soft-deleted rows. This is
+ * the destructive counterpart to the soft DELETE on /api/assets/[id]; the UI
+ * must confirm before calling it.
  */
 export async function DELETE() {
   try {

@@ -71,7 +71,7 @@ Desktop installers are built from `.github/workflows/desktop-release.yml` on `v*
 - The desktop direction is embedded local engines, BYOK providers, OpenAI-compatible endpoints, and Hugging Face/local-model support.
 - The Studio has no account, paywall, activation, or platform-managed balance product surface.
 - Project-wide rules live under [`../spec`](../spec).
-- Runtime media storage uses the visible Lunery profile by default; `ECOM_STORAGE_DIR` is only an absolute-path override.
+- Runtime media storage uses the visible Lunery profile by default; `LUNERY_MEDIA_DIR` is only an absolute-path override.
 
 ## Documentation Map
 

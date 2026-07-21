@@ -14,7 +14,7 @@ import {
   writeFilesOrCleanup,
   writeGeneratedImage,
 } from "@/lib/server/storage";
-import { withUserStorageQuota } from "@/lib/server/file-validation";
+import { withAssetWriteTransaction } from "@/lib/server/file-validation";
 import {
   completeGenerationJob,
   createGenerationJob,
@@ -24,8 +24,8 @@ import { exportForPlatforms } from "@/lib/server/platform-export";
 import {
   PLATFORM_SIZES_BY_ID,
 } from "@/lib/constants/platform-sizes";
-import { loadAgentLayer } from "@/lib/server/agent/v2/layer-access";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 export function buildExportPlatformsTool(ctx: AgentToolContext): Tool {
   return tool({
@@ -94,38 +94,34 @@ export function buildExportPlatformsTool(ctx: AgentToolContext): Tool {
 
         // Assets + job terminal state commit atomically; files are deleted if
         // the transaction rolls back.
-        const createdAssets = await withUserStorageQuota(
-          ctx.userId,
-          storedExports.reduce((sum, s) => sum + s.byteSize, 0),
-          async (tx) => {
-            const assets = await Promise.all(
-              storedExports.map((stored) =>
-                tx.asset.create({
-                  data: {
-                    userId: ctx.userId,
-                    projectId: ctx.projectId,
-                    jobId: job.id,
-                    kind: "GENERATED",
-                    storagePath: stored.storagePath,
-                    mimeType: stored.mimeType,
-                    byteSize: stored.byteSize,
-                    width: stored.width,
-                    height: stored.height,
-                  },
-                }),
-              ),
-            );
-            await completeGenerationJob({
-              jobId: job.id,
-              model: "sharp",
-              provider: "platform-export",
-              successCount: assets.length,
-              requestedCount: presetIds.length,
-              client: tx,
-            });
-            return assets;
-          },
-        ).catch(async (error) => {
+        const createdAssets = await withAssetWriteTransaction(async (tx) => {
+          const assets = await Promise.all(
+            storedExports.map((stored) =>
+              tx.asset.create({
+                data: {
+                  userId: ctx.userId,
+                  projectId: ctx.projectId,
+                  jobId: job.id,
+                  kind: "GENERATED",
+                  storagePath: stored.storagePath,
+                  mimeType: stored.mimeType,
+                  byteSize: stored.byteSize,
+                  width: stored.width,
+                  height: stored.height,
+                },
+              }),
+            ),
+          );
+          await completeGenerationJob({
+            jobId: job.id,
+            model: "sharp",
+            provider: "platform-export",
+            successCount: assets.length,
+            requestedCount: presetIds.length,
+            client: tx,
+          });
+          return assets;
+        }).catch(async (error) => {
           await Promise.allSettled(storedExports.map((stored) => deleteStoredFile(stored.storagePath)));
           throw error;
         });

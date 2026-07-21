@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { del, get, head, put } from "@vercel/blob";
 import { lookup as lookupMime } from "mime-types";
-import { getStorageDriver } from "@/lib/server/env";
 import { ApiError } from "@/lib/server/errors";
 import { sniffImageMime } from "@/lib/server/byok-shared";
 import { assertImageByteSize, safeSharp } from "@/lib/server/image-safety";
@@ -50,10 +48,7 @@ async function localCreateReadStream(
 }
 
 function storageRootPath() {
-  const configured = process.env.ECOM_STORAGE_DIR?.trim();
-  if (!configured) return luneryMediaDir();
-  if (path.isAbsolute(configured)) return configured;
-  throw new Error("ECOM_STORAGE_DIR must be an absolute path, or omitted to use the Lunery profile.");
+  return luneryMediaDir();
 }
 
 function normalizeRuntimeRoot(root: string): string {
@@ -69,36 +64,20 @@ function joinRuntimePath(root: string, ...parts: string[]) {
   return `${normalizedRoot}${separator}${parts.join(path.sep)}`;
 }
 
-function shouldUseBlobStorage(): boolean {
-  const driver = getStorageDriver();
-  if (driver === "blob") return true;
-  if (driver === "local") return false;
-  return process.env.VERCEL === "1" || !!process.env.BLOB_READ_WRITE_TOKEN;
-}
-
-function assertBlobStorageConfigured() {
-  if (!process.env.BLOB_READ_WRITE_TOKEN) {
-    throw new ApiError({
-      status: 503,
-      code: "blob_storage_unconfigured",
-      message: "Persistent asset storage is not configured.",
-      retryable: false,
-    });
-  }
-}
-
-/** True when media is served from Vercel Blob rather than the local filesystem. */
+/**
+ * Local media capability probe for the storage surface.
+ * Always false: media is written only to the local filesystem.
+ */
 export function isBlobStorage(): boolean {
-  return shouldUseBlobStorage();
+  return false;
 }
 
 /**
  * List every stored file under the local storage root as bucket-relative POSIX
  * paths (e.g. `generated/abc.png`, `uploads/{projectId}/x.jpg`) — the same shape
- * as an asset's `storagePath`. Local storage only; returns [] for blob storage.
+ * as an asset's `storagePath`.
  */
 export async function listStoredRelativePaths(): Promise<string[]> {
-  if (shouldUseBlobStorage()) return [];
   const root = storageRootPath();
   const fs = await localFs();
   const out: string[] = [];
@@ -170,11 +149,6 @@ export function resolveStoragePath(storagePath: string) {
 // whole repo. Returns null on unknown bytes; callers decide their default.
 
 export async function ensureStorage() {
-  if (shouldUseBlobStorage()) {
-    assertBlobStorageConfigured();
-    return null;
-  }
-
   const root = storageRootPath();
   const fs = await localFs();
   await fs.mkdir(path.join(root, "uploads"), { recursive: true });
@@ -189,32 +163,6 @@ function storedFileNotFound(): never {
     message: "Stored asset file was not found.",
     retryable: false,
   });
-}
-
-async function writeBlobFile({
-  bytes,
-  mimeType,
-  storagePath,
-}: {
-  bytes: Buffer;
-  mimeType: string;
-  storagePath: string;
-}): Promise<StoredFile> {
-  assertBlobStorageConfigured();
-  const blob = await put(storagePath, bytes, {
-    access: "private",
-    addRandomSuffix: false,
-    allowOverwrite: false,
-    cacheControlMaxAge: 31536000,
-    contentType: mimeType,
-    multipart: bytes.byteLength >= 5 * 1024 * 1024,
-  });
-
-  return {
-    storagePath: blob.pathname,
-    byteSize: bytes.byteLength,
-    mimeType: blob.contentType || mimeType,
-  };
 }
 
 export interface WrittenReference extends StoredImageFile {
@@ -268,20 +216,7 @@ export async function writeReferenceFile(file: File): Promise<WrittenReference> 
   const ext = extensionFromMime(mimeType);
   const storagePath = path.posix.join("uploads", `${Date.now()}-${randomUUID()}.${ext}`);
 
-  if (shouldUseBlobStorage()) {
-    const stored = await writeBlobFile({ bytes: buffer, mimeType, storagePath });
-    return {
-      ...stored,
-      mimeType,
-      ...dimensions,
-      buffer,
-    };
-  }
-
-  const root = await ensureStorage();
-  if (!root) {
-    throw new Error("Local storage root was not initialized.");
-  }
+  await ensureStorage();
   const absolutePath = resolveStoragePath(storagePath);
 
   const fs = await localFs();
@@ -316,14 +251,7 @@ async function writeGeneratedFile({
       ? path.posix.join("generated", projectId, fileName)
       : path.posix.join("generated", fileName);
 
-  if (shouldUseBlobStorage()) {
-    return writeBlobFile({ bytes, mimeType, storagePath });
-  }
-
-  const root = await ensureStorage();
-  if (!root) {
-    throw new Error("Local storage root was not initialized.");
-  }
+  await ensureStorage();
   const absolutePath = resolveStoragePath(storagePath);
 
   const fs = await localFs();
@@ -348,28 +276,7 @@ export async function restoreStoredFile({
   bytes: Buffer;
   mimeType: string;
 }): Promise<StoredFile> {
-  if (shouldUseBlobStorage()) {
-    assertBlobStorageConfigured();
-    const blob = await put(storagePath, bytes, {
-      access: "private",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      cacheControlMaxAge: 31536000,
-      contentType: mimeType,
-      multipart: bytes.byteLength >= 5 * 1024 * 1024,
-    });
-
-    return {
-      storagePath: blob.pathname,
-      byteSize: bytes.byteLength,
-      mimeType: blob.contentType || mimeType,
-    };
-  }
-
-  const root = await ensureStorage();
-  if (!root) {
-    throw new Error("Local storage root was not initialized.");
-  }
+  await ensureStorage();
   const absolutePath = resolveStoragePath(storagePath);
   const fs = await localFs();
   await fs.mkdir(path.dirname(absolutePath), { recursive: true });
@@ -474,20 +381,6 @@ export async function writeGenerated3dModel(
 }
 
 export async function readStoredFile(storagePath: string) {
-  if (shouldUseBlobStorage()) {
-    assertBlobStorageConfigured();
-    const blob = await get(storagePath, { access: "private" });
-    if (!blob || blob.statusCode !== 200 || !blob.stream) {
-      storedFileNotFound();
-    }
-
-    const file = Buffer.from(await new Response(blob.stream).arrayBuffer());
-    return {
-      file,
-      mimeType: blob.blob.contentType || "application/octet-stream",
-    };
-  }
-
   const resolved = resolveStoragePath(storagePath);
   let file: Buffer;
   try {
@@ -507,12 +400,6 @@ export async function readStoredFile(storagePath: string) {
 }
 
 export async function deleteStoredFile(storagePath: string) {
-  if (shouldUseBlobStorage()) {
-    assertBlobStorageConfigured();
-    await del(storagePath);
-    return;
-  }
-
   const resolved = resolveStoragePath(storagePath);
 
   try {
@@ -546,22 +433,6 @@ export async function writeFilesOrCleanup<T extends { storagePath: string }>(
 }
 
 export async function getStoredFileMetadata(storagePath: string): Promise<StoredFileMetadata> {
-  if (shouldUseBlobStorage()) {
-    assertBlobStorageConfigured();
-    try {
-      const blob = await head(storagePath);
-      return {
-        byteSize: blob.size,
-        mimeType: blob.contentType || "application/octet-stream",
-      };
-    } catch (error) {
-      if ((error as Error).name === "BlobNotFoundError") {
-        storedFileNotFound();
-      }
-      throw error;
-    }
-  }
-
   const resolved = resolveStoragePath(storagePath);
   try {
     const fs = await localFs();
@@ -582,24 +453,6 @@ export async function streamStoredFile(
   storagePath: string,
   range?: { start: number; end: number },
 ): Promise<StoredFileStream> {
-  if (shouldUseBlobStorage()) {
-    assertBlobStorageConfigured();
-    const blob = await get(storagePath, {
-      access: "private",
-      headers: range ? { range: `bytes=${range.start}-${range.end}` } : undefined,
-    });
-    const statusCode = Number(blob?.statusCode);
-    if (!blob || (statusCode !== 200 && statusCode !== 206) || !blob.stream) {
-      storedFileNotFound();
-    }
-
-    return {
-      stream: blob.stream,
-      byteSize: blob.blob.size,
-      mimeType: blob.blob.contentType || "application/octet-stream",
-    };
-  }
-
   const resolved = resolveStoragePath(storagePath);
   const metadata = await getStoredFileMetadata(storagePath);
   const fileStream = await localCreateReadStream(resolved, range);

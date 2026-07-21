@@ -7,7 +7,7 @@
  * Regression cover for the three shared primitives with the widest blast radius
  * (Button and AssetImage are used across every surface; SelectTrigger across
  * every form). Each test pins one design invariant from
- * `.ai/loops/design-invariants.md` so a future edit to these primitives cannot
+ * `docs/UI_FRAMEWORK_STACK.md` so a future edit to these primitives cannot
  * silently reintroduce the drift they were converged out of.
  */
 

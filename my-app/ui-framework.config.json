@@ -7,13 +7,9 @@
     "../docs/design/surfaces/canvas.md",
     "../docs/design/surfaces/library.md",
     "components/design-system/README.md",
-    "components/design-system/index.ts",
-    "components/design-system/primitives/index.ts",
     "components/design-system/grammar/tokens.ts",
     "components/design-system/grammar/motion.ts",
-    "components/design-system/shell/index.ts",
-    "components/design-system/assistant/index.ts",
-    "components/design-system/surfaces/index.ts"
+    "components/design-system/shell/index.ts"
   ],
   "baselines": {
     "rawColor": 24,

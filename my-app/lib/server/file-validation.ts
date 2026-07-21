@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 import sharp from "sharp";
 import { prisma } from "@/lib/server/prisma";
 import { ApiError } from "@/lib/server/errors";
-import { getMaxStorageBytesPerUser, getMaxUploadBytesPerFile } from "@/lib/server/env";
+import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { sniffImageMime } from "@/lib/server/byok-shared";
 
 const MAX_IMAGE_DIMENSION = 8192;
@@ -117,62 +117,12 @@ export async function validateFiles(
   }
 }
 
-function throwStorageQuotaExceeded({
-  used,
-  incomingBytes,
-  maxBytes,
-}: {
-  used: number;
-  incomingBytes: number;
-  maxBytes: number;
-}): never {
-  throw new ApiError({
-    status: 409,
-    code: "storage_quota_exceeded",
-    message: `Storage quota exceeded. ${used + incomingBytes} bytes would exceed the ${maxBytes} byte limit.`,
-    retryable: false,
-    details: {
-      usedBytes: used,
-      incomingBytes,
-      maxBytes,
-    },
-  });
-}
-
-async function assertUserStorageQuotaWithClient(
-  client: typeof prisma | PrismaTransactionClient,
-  userId: string,
-  incomingBytes: number,
-) {
-  if (incomingBytes <= 0) {
-    return;
-  }
-
-  const current = await client.asset.aggregate({
-    where: { userId },
-    _sum: { byteSize: true },
-  });
-
-  const used = current._sum.byteSize ?? 0;
-  const maxBytes = getMaxStorageBytesPerUser();
-  if (used + incomingBytes > maxBytes) {
-    throwStorageQuotaExceeded({ used, incomingBytes, maxBytes });
-  }
-}
-
-export async function withUserStorageQuota<T>(
-  userId: string,
-  incomingBytes: number,
+/**
+ * Run multi-row asset writes in a single Prisma transaction so asset rows,
+ * job terminal state, and related canvas mutations stay atomic.
+ */
+export async function withAssetWriteTransaction<T>(
   write: (tx: PrismaTransactionClient) => Promise<T>,
 ): Promise<T> {
-  return prisma.$transaction(async (tx) => {
-    // Serialize quota-sensitive asset writes for this user without a schema change.
-    await tx.userSettings.upsert({
-      where: { userId },
-      update: { updatedAt: new Date() },
-      create: { userId },
-    });
-    await assertUserStorageQuotaWithClient(tx, userId, incomingBytes);
-    return write(tx);
-  });
+  return prisma.$transaction(write);
 }

@@ -172,7 +172,7 @@ export async function DELETE(request: NextRequest, { params }: Params) {
     const user = await requireLocalWorkspaceOwner();
     const { id } = await params;
 
-    // `?permanent=true` hard-deletes the asset (row + file, quota reclaimed).
+    // `?permanent=true` hard-deletes the asset (row + file).
     // Without it, DELETE soft-deletes into Trash as before.
     const permanent = new URL(request.url).searchParams.get("permanent") === "true";
 

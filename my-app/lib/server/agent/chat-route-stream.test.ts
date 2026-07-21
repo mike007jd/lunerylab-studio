@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   requireLocalWorkspaceOwner: vi.fn(),
-  runAgentV2: vi.fn(),
+  runAgent: vi.fn(),
   createAgentTask: vi.fn(),
   persistAgentTaskStep: vi.fn(),
   finishAgentTask: vi.fn(),
@@ -13,8 +13,8 @@ vi.mock("@/lib/server/local-workspace-owner", () => ({
   requireLocalWorkspaceOwner: mocks.requireLocalWorkspaceOwner,
 }));
 
-vi.mock("@/lib/server/agent/v2/run", () => ({
-  runAgentV2: mocks.runAgentV2,
+vi.mock("@/lib/server/agent/runtime/run", () => ({
+  runAgent: mocks.runAgent,
 }));
 
 vi.mock("@/lib/server/agent/task-store", () => ({
@@ -52,7 +52,7 @@ beforeEach(() => {
 
 describe("/api/chat UIMessage stream", () => {
   it("streams live model text and persists the completed assistant turn", async () => {
-    mocks.runAgentV2.mockImplementation(async (input) => {
+    mocks.runAgent.mockImplementation(async (input) => {
       input.onTextDelta?.("Working");
       input.onTextDelta?.(" now");
       return {
@@ -79,7 +79,7 @@ describe("/api/chat UIMessage stream", () => {
   });
 
   it("streams AI SDK UIMessage data parts and forwards deterministic actions", async () => {
-    mocks.runAgentV2.mockImplementation(async (input) => {
+    mocks.runAgent.mockImplementation(async (input) => {
       input.onStep?.({
         id: "step-1",
         summary: "Removed background of layer layer-1.",
@@ -118,7 +118,7 @@ describe("/api/chat UIMessage stream", () => {
     const text = await readResponse(response);
     expect(text).toContain('"type":"data-agent-step"');
     expect(text).toContain('"type":"data-agent-asset"');
-    expect(mocks.runAgentV2).toHaveBeenCalledWith(
+    expect(mocks.runAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user-1",
         sessionId: "session-1",
@@ -130,7 +130,7 @@ describe("/api/chat UIMessage stream", () => {
   });
 
   it("prefers the explicit UI locale over the browser Accept-Language", async () => {
-    mocks.runAgentV2.mockResolvedValue({
+    mocks.runAgent.mockResolvedValue({
       runId: "run-1",
       assistantMessage: "暂无可用的生成后端。请在设置中配置 Provider 或本地 Runtime。",
       steps: [],
@@ -152,7 +152,7 @@ describe("/api/chat UIMessage stream", () => {
     );
     const text = await readResponse(response);
 
-    expect(mocks.runAgentV2).toHaveBeenCalledWith(
+    expect(mocks.runAgent).toHaveBeenCalledWith(
       expect.objectContaining({ locale: "zh-CN" }),
     );
     expect(text).toContain("暂无可用的生成后端");
@@ -160,7 +160,7 @@ describe("/api/chat UIMessage stream", () => {
   });
 
   it("keeps business failures visible as data-agent-error parts", async () => {
-    mocks.runAgentV2.mockResolvedValue({
+    mocks.runAgent.mockResolvedValue({
       runId: "run-1",
       assistantMessage: "Fal BYOK is not connected.",
       steps: [],
@@ -185,7 +185,7 @@ describe("/api/chat UIMessage stream", () => {
   });
 
   it("streams execution exceptions as visible retryable assistant errors", async () => {
-    mocks.runAgentV2.mockRejectedValue(new Error("provider unavailable"));
+    mocks.runAgent.mockRejectedValue(new Error("provider unavailable"));
 
     const response = await POST(
       request({
@@ -201,7 +201,7 @@ describe("/api/chat UIMessage stream", () => {
   });
 
   it("accepts an action-only request with no text message (#9)", async () => {
-    mocks.runAgentV2.mockResolvedValue({
+    mocks.runAgent.mockResolvedValue({
       runId: "run-1",
       assistantMessage: "Removed background.",
       steps: [],
@@ -221,7 +221,7 @@ describe("/api/chat UIMessage stream", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.runAgentV2).toHaveBeenCalledWith(
+    expect(mocks.runAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionId: "session-1",
         message: "",
@@ -234,6 +234,6 @@ describe("/api/chat UIMessage stream", () => {
     const response = await POST(request({ sessionId: "session-1" }));
 
     expect(response.status).toBe(400);
-    expect(mocks.runAgentV2).not.toHaveBeenCalled();
+    expect(mocks.runAgent).not.toHaveBeenCalled();
   });
 });

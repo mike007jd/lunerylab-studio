@@ -44,7 +44,6 @@ describe("getStorageBreakdown", () => {
     expect(result.trashBytes).toBe(340);
     expect(result.modelsBytes).toBe(500);
     expect(result.logsBytes).toBe(30);
-    expect(result.quotaBytes).toBeGreaterThan(0);
     // freeDiskBytes is number|null depending on statfs support.
     expect(result.freeDiskBytes === null || typeof result.freeDiskBytes === "number").toBe(true);
   });

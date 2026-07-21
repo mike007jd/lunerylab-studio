@@ -1,10 +1,10 @@
 /**
- * Agent v2 types — plan-DAG + tool-registry + iterative executor.
+ * Agent runtime types — plan-DAG + tool-registry + iterative executor.
  *
- * v2 replaces the v1 4-action enum (answer/image/edit/video) with a dynamic
- * tool registry executed in a multi-step loop by the AI SDK. Each step is a
- * tool call; tool results flow back to the LLM, which decides the next step
- * or finishes.
+ * The runtime replaces the former 4-action enum (answer/image/edit/video) with
+ * a dynamic tool registry executed in a multi-step loop by the AI SDK. Each
+ * step is a tool call; tool results flow back to the LLM, which decides the
+ * next step or finishes.
  */
 
 import type { Locale } from "@/lib/i18n/locale";
@@ -112,7 +112,7 @@ export interface AgentRunInput {
   /**
    * Deterministic business action requested by a first-party UI control.
    * These bypass model planning while reusing the same tool implementations,
-   * quota checks, canvas mutations, snapshots, and progress stream.
+   * asset-write transactions, canvas mutations, snapshots, and progress stream.
    */
   action?:
     | { type: "inpaint_layer"; layerId: string; prompt: string }

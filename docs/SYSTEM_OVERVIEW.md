@@ -61,10 +61,9 @@ Prisma models:
 
 ### Storage
 
-- Local mode writes to the visible Lunery profile media directory by default;
-  `ECOM_STORAGE_DIR` is an absolute-path override.
-- Blob mode is selected by `ECOM_STORAGE_DRIVER=blob`, `VERCEL=1`, or
-  `BLOB_READ_WRITE_TOKEN`; it requires `BLOB_READ_WRITE_TOKEN`.
+- Media storage is local filesystem only. It writes to the visible Lunery
+  profile media directory by default; `LUNERY_MEDIA_DIR` is an absolute-path
+  override.
 - Storage paths are limited to `uploads/<file>`, `generated/<file>`, and their
   project-scoped `bucket/<projectId>/<file>` form.
 - `my-app/data/uploads` and `my-app/data/generated` are legacy migration/
@@ -82,7 +81,7 @@ Prisma models:
   clients.
 - `lib/server/video-runtime.ts`, `lib/server/byok-video.ts`, and
   `lib/video-models.ts` own video provider behavior.
-- `lib/server/agent/v2/` owns the canvas agent loop, tools, snapshots, and
+- `lib/server/agent/runtime/` owns the canvas agent loop, tools, snapshots, and
   artifact aggregation.
 
 ## Security And Boundaries

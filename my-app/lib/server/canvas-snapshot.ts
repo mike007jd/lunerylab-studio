@@ -3,7 +3,7 @@
  * state of a session and writes a CanvasSnapshot row.
  *
  * Used by:
- *   - Agent v2 executor (auto-snapshot after a successful run that mutated
+ *   - Agent runtime executor (auto-snapshot after a successful run that mutated
  *     the canvas), so multi-step agent runs are trivially reversible.
  *   - Manual snapshot creation via POST /api/canvas/sessions/[id]/snapshots.
  */
