@@ -10,7 +10,6 @@ export {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-export { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 export { Badge, badgeVariants } from "@/components/ui/badge";
 export { Button, buttonVariants } from "@/components/ui/button";
 export {
