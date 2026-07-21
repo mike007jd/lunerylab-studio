@@ -22,11 +22,7 @@ export const LOCAL_WORKSPACE_OWNER: LocalWorkspaceOwner = {
 };
 
 function assertWorkspaceApiAllowed(): void {
-  if (
-    isDesktopRuntime() ||
-    process.env.NODE_ENV !== "production" ||
-    process.env.ECOM_ENABLE_WEB_WORKSPACE_API === "1"
-  ) {
+  if (isDesktopRuntime()) {
     return;
   }
 

@@ -5,7 +5,6 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { prisma } from "@/lib/server/prisma";
 import {
-  isBlobStorage,
   listStoredRelativePaths,
   readStoredFile,
 } from "@/lib/server/storage";
@@ -155,12 +154,10 @@ export async function exportWorkspaceBackup(createdAt: string): Promise<Workspac
 
   const media: WorkspaceBackup["media"] = [];
   const mediaManifest: WorkspaceBackup["manifest"]["media"] = [];
-  if (!isBlobStorage()) {
-    for (const path of await listStoredRelativePaths()) {
-      const { file } = await readStoredFile(path);
-      media.push({ path, base64: file.toString("base64") });
-      mediaManifest.push({ path, sha256: sha256(file), bytes: file.byteLength });
-    }
+  for (const path of await listStoredRelativePaths()) {
+    const { file } = await readStoredFile(path);
+    media.push({ path, base64: file.toString("base64") });
+    mediaManifest.push({ path, sha256: sha256(file), bytes: file.byteLength });
   }
 
   const configFiles = await listDirectoryFiles(luneryConfigDir());
@@ -307,14 +304,6 @@ export async function restoreWorkspaceBackup(
     });
   }
   verifyBackupIntegrity(backup);
-  if (isBlobStorage()) {
-    throw new ApiError({
-      status: 400,
-      code: "restore_local_only",
-      message: "Workspace restore is available in the local desktop app only.",
-      retryable: false,
-    });
-  }
 
   const counts: Record<string, number> = {};
   const deferredUpdates: Array<{ model: ModelName; id: string; data: Record<string, unknown> }> = [];

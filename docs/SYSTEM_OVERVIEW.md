@@ -61,10 +61,9 @@ Prisma models:
 
 ### Storage
 
-- Local mode writes to the visible Lunery profile media directory by default;
-  `ECOM_STORAGE_DIR` is an absolute-path override.
-- Blob mode is selected by `ECOM_STORAGE_DRIVER=blob`, `VERCEL=1`, or
-  `BLOB_READ_WRITE_TOKEN`; it requires `BLOB_READ_WRITE_TOKEN`.
+- Media storage is local filesystem only. It writes to the visible Lunery
+  profile media directory by default; `ECOM_STORAGE_DIR` is an absolute-path
+  override.
 - Storage paths are limited to `uploads/<file>`, `generated/<file>`, and their
   project-scoped `bucket/<projectId>/<file>` form.
 - `my-app/data/uploads` and `my-app/data/generated` are legacy migration/

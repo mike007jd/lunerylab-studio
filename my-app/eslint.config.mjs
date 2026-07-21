@@ -72,7 +72,6 @@ const eslintConfig = defineConfig([
             { name: "@ai-sdk/anthropic", message: "Server-only — use via lib/server/byok-llm.ts." },
             { name: "@ai-sdk/google", message: "Server-only — use via lib/server/byok-llm.ts." },
             { name: "@ai-sdk/openai-compatible", message: "Server-only — use via lib/server/byok-llm.ts." },
-            { name: "@vercel/blob", message: "Server-only — use via lib/server/storage.ts." },
             { name: "ai", message: "Server-only — use via lib/server/byok-llm.ts or generation helpers." },
           ],
         },

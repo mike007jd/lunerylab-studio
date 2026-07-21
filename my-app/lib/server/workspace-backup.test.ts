@@ -14,7 +14,6 @@ const mocks = vi.hoisted(() => ({
     deleteMany: ReturnType<typeof vi.fn>;
   }>,
   transaction: vi.fn(),
-  isBlobStorage: vi.fn(),
   listStoredRelativePaths: vi.fn(),
   readStoredFile: vi.fn(),
 }));
@@ -41,7 +40,6 @@ vi.mock("@/lib/server/prisma", () => {
 });
 
 vi.mock("@/lib/server/storage", () => ({
-  isBlobStorage: mocks.isBlobStorage,
   listStoredRelativePaths: mocks.listStoredRelativePaths,
   readStoredFile: mocks.readStoredFile,
 }));
@@ -62,7 +60,6 @@ let testRoot = "";
 beforeEach(async () => {
   vi.clearAllMocks();
   for (const key of Object.keys(mocks.models)) delete mocks.models[key];
-  mocks.isBlobStorage.mockReturnValue(false);
   mocks.listStoredRelativePaths.mockResolvedValue([]);
   testRoot = await fs.mkdtemp(path.join(tmpdir(), "lunery-backup-test-"));
   vi.stubEnv("LUNERY_CONFIG_DIR", path.join(testRoot, "config"));
@@ -137,8 +134,10 @@ function goodBackup(): WorkspaceBackup {
 describe("exportWorkspaceBackup", () => {
   it("includes a manifest excluding keychain secrets and media checksums", async () => {
     const bytes = Buffer.from("hello");
-    mocks.listStoredRelativePaths.mockResolvedValue(["generated/a.png"]);
-    mocks.readStoredFile.mockResolvedValue({ file: bytes });
+    mocks.listStoredRelativePaths.mockResolvedValue(["generated/a.png", "uploads/ref.jpg"]);
+    mocks.readStoredFile.mockImplementation(async (storagePath: string) => ({
+      file: storagePath === "generated/a.png" ? bytes : Buffer.from("ref"),
+    }));
 
     const backup = await exportWorkspaceBackup("2026-07-15T00:00:00.000Z");
 
@@ -146,12 +145,20 @@ describe("exportWorkspaceBackup", () => {
     expect(backup.manifest.excluded).toContain("keychain-secrets");
     expect(backup.manifest.excluded).toEqual(expect.arrayContaining(["models", "logs", "runtime-temp"]));
     expect(backup.manifest.dataSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(backup.manifest.media[0]).toMatchObject({
-      path: "generated/a.png",
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      bytes: 5,
-    });
-    expect(backup.media[0]!.base64).toBe(bytes.toString("base64"));
+    expect(backup.manifest.media).toEqual([
+      {
+        path: "generated/a.png",
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        bytes: 5,
+      },
+      {
+        path: "uploads/ref.jpg",
+        sha256: createHash("sha256").update(Buffer.from("ref")).digest("hex"),
+        bytes: 3,
+      },
+    ]);
+    expect(backup.media.map((entry) => entry.path)).toEqual(["generated/a.png", "uploads/ref.jpg"]);
+    expect(mocks.readStoredFile).toHaveBeenCalledTimes(2);
   });
 });
 

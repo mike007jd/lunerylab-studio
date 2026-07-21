@@ -43,8 +43,8 @@ For desktop Studio, `.env.local` can keep `DATABASE_URL` empty. Desktop runtime
 starts PGlite and overrides `DATABASE_URL`. Copying `.env.example` keeps
 optional runtime overrides documented.
 
-Do not set `ECOM_ENABLE_WEB_WORKSPACE_API=1` unless you intentionally want the
-dangerous web workspace escape hatch. Desktop never needs it.
+Workspace APIs are desktop-only. Browser and non-desktop local servers receive
+`403 workspace_api_disabled`; there is no web escape hatch.
 
 ## Run Studio (preferred)
 

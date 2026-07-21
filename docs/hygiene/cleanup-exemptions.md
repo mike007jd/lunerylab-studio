@@ -74,5 +74,5 @@ before deleting the TS registry.
 | `.ai/loops/design-invariants.md` references | Doc/gate renamed | Ledger gone; invariants live in UI_FRAMEWORK_STACK + ui:check |
 | `ECOM_*` env prefix rename | Deferred | Naming debt only; needs product confirmation |
 | agent `v2/` directory rename | Deferred | Naming debt only; needs product confirmation |
-| Web blob / `ECOM_ENABLE_WEB_WORKSPACE_API` | Deferred | Needs product confirmation before collapse |
+| Former web workspace API escape hatch | Removed | Desktop-local convergence: local FS media only; workspace APIs desktop-gated |
 | Settings "Cost/local-first mode" doc claim | Deferred | Doc drift; confirm whether to remove from surface contract |

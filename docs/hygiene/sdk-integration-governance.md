@@ -30,9 +30,9 @@ provider capability is still current.
   currently carry provider-specific body shapes, reference-image compression,
   polling deadlines, URL downloads, and error mapping that AI SDK does not own
   in this project.
-- Tauri desktop, Konva canvas persistence, local engine sidecars, and blob storage are
-  product boundaries. Reuse the existing wrappers instead of adding parallel
-  abstractions.
+- Tauri desktop, Konva canvas persistence, local engine sidecars, and local media
+  storage are product boundaries. Reuse the existing wrappers instead of adding
+  parallel abstractions.
 - `ai:freshness` is a governance gate. Keep exact model ids, source URLs, and
   checked dates explicit; URL probes may use a curl fallback only after Node
   fetch fails.

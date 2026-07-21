@@ -4,7 +4,6 @@ import fs from "node:fs/promises";
 import { prisma } from "@/lib/server/prisma";
 import {
   deleteStoredFile,
-  isBlobStorage,
   listStoredRelativePaths,
   resolveStoragePath,
 } from "@/lib/server/storage";
@@ -19,7 +18,7 @@ import {
  *    Reported by default; deleted only when deleteOrphans is set (a destructive
  *    action the caller opts into).
  *
- * Local storage only — blob storage returns an empty, no-op result.
+ * Local filesystem media only.
  */
 export interface StorageReconcileResult {
   supported: boolean;
@@ -41,10 +40,6 @@ export async function reconcileStorage(
   userId: string,
   options: { deleteOrphans?: boolean } = {},
 ): Promise<StorageReconcileResult> {
-  if (isBlobStorage()) {
-    return { supported: false, missingFiles: [], orphanFiles: [], orphansDeleted: 0 };
-  }
-
   // Referenced paths span ALL asset rows (active + trashed) so a trashed asset's
   // file is never mistaken for an orphan. Missing-file detection is scoped to the
   // owner's active assets.

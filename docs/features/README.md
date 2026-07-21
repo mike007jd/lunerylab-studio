@@ -95,7 +95,7 @@ model-management screen.
 | --- | --- | --- |
 | Bootstrap snapshot | Hydrates initial settings/runtime/catalog state. | `app/api/bootstrap/route.ts`, `lib/client/use-bootstrap-snapshot.ts` |
 | Models API | Returns model catalog to clients. | `app/api/models/route.ts`, `lib/server/model-catalog.ts` |
-| Storage service | Stores uploaded/generated files locally or in Vercel Blob. | `lib/server/storage.ts` |
+| Storage service | Stores uploaded/generated files on the local filesystem under the Lunery media profile. | `lib/server/storage.ts` |
 | i18n | Provides English, Simplified Chinese, and Traditional Chinese UI copy. | `lib/i18n/*` |
 | UI framework gate | Keeps surface code aligned with the Luna design system. | `scripts/check-ui-framework.mjs`, `ui-framework.config.json` |
 | AI freshness gate | Verifies current model/provider ids and source URLs. | `scripts/audit-ai-freshness.mjs` |
