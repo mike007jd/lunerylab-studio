@@ -13,7 +13,7 @@ import {
   listReferenceSets,
   type ReferenceSetSnapshot,
 } from "@/lib/server/reference-set";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 function describeSet(set: ReferenceSetSnapshot): {
   id: string;

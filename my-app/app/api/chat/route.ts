@@ -5,8 +5,8 @@ import { detectLocaleFromAcceptLanguage, normalizeLocale } from "@/lib/i18n/loca
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 import { ApiError, jsonError, toApiError } from "@/lib/server/errors";
 import { parseJsonBody } from "@/lib/server/http-validation";
-import { runAgentV2 } from "@/lib/server/agent/v2/run";
-import type { AgentRunResult } from "@/lib/server/agent/v2/run";
+import { runAgent } from "@/lib/server/agent/runtime/run";
+import type { AgentRunResult } from "@/lib/server/agent/runtime/run";
 import type { AgentUiContext, AgentMarkedRegion } from "@/lib/server/agent/types";
 import { createRouteTelemetry } from "@/lib/server/route-telemetry";
 import {
@@ -240,7 +240,7 @@ export async function POST(request: Request) {
         try {
           const stepWrites: Array<Promise<void>> = [];
           let textStarted = false;
-          const v2Result = await runAgentV2({
+          const agentResult = await runAgent({
             taskId: task.id,
             userId: user.id,
             sessionId,
@@ -275,21 +275,21 @@ export async function POST(request: Request) {
           });
           if (textStarted) writer.write({ type: "text-end", id: "agent-final" });
           await Promise.all(stepWrites);
-          const assistantParts = writeResultParts(writer, v2Result, textStarted, task.id);
+          const assistantParts = writeResultParts(writer, agentResult, textStarted, task.id);
           await finishAgentTask({
             taskId: task.id,
-            result: v2Result,
+            result: agentResult,
             assistantParts,
             cancelled: request.signal.aborted,
           });
           writer.write({
             type: "data-agent-status",
             id: "agent-status",
-            data: { status: v2Result.error ? "error" : "complete" },
+            data: { status: agentResult.error ? "error" : "complete" },
           });
           writer.write({
             type: "finish",
-            finishReason: v2Result.error ? "error" : "stop",
+            finishReason: agentResult.error ? "error" : "stop",
           });
         } catch (err) {
           const apiErr = toApiError(err);

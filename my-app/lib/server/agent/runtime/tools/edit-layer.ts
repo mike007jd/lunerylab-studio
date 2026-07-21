@@ -20,9 +20,9 @@ import {
   createGenerationJob,
   failRunningGenerationJob,
 } from "@/lib/server/generation-job";
-import { loadAgentLayer } from "@/lib/server/agent/v2/layer-access";
-import { saveResultAsReplacementLayer } from "@/lib/server/agent/v2/replacement-layer";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
+import { saveResultAsReplacementLayer } from "@/lib/server/agent/runtime/replacement-layer";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 export function buildEditLayerTool(ctx: AgentToolContext): Tool {
   return tool({

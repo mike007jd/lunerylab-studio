@@ -42,7 +42,7 @@ model manager.
 | BYOK image providers | Uses OpenAI, OpenAI-compatible, Fal, Replicate, and related providers. | `lib/server/byok-image.ts`, `lib/server/byok-image-adapters.ts`, `lib/server/byok-image-catalog.ts` |
 | BYOK text providers | Uses AI SDK models for text and structured prompt work. | `lib/server/byok-llm.ts`, `lib/server/byok-provider-config.ts` |
 | Video generation | Submits and polls provider video jobs. | `app/api/generate/video/route.ts`, `app/api/generate/video/[jobId]/status/route.ts`, `lib/server/byok-video.ts` |
-| 3D generation | Agent-accessible BYOK 3D generation. | `lib/server/byok-3d.ts`, `lib/server/agent/v2/tools/generate-3d.ts` |
+| 3D generation | Agent-accessible BYOK 3D generation. | `lib/server/byok-3d.ts`, `lib/server/agent/runtime/tools/generate-3d.ts` |
 
 No generation path may silently choose a hardcoded model when the user has not
 selected or configured one.
@@ -52,14 +52,14 @@ selected or configured one.
 | Feature | User value | Main files |
 | --- | --- | --- |
 | Agent chat | Natural-language helper for canvas operations. | `app/api/chat/route.ts`, `components/studio/agent-chat/*` |
-| Agent executor | Runs AI SDK tool loops with deterministic action support. | `lib/server/agent/v2/executor.ts`, `lib/server/agent/v2/run.ts` |
-| Agent tools | Observe, generate, edit, inpaint, remove background, move layers, export. | `lib/server/agent/v2/tools/*` |
+| Agent executor | Runs AI SDK tool loops with deterministic action support. | `lib/server/agent/runtime/executor.ts`, `lib/server/agent/runtime/run.ts` |
+| Agent tools | Observe, generate, edit, inpaint, remove background, move layers, export. | `lib/server/agent/runtime/tools/*` |
 | Canvas editor | Focused Konva asset editor with persisted layers, transforms, pan/zoom, and masks. | `app/canvas/[sessionId]/page.tsx`, `components/canvas/*` |
 | Canvas snapshots | Saves rollback points after agent and user changes. | `lib/server/canvas-snapshot.ts`, `app/api/canvas/sessions/[id]/snapshots/*` |
 | Layer APIs | Persist layer geometry, ordering, visibility, and deletion. | `app/api/canvas/sessions/[id]/layers/*`, `lib/server/canvas-layer-order.ts` |
 
 Agent UI should use assistant-ui as the presentation/runtime layer while keeping
-the backend agent contract in `lib/server/agent/v2`.
+the backend agent contract in `lib/server/agent/runtime`.
 
 ## Library And Projects
 

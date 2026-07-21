@@ -28,8 +28,8 @@ vi.mock("@/lib/server/prisma", () => ({
   },
 }));
 
-import { saveResultAsReplacementLayer } from "@/lib/server/agent/v2/replacement-layer";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import { saveResultAsReplacementLayer } from "@/lib/server/agent/runtime/replacement-layer";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 const ctx = {
   userId: "user-1",

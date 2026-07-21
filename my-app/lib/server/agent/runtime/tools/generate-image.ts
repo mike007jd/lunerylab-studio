@@ -29,7 +29,7 @@ import {
 import { loadImageReferenceFiles } from "@/lib/server/reference-assets";
 import { assertReferenceLimit } from "@/lib/server/generate-request";
 import { parseRequestedAspectRatio } from "@/lib/server/byok-shared";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 const GRID_GAP = 24;
 const GRID_ORIGIN = { x: 48, y: 48 };

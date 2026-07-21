@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
-import type { CanvasSnapshot } from "@/lib/server/agent/v2/canvas-serializer";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
+import type { CanvasSnapshot } from "@/lib/server/agent/runtime/canvas-serializer";
 
 vi.mock("server-only", () => ({}));
 
-import { buildObserveCanvasTool } from "@/lib/server/agent/v2/tools/observe-canvas";
+import { buildObserveCanvasTool } from "@/lib/server/agent/runtime/tools/observe-canvas";
 
 function snapshot(): CanvasSnapshot {
   return {

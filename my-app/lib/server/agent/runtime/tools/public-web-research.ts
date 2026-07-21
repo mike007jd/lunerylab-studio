@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 function decodeXml(value: string): string {
   return value

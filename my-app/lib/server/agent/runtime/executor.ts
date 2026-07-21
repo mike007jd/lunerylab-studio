@@ -1,5 +1,5 @@
 /**
- * Agent v2 executor.
+ * Agent runtime executor.
  *
  * Drives a multi-step agent loop with the AI SDK:
  *   1. Resolve runtime supply (text + image backend).
@@ -19,13 +19,13 @@ import { stepCountIs, streamText } from "ai";
 import { randomUUID } from "node:crypto";
 import { detectLocaleFromAcceptLanguage, isChineseLocale } from "@/lib/i18n/locale";
 import { resolveStudioRuntimeSupply } from "@/lib/server/runtime-supply";
-import { resolveAgentLanguageModel } from "@/lib/server/agent/v2/resolve-language-model";
+import { resolveAgentLanguageModel } from "@/lib/server/agent/runtime/resolve-language-model";
 import {
   buildCanvasSnapshot,
   renderCanvasSnapshot,
-} from "@/lib/server/agent/v2/canvas-serializer";
-import { buildAgentSystemPrompt } from "@/lib/server/agent/v2/system-prompt";
-import { buildAgentToolset, type AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+} from "@/lib/server/agent/runtime/canvas-serializer";
+import { buildAgentSystemPrompt } from "@/lib/server/agent/runtime/system-prompt";
+import { buildAgentToolset, type AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 import { getModelCatalog } from "@/lib/server/model-catalog";
 import { ApiError } from "@/lib/server/errors";
 import { prisma } from "@/lib/server/prisma";
@@ -35,7 +35,7 @@ import type {
   AgentRunResult,
   AgentStep,
   AgentStepArtifacts,
-} from "@/lib/server/agent/v2/types";
+} from "@/lib/server/agent/runtime/types";
 
 type ExecutableTool = {
   execute?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
@@ -245,7 +245,7 @@ async function runDeterministicAction(
   return { message: readToolSummary(result, `Removed background of layer ${action.layerId}.`) };
 }
 
-export async function runAgentV2(input: AgentRunInput): Promise<AgentRunResult> {
+export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
   const runId = randomUUID();
   const startMs = Date.now();
   const locale = input.locale ?? detectLocaleFromAcceptLanguage(null);
@@ -452,7 +452,7 @@ export async function runAgentV2(input: AgentRunInput): Promise<AgentRunResult> 
           : "The run timed out and was stopped.";
       if (!userAborted) runError = { code: "agent_timeout", message: finalMessage };
     } else {
-      console.error(`[agent-v2:${runId}] run error:`, error);
+      console.error(`[agent:${runId}] run error:`, error);
       runError = toRunError(error, locale);
       finalMessage = runError.message;
     }

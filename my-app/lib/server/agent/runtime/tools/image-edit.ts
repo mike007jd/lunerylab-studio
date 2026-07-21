@@ -24,8 +24,8 @@ import {
   isTemporaryCanvasMaskToken,
   readTemporaryCanvasMask,
 } from "@/lib/server/canvas-temporary-mask";
-import { loadAgentLayer } from "@/lib/server/agent/v2/layer-access";
-import { saveResultAsReplacementLayer } from "@/lib/server/agent/v2/replacement-layer";
+import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
+import { saveResultAsReplacementLayer } from "@/lib/server/agent/runtime/replacement-layer";
 import {
   completeGenerationJob,
   createGenerationJob,
@@ -38,7 +38,7 @@ import {
 } from "@/lib/server/byok-shared";
 import { falQueueSubmit } from "@/lib/server/byok-provider-clients";
 import { resolveByokProviderConfig } from "@/lib/server/byok-provider-config";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 function pickFalProviderId(): string | null {
   const connections = listByokConnectionMeta();

@@ -1,5 +1,5 @@
 /**
- * Agent v2 system prompt.
+ * Agent runtime system prompt.
  *
  * Frames the agent as a creator co-pilot that understands natural-language
  * intent and orchestrates image / video tools to put concrete output on the

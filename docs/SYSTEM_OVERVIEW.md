@@ -81,7 +81,7 @@ Prisma models:
   clients.
 - `lib/server/video-runtime.ts`, `lib/server/byok-video.ts`, and
   `lib/video-models.ts` own video provider behavior.
-- `lib/server/agent/v2/` owns the canvas agent loop, tools, snapshots, and
+- `lib/server/agent/runtime/` owns the canvas agent loop, tools, snapshots, and
   artifact aggregation.
 
 ## Security And Boundaries

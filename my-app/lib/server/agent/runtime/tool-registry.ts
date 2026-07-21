@@ -11,25 +11,25 @@
 import type { Tool } from "ai";
 import type { Locale } from "@/lib/i18n/locale";
 import type { StudioRuntimeSupply } from "@/lib/server/runtime-supply";
-import type { AgentStep, AgentStepArtifacts } from "@/lib/server/agent/v2/types";
-import type { CanvasSnapshot } from "@/lib/server/agent/v2/canvas-serializer";
-import { buildObserveCanvasTool } from "@/lib/server/agent/v2/tools/observe-canvas";
-import { buildGenerateImageTool } from "@/lib/server/agent/v2/tools/generate-image";
-import { buildEditLayerTool } from "@/lib/server/agent/v2/tools/edit-layer";
-import { buildGenerateVideoTool } from "@/lib/server/agent/v2/tools/generate-video";
+import type { AgentStep, AgentStepArtifacts } from "@/lib/server/agent/runtime/types";
+import type { CanvasSnapshot } from "@/lib/server/agent/runtime/canvas-serializer";
+import { buildObserveCanvasTool } from "@/lib/server/agent/runtime/tools/observe-canvas";
+import { buildGenerateImageTool } from "@/lib/server/agent/runtime/tools/generate-image";
+import { buildEditLayerTool } from "@/lib/server/agent/runtime/tools/edit-layer";
+import { buildGenerateVideoTool } from "@/lib/server/agent/runtime/tools/generate-video";
 import {
   buildMoveLayerTool,
   buildReorderLayerTool,
   buildSetLayerVisibilityTool,
-} from "@/lib/server/agent/v2/tools/canvas-ops";
-import { buildExportPlatformsTool } from "@/lib/server/agent/v2/tools/export-platforms";
-import { buildListReferenceSetsTool } from "@/lib/server/agent/v2/tools/reference-set-ops";
-import { buildGenerate3dTool } from "@/lib/server/agent/v2/tools/generate-3d";
+} from "@/lib/server/agent/runtime/tools/canvas-ops";
+import { buildExportPlatformsTool } from "@/lib/server/agent/runtime/tools/export-platforms";
+import { buildListReferenceSetsTool } from "@/lib/server/agent/runtime/tools/reference-set-ops";
+import { buildGenerate3dTool } from "@/lib/server/agent/runtime/tools/generate-3d";
 import {
   buildInpaintLayerTool,
   buildRemoveBackgroundTool,
-} from "@/lib/server/agent/v2/tools/image-edit";
-import { buildPublicWebResearchTool } from "@/lib/server/agent/v2/tools/public-web-research";
+} from "@/lib/server/agent/runtime/tools/image-edit";
+import { buildPublicWebResearchTool } from "@/lib/server/agent/runtime/tools/public-web-research";
 
 export interface AgentToolContext {
   taskId?: string;

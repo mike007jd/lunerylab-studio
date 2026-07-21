@@ -15,8 +15,8 @@ import { normalizeDuration } from "@/lib/video-models";
 import { resolveVideoModelEntry } from "@/lib/server/model-catalog";
 import { readStoredFile } from "@/lib/server/storage";
 import { createGenerationJob, failRunningGenerationJob } from "@/lib/server/generation-job";
-import { loadAgentLayer } from "@/lib/server/agent/v2/layer-access";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
   return tool({
@@ -105,7 +105,7 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
           runtime: videoRuntime,
           agentTaskId: ctx.taskId,
         }).catch((error) => {
-          console.error("[agent_v2_video_job_failed]", error);
+          console.error("[agent:video_job_failed]", error);
         });
 
         ctx.collectArtifacts({ videoJobId: job.id });

@@ -1,6 +1,6 @@
 # Cleanup Exemptions Ledger
 
-Updated: 2026-07-21 (dead-code-and-docs-cleanup-loop, round 2).
+Updated: 2026-07-21 (agent runtime rename; dead-code-and-docs-cleanup-loop, round 2).
 
 Knip / filename scans are candidate generators only. Items below were reviewed
 and must not be re-proposed as dead without new evidence.
@@ -23,7 +23,7 @@ DEAD_CODE_TOOL:  pnpm dlx knip@5
 IMPACT_TOOL:     grep+callgraph (GitNexus MCP unavailable this session)
 DOCS_ROOT:       docs/, /spec, README*, NOTICE/LICENSE, docs/adr, docs/hygiene
 QUARANTINE_DIR:  .trash/
-ARCH_SWAPS:      agent v1→v2 (done); ToolLoopAgent→streamText (policy); legacy profile paths→~/.lunerylab; capability-router→runtime-supply
+ARCH_SWAPS:      former versioned agent directory→runtime/ (done); ToolLoopAgent→streamText (policy); legacy profile paths→~/.lunerylab; capability-router→runtime-supply
 PRE_LAUNCH:      true
 SECURITY_KEEPLIST: desktop bridge auth; endpoint validation; file/path containment; destructive-action confirmation; no-default-model; PGlite baseline init
 ```
@@ -46,7 +46,6 @@ SECURITY_KEEPLIST: desktop bridge auth; endpoint validation; file/path containme
 | `@electric-sql/pglite` / `@electric-sql/pglite-socket` | Imported only by desktop-runtime-server; copied into appOut |
 | `components/design-system/shell/index.ts` | Imported by app-shell + console loading for content-frame classes |
 | shadcn unused sub-exports (DialogTrigger, etc.) | Design-system completeness / future composition; not proven theater |
-| `lib/server/agent/v2/**` | Current agent runtime (naming debt only) |
 | Model catalog `compatibility` / `legacy` lifecycle | Product policy, not dead shim |
 | DB archive-on-incompatible in desktop-runtime-server | Current local safety valve |
 | `docs/PNPM_OVERRIDES.md` | Linked from OPERATIONS; unique override rationale |
@@ -73,6 +72,6 @@ before deleting the TS registry.
 | Showcase surface claim in UI_FRAMEWORK_STACK | Doc fixed | Removed from production surface list |
 | `.ai/loops/design-invariants.md` references | Doc/gate renamed | Ledger gone; invariants live in UI_FRAMEWORK_STACK + ui:check |
 | Legacy storage env prefix rename | Done | Renamed to `LUNERY_MEDIA_DIR` / `LUNERY_MAX_UPLOAD_BYTES_PER_FILE`; removed fixed per-user storage quota |
-| agent `v2/` directory rename | Deferred | Naming debt only; needs product confirmation |
+| Former versioned agent directory rename | Done | Renamed to `lib/server/agent/runtime/**`; entry `runAgent`; kept `runtime/` boundary (not flattened into `agent/`) to avoid outer request/runtime type collisions |
 | Former web workspace API escape hatch | Removed | Desktop-local convergence: local FS media only; workspace APIs desktop-gated |
 | Settings "Cost/local-first mode" doc claim | Done | Removed from settings surface contract; Required Structure matches current product |

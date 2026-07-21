@@ -4,7 +4,7 @@
  * use-canvas-session-refresh — agent-driven inbound sync for the canvas stage.
  *
  * Why polling (not SSE / custom event):
- *   - Agent v2 finishes by writing to Prisma (`canvasSession.updatedAt`,
+ *   - Agent runtime finishes by writing to Prisma (`canvasSession.updatedAt`,
  *     new CanvasLayer rows). There is no existing SSE channel from agent → UI.
  *   - A lightweight revision probe checks the parent timestamp plus layer
  *     count/latest timestamp; the full payload is fetched only after a change.

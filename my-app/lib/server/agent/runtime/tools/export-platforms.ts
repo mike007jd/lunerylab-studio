@@ -24,8 +24,8 @@ import { exportForPlatforms } from "@/lib/server/platform-export";
 import {
   PLATFORM_SIZES_BY_ID,
 } from "@/lib/constants/platform-sizes";
-import { loadAgentLayer } from "@/lib/server/agent/v2/layer-access";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 export function buildExportPlatformsTool(ctx: AgentToolContext): Tool {
   return tool({

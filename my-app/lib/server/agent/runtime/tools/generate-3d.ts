@@ -23,8 +23,8 @@ import { findByokProvider, isModel3dCapableByok } from "@/lib/byok-providers";
 import { listByokConnectionMeta } from "@/lib/server/byok-connection-store";
 import { fetchConfiguredProviderIds } from "@/lib/server/byok-shared";
 import { selectConfiguredModel3dProvider } from "@/lib/server/model3d-provider-selection";
-import { loadAgentLayer } from "@/lib/server/agent/v2/layer-access";
-import type { AgentToolContext } from "@/lib/server/agent/v2/tool-registry";
+import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
+import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 
 async function pickModel3dProvider(): Promise<string | null> {
   const [connections, configuredProviderIds] = await Promise.all([
