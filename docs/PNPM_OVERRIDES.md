@@ -37,13 +37,13 @@ unrelated framework or product-library upgrades:
 - `fast-uri` -> `3.1.2`
 - `hono` -> `4.12.26`
 - `ip-address` -> `10.2.0`
-- `js-yaml` -> `4.2.0`
+- `js-yaml` -> `4.3.0`
 - `qs` -> `6.15.2`
 - `path-to-regexp@>=8.0.0 <8.4.2` -> `8.4.2`
 - `picomatch@^2.0.0` -> `2.3.2`
 - `picomatch@^4.0.0` -> `4.0.4`
-- `brace-expansion@^1.0.0` -> `1.1.15`
-- `brace-expansion@^5.0.0` -> `5.0.6`
+- `brace-expansion@^1.0.0` -> `1.1.16`
+- `brace-expansion@^5.0.0` -> `5.0.7`
 - `undici` -> `6.27.0`
 
 The vulnerable paths observed on 2026-06-08 were in development tooling:
