@@ -4,7 +4,7 @@
 around a real, observable issue, not as a precaution. Drop an override only
 after confirming the upstream issue is fixed in every consumer.
 
-Last checked: 2026-06-19 against the npm registry and `pnpm audit`.
+Last checked: 2026-07-21 against `my-app/pnpm-workspace.yaml` and `pnpm audit`.
 
 ## `defu` → `^6.1.5`
 
@@ -44,6 +44,7 @@ unrelated framework or product-library upgrades:
 - `picomatch@^4.0.0` -> `4.0.4`
 - `brace-expansion@^1.0.0` -> `1.1.15`
 - `brace-expansion@^5.0.0` -> `5.0.6`
+- `undici` -> `6.27.0`
 
 The vulnerable paths observed on 2026-06-08 were in development tooling:
 `eslint`, `eslint-config-next`, `shadcn`, and their MCP / Express / globbing
