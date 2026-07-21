@@ -2,6 +2,12 @@
 
 Canvas is the visual context and artifact editing surface.
 
+## Ownership
+
+- Owner: `my-app/components/canvas`
+- Route: `/canvas/[sessionId]`
+- Role: artifact editing and visual context surface
+
 ## Role
 
 Canvas helps users inspect, mask, arrange, and refine generated assets. It is not

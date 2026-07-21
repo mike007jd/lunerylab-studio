@@ -1,6 +1,6 @@
 # Cleanup Exemptions Ledger
 
-Updated: 2026-07-21 (dead-code-and-docs-cleanup-loop).
+Updated: 2026-07-21 (dead-code-and-docs-cleanup-loop, round 2).
 
 Knip / filename scans are candidate generators only. Items below were reviewed
 and must not be re-proposed as dead without new evidence.
@@ -49,13 +49,15 @@ SECURITY_KEEPLIST: desktop bridge auth; endpoint validation; file/path containme
 | `lib/server/agent/v2/**` | Current agent runtime (naming debt only) |
 | Model catalog `compatibility` / `legacy` lifecycle | Product policy, not dead shim |
 | DB archive-on-incompatible in desktop-runtime-server | Current local safety valve |
-| `docs/PNPM_OVERRIDES.md` | Orphan inbound links fixed via OPERATIONS; still unique rationale |
+| `docs/PNPM_OVERRIDES.md` | Linked from OPERATIONS; unique override rationale |
 
-## Quarantined this round (`.trash/`)
+## Permanently deleted (round 2, after dual skeptic)
 
-Review next cycle; delete only after another dual-skeptic pass if still unused.
+Recoverable via git history (`e8be661`, `0028e6a`, then this round's delete commit).
+`lunaSurfaces` owner/route/role rows were copied into `docs/design/surfaces/*`
+before deleting the TS registry.
 
-| Path | Reason |
+| Former path | Why deleted |
 | --- | --- |
 | `.trash/ui/avatar.tsx` | Zero product consumers; not ui:check-pinned |
 | `.trash/design-system/surface-shell.tsx` | Zero consumers; content-frame covers layout |
@@ -70,6 +72,7 @@ Review next cycle; delete only after another dual-skeptic pass if still unused.
 | --- | --- | --- |
 | Showcase surface claim in UI_FRAMEWORK_STACK | Doc fixed | Removed from production surface list |
 | `.ai/loops/design-invariants.md` references | Doc/gate renamed | Ledger gone; invariants live in UI_FRAMEWORK_STACK + ui:check |
-| `ECOM_*` env prefix rename | Deferred | Naming debt only; not dead code |
-| agent `v2/` directory rename | Deferred | Naming debt only |
+| `ECOM_*` env prefix rename | Deferred | Naming debt only; needs product confirmation |
+| agent `v2/` directory rename | Deferred | Naming debt only; needs product confirmation |
 | Web blob / `ECOM_ENABLE_WEB_WORKSPACE_API` | Deferred | Needs product confirmation before collapse |
+| Settings "Cost/local-first mode" doc claim | Deferred | Doc drift; confirm whether to remove from surface contract |

@@ -18,4 +18,6 @@ of truth still lives in `/spec`; do not duplicate or weaken those rules here.
   target caches, local engines, uploads, and generated media are local working
   state.
 - Gate-unprovable dead candidates go to `.trash/` first; do not direct-delete
-  platform/runtime/config-driven code.
+  platform/runtime/config-driven code. After a later dual-skeptic pass with no
+  survival evidence, permanently delete the quarantine and record it in
+  `cleanup-exemptions.md`.

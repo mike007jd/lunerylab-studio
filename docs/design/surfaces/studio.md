@@ -2,6 +2,12 @@
 
 Studio is the primary production surface.
 
+## Ownership
+
+- Owner: `my-app/components/studio`
+- Route: `/studio`
+- Role: primary creative production surface
+
 ## Role
 
 The user should be able to create, inspect, iterate, and hand off assets without
