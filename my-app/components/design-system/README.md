@@ -2,11 +2,12 @@
 
 This folder is the framework boundary for Lunery Lab UI work.
 
-- `primitives`: local primitive exports only.
 - `grammar`: named UI language, tokens, density, motion, and interaction rules.
-- `shell`: reusable surface shells and layout rhythm.
-- `assistant`: assistant-ui presentation/runtime boundary.
-- `surfaces`: surface ownership registry.
+- `shell`: console content-frame classes and layout rhythm helpers.
 
-Feature code should reuse this folder before creating new local styling grammar.
+Feature code imports these modules by deep path
+(`@/components/design-system/grammar/*`, `@/components/design-system/shell`)
+and uses shadcn primitives directly from `@/components/ui/*`.
 
+Surface ownership lives in `docs/design/surfaces/*`. Assistant presentation
+lives in `components/studio/agent-chat/*`.

@@ -94,7 +94,7 @@ const files = scanRoots.flatMap((dir) => walk(dir));
 const frameworkFiles = walk(frameworkRoot);
 
 // ---------------------------------------------------------------------------
-// Design invariants (see .ai/loops/design-invariants.md).
+// Design invariants (see docs/UI_FRAMEWORK_STACK.md → Design Invariants).
 //
 // Each rule below is the machine half of one invariant: it pins the canonical
 // implementation in place so the same drift class cannot be reintroduced by the
@@ -498,7 +498,7 @@ const checks = [
     max: 0,
   },
   {
-    name: "design invariants (.ai/loops/design-invariants.md)",
+    name: "design invariants (docs/UI_FRAMEWORK_STACK.md)",
     result: { count: invariants.length, hits: invariants },
     max: 0,
   },
