@@ -55,7 +55,7 @@ Claude-specific role hint:
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus (4924 symbols, 13571 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely. Resolve the current index name with `list_repos`; do not hardcode a legacy repository name.
+This project is indexed by GitNexus as **lunerylab-studio** (4964 symbols, 13728 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -78,10 +78,10 @@ This project is indexed by GitNexus (4924 symbols, 13571 relationships, 300 exec
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/{current-index}/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/{current-index}/clusters` | All functional areas |
-| `gitnexus://repo/{current-index}/processes` | All execution flows |
-| `gitnexus://repo/{current-index}/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/lunerylab-studio/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/lunerylab-studio/clusters` | All functional areas |
+| `gitnexus://repo/lunerylab-studio/processes` | All execution flows |
+| `gitnexus://repo/lunerylab-studio/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 

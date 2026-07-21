@@ -718,7 +718,7 @@ function AssetTile({
                   "absolute left-2 top-2 z-10 inline-flex h-6 w-6 items-center justify-center rounded-md border transition-[color,background-color,border-color,opacity]",
                   isSelected
                     ? "border-(--accent-glow) bg-(--accent-glow) text-(--bg-base) opacity-100"
-                    : "border-white/70 bg-black/40 text-white opacity-100 md:opacity-0 md:group-hover/tile:opacity-100 md:group-focus-within/tile:opacity-100",
+                    : "border-(--text-primary)/70 bg-(--scrim-media) text-(--text-primary) opacity-100 md:opacity-0 md:group-hover/tile:opacity-100 md:group-focus-within/tile:opacity-100",
                 )}
               >
                 {isSelected ? <Check className="h-3.5 w-3.5" /> : null}
@@ -763,7 +763,7 @@ function AssetTile({
                       aria-label={labels.actionForResult(labels.regenerate, position)}
                       variant="ghost"
                       size="icon-xs"
-                      className="h-8 w-8 rounded-md bg-white/95 text-foreground shadow-md hover:bg-white"
+                      className="h-8 w-8 rounded-md bg-(--scrim-inverse) text-foreground shadow-md hover:bg-(--scrim-inverse)"
                     >
                       <RefreshCw className="h-3.5 w-3.5" />
                     </Button>
@@ -779,7 +779,7 @@ function AssetTile({
                     aria-label={labels.actionForResult(labels.download, position)}
                     variant="ghost"
                     size="icon-xs"
-                    className="h-8 w-8 rounded-md bg-white/95 text-foreground shadow-md hover:bg-white"
+                    className="h-8 w-8 rounded-md bg-(--scrim-inverse) text-foreground shadow-md hover:bg-(--scrim-inverse)"
                   >
                     <Download className="h-3.5 w-3.5" />
                   </Button>

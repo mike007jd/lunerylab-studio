@@ -7,6 +7,7 @@ import {
   Empty,
   EmptyContent,
 } from "@/components/ui/empty";
+import { lunaClass } from "@/components/design-system/grammar/tokens";
 import { cn } from "@/lib/utils";
 
 interface SurfaceCardProps {
@@ -31,7 +32,13 @@ interface EmptyStateCardProps {
 
 export function EmptyStateCard({ children, className }: EmptyStateCardProps) {
   return (
-    <Empty className={cn("rounded-xl border border-dashed border-(--border-subtle) p-6 text-sm text-(--text-muted)", className)}>
+    <Empty
+      className={cn(
+        "rounded-xl border border-dashed border-(--border-subtle) p-6 text-sm",
+        lunaClass.mutedText,
+        className,
+      )}
+    >
       <EmptyContent>{children}</EmptyContent>
     </Empty>
   );

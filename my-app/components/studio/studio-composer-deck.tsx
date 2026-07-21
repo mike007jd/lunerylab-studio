@@ -158,7 +158,7 @@ export const ComposerDeck = memo(function ComposerDeck({
                       aria-label={`${removeLabel}: ${preview.file.name}`}
                       variant="ghost"
                       size="icon-xs"
-                      className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-(--bg-elevated) text-white opacity-100 backdrop-blur-sm transition-[opacity,background-color] duration-(--motion-control) hover:bg-(--bg-surface) md:opacity-0 md:group-hover/card:opacity-100 md:group-focus-within/card:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
+                      className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-(--bg-elevated) text-(--text-primary) opacity-100 backdrop-blur-sm transition-[opacity,background-color] duration-(--motion-control) hover:bg-(--bg-surface) md:opacity-0 md:group-hover/card:opacity-100 md:group-focus-within/card:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
                     >
                       <X className="h-3 w-3" />
                     </Button>
@@ -170,7 +170,7 @@ export const ComposerDeck = memo(function ComposerDeck({
                         aria-label={`${moveBeforeLabel}: ${preview.file.name}`}
                         variant="ghost"
                         size="icon-xs"
-                        className="h-6 w-6 rounded-full bg-black/55 text-white disabled:opacity-25"
+                        className="h-6 w-6 rounded-full bg-(--scrim) text-(--text-primary) disabled:opacity-25"
                       >
                         <ArrowLeft className="h-3 w-3" />
                       </Button>
@@ -181,7 +181,7 @@ export const ComposerDeck = memo(function ComposerDeck({
                         aria-label={`${moveAfterLabel}: ${preview.file.name}`}
                         variant="ghost"
                         size="icon-xs"
-                        className="h-6 w-6 rounded-full bg-black/55 text-white disabled:opacity-25"
+                        className="h-6 w-6 rounded-full bg-(--scrim) text-(--text-primary) disabled:opacity-25"
                       >
                         <ArrowRight className="h-3 w-3" />
                       </Button>

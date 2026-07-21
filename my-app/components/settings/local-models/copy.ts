@@ -5,6 +5,7 @@ export const COPY = {
     advancedTitle: "Other choices & advanced setup",
     subtitle: "Models that run on your computer.",
     searchPlaceholder: "Search models",
+    categoriesLabel: "Model categories",
     filters: {
       all: "All",
       recommended: "Recommended",
@@ -115,6 +116,7 @@ export const COPY = {
     advancedTitle: "其他选择与高级设置",
     subtitle: "在你电脑上运行的模型。",
     searchPlaceholder: "搜索模型",
+    categoriesLabel: "模型分类",
     filters: {
       all: "全部",
       recommended: "推荐",
@@ -226,6 +228,7 @@ export const COPY = {
     advancedTitle: "其他選擇與進階設定",
     subtitle: "在你電腦上執行的模型。",
     searchPlaceholder: "搜尋模型",
+    categoriesLabel: "模型分類",
     filters: {
       all: "全部",
       recommended: "推薦",

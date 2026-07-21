@@ -260,6 +260,7 @@ function Sidebar({
 function SidebarTrigger({
   className,
   onClick,
+  "aria-label": ariaLabel,
   ...props
 }: React.ComponentProps<typeof Button>) {
   const { toggleSidebar } = useSidebar()
@@ -271,29 +272,34 @@ function SidebarTrigger({
       variant="ghost"
       size="icon"
       className={cn("size-7", className)}
+      {...props}
+      // Callers (shell header) must pass a localized aria-label; English is
+      // only the primitive fallback so the control is never unlabeled.
+      aria-label={ariaLabel ?? "Show or hide navigation"}
       onClick={(event) => {
         onClick?.(event)
         toggleSidebar()
       }}
-      {...props}
     >
       <PanelLeftIcon />
-      <span className="sr-only">Toggle Sidebar</span>
     </Button>
   )
 }
 
-function SidebarRail({ className, ...props }: React.ComponentProps<"button">) {
+function SidebarRail({
+  className,
+  "aria-label": ariaLabel,
+  title,
+  ...props
+}: React.ComponentProps<"button">) {
   const { toggleSidebar } = useSidebar()
+  const label = ariaLabel ?? "Show or hide navigation"
 
   return (
     <button
       data-sidebar="rail"
       data-slot="sidebar-rail"
-      aria-label="Toggle Sidebar"
       tabIndex={-1}
-      onClick={toggleSidebar}
-      title="Toggle Sidebar"
       className={cn(
         "absolute inset-y-0 z-20 hidden w-4 -translate-x-1/2 transition-[left,right,width] ease-linear group-data-[side=left]:-right-4 group-data-[side=right]:left-0 after:absolute after:inset-y-0 after:left-1/2 after:w-[2px] hover:after:bg-sidebar-border sm:flex",
         "in-data-[side=left]:cursor-w-resize in-data-[side=right]:cursor-e-resize",
@@ -304,6 +310,9 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"button">) {
         className
       )}
       {...props}
+      aria-label={label}
+      title={title ?? label}
+      onClick={toggleSidebar}
     />
   )
 }

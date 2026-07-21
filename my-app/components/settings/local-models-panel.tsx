@@ -667,7 +667,7 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
             {/* Primary category filter. Search intentionally overrides this filter. */}
             <div
               role="group"
-              aria-label="Model categories"
+              aria-label={copy.categoriesLabel}
               className="flex flex-wrap items-center gap-1.5"
             >
               {CATEGORY_TABS.filter((cap) => allowedCategories.includes(cap)).map((cap) => {

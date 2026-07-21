@@ -1,4 +1,5 @@
 import { ChevronDown } from "@/components/ui/icons";
+import { lunaClass } from "@/components/design-system/grammar/tokens";
 import { cn } from "@/lib/utils";
 
 /**
@@ -34,12 +35,18 @@ export function AdvancedDisclosure({
     >
       <summary
         className={cn(
-          "flex cursor-pointer list-none items-center justify-between gap-2 py-2.5 text-xs font-semibold text-(--text-secondary) transition-colors hover:text-(--text-primary) [&::-webkit-details-marker]:hidden",
+          "flex cursor-pointer list-none items-center justify-between gap-2 py-2.5 text-xs font-semibold transition-colors hover:text-(--text-primary) [&::-webkit-details-marker]:hidden",
+          lunaClass.secondaryText,
           summaryClassName,
         )}
       >
         <span className="min-w-0 truncate">{title}</span>
-        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-(--text-muted) transition-transform duration-(--motion-control) group-open:rotate-180" />
+        <ChevronDown
+          className={cn(
+            "h-3.5 w-3.5 shrink-0 transition-transform duration-(--motion-control) group-open:rotate-180",
+            lunaClass.mutedText,
+          )}
+        />
       </summary>
       <div className="space-y-3 pb-1 pt-1">{children}</div>
     </details>

@@ -20,7 +20,7 @@ export function LunaLogo({ className, size = 32 }: LunaLogoProps) {
         <linearGradient id="luna-gold-gradient" x1="2" y1="16" x2="22" y2="16" gradientUnits="userSpaceOnUse">
           <stop offset="0%" stopColor="currentColor" stopOpacity="0" />
           <stop offset="50%" stopColor="currentColor" stopOpacity="0.5" />
-          <stop offset="100%" stopColor="#D4AF37" />
+          <stop offset="100%" stopColor="var(--accent-gold)" />
         </linearGradient>
       </defs>
       {/* Inner offset orbit (Moon phase reference) */}

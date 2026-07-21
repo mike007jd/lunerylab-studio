@@ -126,6 +126,8 @@
   --scrim: rgba(8, 9, 14, 0.55);
   --scrim-strong: rgba(8, 9, 14, 0.74);
   --scrim-hover: rgba(8, 9, 14, 0.28);
+  --scrim-media: rgba(8, 9, 14, 0.40);
+  --scrim-inverse: rgba(255, 255, 255, 0.95);
   --agent-avatar-from: #A1B2D0;
   --agent-avatar-to: #E2E8F0;
 

@@ -12,14 +12,14 @@
     "components/design-system/shell/index.ts"
   ],
   "baselines": {
-    "rawColor": 24,
-    "arbitraryUtility": 142,
+    "rawColor": 0,
+    "arbitraryUtility": 52,
     "bareButton": 0,
     "nonSemanticPalette": 0,
     "secondStylingSystem": 0,
     "framerDurationLiteral": 0,
     "framerEaseLiteral": 0,
     "rawCubicBezier": 0,
-    "transitionAll": 1
+    "transitionAll": 0
   }
 }
