@@ -3,7 +3,7 @@ import { ApiError, jsonError } from "@/lib/server/errors";
 import {
   assertRequestContentLength,
   validateFiles,
-  withUserStorageQuota,
+  withAssetWriteTransaction,
 } from "@/lib/server/file-validation";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { parseFormData } from "@/lib/server/http-validation";
@@ -106,37 +106,33 @@ export async function POST(request: NextRequest, { params }: Params) {
         projectId: session.projectId,
       })),
     );
-    const createdAssets = await withUserStorageQuota(
-      user.id,
-      storedOutputs.reduce((total, stored) => total + stored.byteSize, 0),
-      async (tx) => {
-        const assets = await Promise.all(storedOutputs.map((stored, index) => tx.asset.create({
-          data: {
-            userId: user.id,
-            projectId: session.projectId,
-            jobId: job.id,
-            kind: "GENERATED",
-            storagePath: stored.storagePath,
-            mimeType: stored.mimeType,
-            byteSize: stored.byteSize,
-            width: stored.width,
-            height: stored.height,
-            summary: outputs[index]?.presetId === "original"
-              ? "Canvas export · original size"
-              : `Canvas export · ${outputs[index]?.presetId ?? "platform"}`,
-          },
-        })));
-        await completeGenerationJob({
+    const createdAssets = await withAssetWriteTransaction(async (tx) => {
+      const assets = await Promise.all(storedOutputs.map((stored, index) => tx.asset.create({
+        data: {
+          userId: user.id,
+          projectId: session.projectId,
           jobId: job.id,
-          model: "sharp",
-          provider: "canvas-export",
-          successCount: assets.length,
-          requestedCount: outputs.length,
-          client: tx,
-        });
-        return assets;
-      },
-    ).catch(async (error) => {
+          kind: "GENERATED",
+          storagePath: stored.storagePath,
+          mimeType: stored.mimeType,
+          byteSize: stored.byteSize,
+          width: stored.width,
+          height: stored.height,
+          summary: outputs[index]?.presetId === "original"
+            ? "Canvas export · original size"
+            : `Canvas export · ${outputs[index]?.presetId ?? "platform"}`,
+        },
+      })));
+      await completeGenerationJob({
+        jobId: job.id,
+        model: "sharp",
+        provider: "canvas-export",
+        successCount: assets.length,
+        requestedCount: outputs.length,
+        client: tx,
+      });
+      return assets;
+    }).catch(async (error) => {
       await Promise.allSettled(storedOutputs.map((stored) => deleteStoredFile(stored.storagePath)));
       throw error;
     });

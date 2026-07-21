@@ -35,7 +35,6 @@ beforeEach(() => {
     modelsBytes: 0,
     logsBytes: 0,
     freeDiskBytes: 10,
-    quotaBytes: 100,
   });
   mocks.fetchDesktopStatusSnapshot.mockResolvedValue({
     providers: [

@@ -5,7 +5,7 @@ vi.mock("server-only", () => ({}));
 const mocks = vi.hoisted(() => ({
   writeGeneratedImage: vi.fn(),
   deleteStoredFile: vi.fn(),
-  withUserStorageQuota: vi.fn(),
+  withAssetWriteTransaction: vi.fn(),
   assetCreate: vi.fn(),
   txLayerUpdate: vi.fn(),
   txLayerAggregate: vi.fn(),
@@ -19,7 +19,7 @@ vi.mock("@/lib/server/storage", () => ({
   deleteStoredFile: mocks.deleteStoredFile,
 }));
 vi.mock("@/lib/server/file-validation", () => ({
-  withUserStorageQuota: mocks.withUserStorageQuota,
+  withAssetWriteTransaction: mocks.withAssetWriteTransaction,
 }));
 vi.mock("@/lib/server/prisma", () => ({
   prisma: {
@@ -48,8 +48,8 @@ beforeEach(() => {
     height: 1080,
   });
   mocks.assetCreate.mockResolvedValue({ id: "asset-new" });
-  mocks.withUserStorageQuota.mockImplementation(
-    async (_userId: string, _byteSize: number, operation: (tx: unknown) => unknown) =>
+  mocks.withAssetWriteTransaction.mockImplementation(
+    async (operation: (tx: unknown) => unknown) =>
       operation({ asset: { create: mocks.assetCreate } }),
   );
   mocks.deleteStoredFile.mockResolvedValue(undefined);
@@ -81,11 +81,7 @@ describe("saveResultAsReplacementLayer (#3)", () => {
 
     expect(result).toEqual({ assetId: "asset-new", layerId: "layer-new" });
     expect(mocks.transaction).toHaveBeenCalledTimes(1);
-    expect(mocks.withUserStorageQuota).toHaveBeenCalledWith(
-      "user-1",
-      1234,
-      expect.any(Function),
-    );
+    expect(mocks.withAssetWriteTransaction).toHaveBeenCalledWith(expect.any(Function));
     expect(mocks.assetCreate).toHaveBeenCalledWith({
       data: expect.objectContaining({ width: 1920, height: 1080 }),
     });

@@ -4,7 +4,6 @@ import fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
 import { prisma } from "@/lib/server/prisma";
-import { getMaxStorageBytesPerUser } from "@/lib/server/env";
 import { luneryLogDir, luneryModelsDir, luneryProfileRoot } from "@/lib/server/lunery-profile";
 
 /**
@@ -12,7 +11,6 @@ import { luneryLogDir, luneryModelsDir, luneryProfileRoot } from "@/lib/server/l
  * that Trash still occupies space until purged.
  *
  * - active/trash: summed from asset rows (byteSize), split by soft-delete state.
- *   These are what the per-user quota is measured against.
  * - models/logs: on-disk footprint of the profile's models/ and logs/ dirs.
  * - freeDisk: bytes still available on the volume holding the profile.
  *
@@ -25,7 +23,6 @@ export interface StorageBreakdown {
   modelsBytes: number;
   logsBytes: number;
   freeDiskBytes: number | null;
-  quotaBytes: number;
 }
 
 async function dirSizeBytes(dir: string): Promise<number> {
@@ -88,6 +85,5 @@ export async function getStorageBreakdown(userId: string): Promise<StorageBreakd
     modelsBytes,
     logsBytes,
     freeDiskBytes: freeDisk,
-    quotaBytes: getMaxStorageBytesPerUser(),
   };
 }

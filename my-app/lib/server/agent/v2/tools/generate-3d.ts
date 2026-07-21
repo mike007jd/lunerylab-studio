@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { generateModel3dByok } from "@/lib/server/byok-3d";
 import { deleteStoredFile, readStoredFile, writeGenerated3dModel } from "@/lib/server/storage";
-import { withUserStorageQuota } from "@/lib/server/file-validation";
+import { withAssetWriteTransaction } from "@/lib/server/file-validation";
 import {
   completeGenerationJob,
   createGenerationJob,
@@ -113,34 +113,30 @@ export function buildGenerate3dTool(ctx: AgentToolContext): Tool {
 
         // Asset + job terminal state commit atomically; the file is deleted if
         // the transaction rolls back.
-        const createdAsset = await withUserStorageQuota(
-          ctx.userId,
-          storedModel.byteSize,
-          async (tx) => {
-            const asset = await tx.asset.create({
-              data: {
-                userId: ctx.userId,
-                projectId: ctx.projectId,
-                jobId: job.id,
-                kind: "GENERATED",
-                modality: "MODEL_3D",
-                storagePath: storedModel.storagePath,
-                mimeType: storedModel.mimeType,
-                byteSize: storedModel.byteSize,
-                format: result.format,
-              },
-            });
-            await completeGenerationJob({
+        const createdAsset = await withAssetWriteTransaction(async (tx) => {
+          const asset = await tx.asset.create({
+            data: {
+              userId: ctx.userId,
+              projectId: ctx.projectId,
               jobId: job.id,
-              model: result.model,
-              provider: result.provider,
-              successCount: 1,
-              requestedCount: 1,
-              client: tx,
-            });
-            return asset;
-          },
-        ).catch(async (error) => {
+              kind: "GENERATED",
+              modality: "MODEL_3D",
+              storagePath: storedModel.storagePath,
+              mimeType: storedModel.mimeType,
+              byteSize: storedModel.byteSize,
+              format: result.format,
+            },
+          });
+          await completeGenerationJob({
+            jobId: job.id,
+            model: result.model,
+            provider: result.provider,
+            successCount: 1,
+            requestedCount: 1,
+            client: tx,
+          });
+          return asset;
+        }).catch(async (error) => {
           await deleteStoredFile(storedModel.storagePath);
           throw error;
         });

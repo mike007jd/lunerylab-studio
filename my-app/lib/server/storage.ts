@@ -48,10 +48,7 @@ async function localCreateReadStream(
 }
 
 function storageRootPath() {
-  const configured = process.env.ECOM_STORAGE_DIR?.trim();
-  if (!configured) return luneryMediaDir();
-  if (path.isAbsolute(configured)) return configured;
-  throw new Error("ECOM_STORAGE_DIR must be an absolute path, or omitted to use the Lunery profile.");
+  return luneryMediaDir();
 }
 
 function normalizeRuntimeRoot(root: string): string {

@@ -27,7 +27,7 @@ const modelsDir = absoluteEnvPath("LUNERY_MODELS_DIR", join(profileRoot, "models
 const logDir = absoluteEnvPath("LUNERY_LOG_DIR", join(profileRoot, "logs"));
 const runtimeDir = absoluteEnvPath("LUNERY_RUNTIME_DIR", join(profileRoot, "runtime"));
 const pgliteDir = absoluteEnvPath("LUNERY_PGLITE_DIR", join(dataDir, "pglite"));
-const mediaDir = absoluteEnvPath("ECOM_STORAGE_DIR", join(dataDir, "media"));
+const mediaDir = absoluteEnvPath("LUNERY_MEDIA_DIR", join(dataDir, "media"));
 
 const child = spawn(process.execPath, [tauriBin, "dev", ...process.argv.slice(2)], {
   cwd: appRoot,
@@ -42,7 +42,7 @@ const child = spawn(process.execPath, [tauriBin, "dev", ...process.argv.slice(2)
     LUNERY_LOG_DIR: logDir,
     LUNERY_RUNTIME_DIR: runtimeDir,
     LUNERY_PGLITE_DIR: pgliteDir,
-    ECOM_STORAGE_DIR: mediaDir,
+    LUNERY_MEDIA_DIR: mediaDir,
   },
 });
 

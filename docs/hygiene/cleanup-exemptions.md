@@ -72,7 +72,7 @@ before deleting the TS registry.
 | --- | --- | --- |
 | Showcase surface claim in UI_FRAMEWORK_STACK | Doc fixed | Removed from production surface list |
 | `.ai/loops/design-invariants.md` references | Doc/gate renamed | Ledger gone; invariants live in UI_FRAMEWORK_STACK + ui:check |
-| `ECOM_*` env prefix rename | Deferred | Naming debt only; needs product confirmation |
+| Legacy storage env prefix rename | Done | Renamed to `LUNERY_MEDIA_DIR` / `LUNERY_MAX_UPLOAD_BYTES_PER_FILE`; removed fixed per-user storage quota |
 | agent `v2/` directory rename | Deferred | Naming debt only; needs product confirmation |
 | Former web workspace API escape hatch | Removed | Desktop-local convergence: local FS media only; workspace APIs desktop-gated |
-| Settings "Cost/local-first mode" doc claim | Deferred | Doc drift; confirm whether to remove from surface contract |
+| Settings "Cost/local-first mode" doc claim | Done | Removed from settings surface contract; Required Structure matches current product |

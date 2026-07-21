@@ -673,11 +673,7 @@ fn desktop_server_root(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 #[cfg(not(debug_assertions))]
-const DESKTOP_SERVER_ENV_KEYS: &[&str] = &[
-    "ECOM_STORAGE_DRIVER",
-    "ECOM_MAX_UPLOAD_BYTES_PER_FILE",
-    "ECOM_MAX_STORAGE_BYTES_PER_USER",
-];
+const DESKTOP_SERVER_ENV_KEYS: &[&str] = &["LUNERY_MAX_UPLOAD_BYTES_PER_FILE"];
 
 #[cfg(not(debug_assertions))]
 fn trim_env_value(value: &str) -> String {
@@ -1106,7 +1102,7 @@ fn start_desktop_server(
             format!("http://127.0.0.1:{}", bridge.port),
         )
         .env("LUNERY_DESKTOP_BRIDGE_TOKEN", bridge.token)
-        .env("ECOM_STORAGE_DIR", media_dir)
+        .env("LUNERY_MEDIA_DIR", media_dir)
         .env("LUNERY_PUBLIC_DIR", public_dir)
         .env("LUNERY_PGLITE_DIR", pglite_dir)
         .env("LUNERY_PRISMA_MIGRATIONS_DIR", migrations_dir)

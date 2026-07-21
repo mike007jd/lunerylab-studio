@@ -63,7 +63,7 @@ beforeEach(async () => {
   mocks.listStoredRelativePaths.mockResolvedValue([]);
   testRoot = await fs.mkdtemp(path.join(tmpdir(), "lunery-backup-test-"));
   vi.stubEnv("LUNERY_CONFIG_DIR", path.join(testRoot, "config"));
-  vi.stubEnv("ECOM_STORAGE_DIR", path.join(testRoot, "media"));
+  vi.stubEnv("LUNERY_MEDIA_DIR", path.join(testRoot, "media"));
   // $transaction passes a tx that proxies to the same per-model mocks.
   mocks.transaction.mockImplementation(async (fn: (tx: unknown) => unknown) => {
     const txHandler = {

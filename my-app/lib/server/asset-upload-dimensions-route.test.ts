@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
   resolveOwnedProjectId: vi.fn(),
   assertRequestContentLength: vi.fn(),
   validateFiles: vi.fn(),
-  withUserStorageQuota: vi.fn(),
+  withAssetWriteTransaction: vi.fn(),
   writeReferenceFile: vi.fn(),
   deleteStoredFile: vi.fn(),
   generationJobCreate: vi.fn(),
@@ -24,7 +24,7 @@ vi.mock("@/lib/server/project-ownership", () => ({
 vi.mock("@/lib/server/file-validation", () => ({
   assertRequestContentLength: mocks.assertRequestContentLength,
   validateFiles: mocks.validateFiles,
-  withUserStorageQuota: mocks.withUserStorageQuota,
+  withAssetWriteTransaction: mocks.withAssetWriteTransaction,
 }));
 vi.mock("@/lib/server/storage", () => ({
   writeReferenceFile: mocks.writeReferenceFile,
@@ -62,8 +62,8 @@ beforeEach(() => {
     deletedAt: null,
     createdAt: new Date("2026-07-16T00:00:00.000Z"),
   }));
-  mocks.withUserStorageQuota.mockImplementation(
-    async (_userId: string, _bytes: number, operation: (tx: unknown) => unknown) =>
+  mocks.withAssetWriteTransaction.mockImplementation(
+    async (operation: (tx: unknown) => unknown) =>
       operation({
         generationJob: { create: mocks.generationJobCreate },
         asset: { create: mocks.assetCreate },

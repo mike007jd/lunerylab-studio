@@ -12,7 +12,7 @@ let tmpDir: string;
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-cleanup-"));
   // Local filesystem rooted at the temp dir (absolute path required).
-  vi.stubEnv("ECOM_STORAGE_DIR", tmpDir);
+  vi.stubEnv("LUNERY_MEDIA_DIR", tmpDir);
   fs.mkdirSync(path.join(tmpDir, "generated"), { recursive: true });
 });
 
@@ -70,7 +70,7 @@ describe("writeFilesOrCleanup (#7)", () => {
   });
 
   it("normalizes a configured root without using a dynamic filesystem trace", () => {
-    vi.stubEnv("ECOM_STORAGE_DIR", `${tmpDir}${path.sep}`);
+    vi.stubEnv("LUNERY_MEDIA_DIR", `${tmpDir}${path.sep}`);
     expect(storage.resolveStoragePath("generated/sample.png")).toBe(
       path.join(tmpDir, "generated", "sample.png"),
     );

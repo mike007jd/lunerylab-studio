@@ -11,9 +11,5 @@ function readPositiveIntEnv(name: string, defaultValue: number): number {
 }
 
 export function getMaxUploadBytesPerFile(): number {
-  return readPositiveIntEnv("ECOM_MAX_UPLOAD_BYTES_PER_FILE", 10 * 1024 * 1024);
-}
-
-export function getMaxStorageBytesPerUser(): number {
-  return readPositiveIntEnv("ECOM_MAX_STORAGE_BYTES_PER_USER", 1024 * 1024 * 1024);
+  return readPositiveIntEnv("LUNERY_MAX_UPLOAD_BYTES_PER_FILE", 10 * 1024 * 1024);
 }

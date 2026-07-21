@@ -13,7 +13,7 @@ let tmpDir: string;
 beforeEach(() => {
   vi.clearAllMocks();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "image-dimensions-"));
-  vi.stubEnv("ECOM_STORAGE_DIR", tmpDir);
+  vi.stubEnv("LUNERY_MEDIA_DIR", tmpDir);
 });
 
 afterEach(() => {

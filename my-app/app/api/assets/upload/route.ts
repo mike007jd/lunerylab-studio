@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ApiError, jsonError } from "@/lib/server/errors";
-import { assertRequestContentLength, validateFiles, withUserStorageQuota } from "@/lib/server/file-validation";
+import { assertRequestContentLength, validateFiles, withAssetWriteTransaction } from "@/lib/server/file-validation";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { deleteStoredFile, writeReferenceFile } from "@/lib/server/storage";
 import { toAssetDTO } from "@/lib/server/dto";
@@ -30,13 +30,10 @@ export async function POST(request: NextRequest) {
     }
 
     await validateFiles([file], { maxFiles: 1 });
-    // Quota check happens inside the transaction below via withUserStorageQuota
-    // — the previous TOCTOU pre-check is gone because two concurrent uploads
-    // could both pass the pre-check and exceed the cap together.
 
     const stored = await writeReferenceFile(file);
 
-    const asset = await withUserStorageQuota(user.id, stored.byteSize, async (tx) => {
+    const asset = await withAssetWriteTransaction(async (tx) => {
       // Every asset is attached to a generation job by schema contract.
       // For direct uploads, we persist a local IMPORT job record.
       // so uploaded references remain fully traceable in production audit logs.

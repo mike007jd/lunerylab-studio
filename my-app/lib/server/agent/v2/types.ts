@@ -112,7 +112,7 @@ export interface AgentRunInput {
   /**
    * Deterministic business action requested by a first-party UI control.
    * These bypass model planning while reusing the same tool implementations,
-   * quota checks, canvas mutations, snapshots, and progress stream.
+   * asset-write transactions, canvas mutations, snapshots, and progress stream.
    */
   action?:
     | { type: "inpaint_layer"; layerId: string; prompt: string }

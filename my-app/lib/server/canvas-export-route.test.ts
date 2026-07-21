@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
   requireWritableCanvasSession: vi.fn(),
   assertRequestContentLength: vi.fn(),
   validateFiles: vi.fn(),
-  withUserStorageQuota: vi.fn(),
+  withAssetWriteTransaction: vi.fn(),
   exportForPlatforms: vi.fn(),
   writeGeneratedImage: vi.fn(),
   writeFilesOrCleanup: vi.fn(),
@@ -28,7 +28,7 @@ vi.mock("@/lib/server/canvas-session-access", () => ({
 vi.mock("@/lib/server/file-validation", () => ({
   assertRequestContentLength: mocks.assertRequestContentLength,
   validateFiles: mocks.validateFiles,
-  withUserStorageQuota: mocks.withUserStorageQuota,
+  withAssetWriteTransaction: mocks.withAssetWriteTransaction,
 }));
 vi.mock("@/lib/server/platform-export", () => ({
   exportForPlatforms: mocks.exportForPlatforms,
@@ -82,9 +82,7 @@ beforeEach(() => {
     Promise.all(writers.map((writer) => writer())),
   );
   mocks.assetCreate.mockResolvedValue({ id: "asset-1", mimeType: "image/png" });
-  mocks.withUserStorageQuota.mockImplementation(async (
-    _userId: string,
-    _bytes: number,
+  mocks.withAssetWriteTransaction.mockImplementation(async (
     operation: (tx: unknown) => Promise<unknown>,
   ) => operation({ asset: { create: mocks.assetCreate } }));
 });

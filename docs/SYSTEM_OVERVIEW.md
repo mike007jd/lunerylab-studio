@@ -62,7 +62,7 @@ Prisma models:
 ### Storage
 
 - Media storage is local filesystem only. It writes to the visible Lunery
-  profile media directory by default; `ECOM_STORAGE_DIR` is an absolute-path
+  profile media directory by default; `LUNERY_MEDIA_DIR` is an absolute-path
   override.
 - Storage paths are limited to `uploads/<file>`, `generated/<file>`, and their
   project-scoped `bucket/<projectId>/<file>` form.

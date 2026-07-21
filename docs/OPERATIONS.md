@@ -25,7 +25,7 @@ routes redirect to the standalone website.
 Minimum local variables:
 
 - `DATABASE_URL`: PostgreSQL connection string.
-- `ECOM_STORAGE_DIR`: optional absolute path for local media storage. Omit it
+- `LUNERY_MEDIA_DIR`: optional absolute path for local media storage. Omit it
   to use the visible Lunery profile media directory.
 
 Desktop bridge variables are set by the desktop runtime, not by users in normal
