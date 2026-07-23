@@ -1,5 +1,5 @@
 import "server-only";
-import sharp from "sharp";
+import sharp, { type Sharp } from "sharp";
 
 // Cap decoded pixel area to block decompression bombs from untrusted bytes
 // (provider-returned generations, user uploads). 64 MP ≈ 8000×8000 — far above
@@ -29,7 +29,7 @@ export function configureSharpRuntime(): void {
 export function safeSharp(
   input: Buffer,
   options?: { failOn?: "none" | "truncated" | "error" | "warning" },
-): sharp.Sharp {
+): Sharp {
   configureSharpRuntime();
   return sharp(input, {
     limitInputPixels: MAX_INPUT_PIXELS,
