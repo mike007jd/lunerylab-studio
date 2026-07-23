@@ -273,6 +273,17 @@ pub(crate) fn current_llama_epoch() -> u64 {
     LLAMA_EPOCH.load(Ordering::SeqCst)
 }
 
+pub(crate) fn invalidate_llama_epoch_if_current(expected: u64) -> bool {
+    LLAMA_EPOCH
+        .compare_exchange(
+            expected,
+            expected.wrapping_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
 pub(crate) fn next_mlx_epoch() -> u64 {
     MLX_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
 }

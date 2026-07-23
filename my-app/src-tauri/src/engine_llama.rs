@@ -9,8 +9,8 @@ use crate::llama_resident::LlamaResident;
 use crate::model_residency::PersistentRegistration;
 use crate::profile::profile_runtime_root_path;
 use crate::{
-    current_llama_epoch, kill_stale_pid_if_matches, next_llama_epoch, reserve_local_port,
-    residency_global, wait_for_port, write_pid_lockfile,
+    current_llama_epoch, invalidate_llama_epoch_if_current, kill_stale_pid_if_matches,
+    next_llama_epoch, reserve_local_port, residency_global, wait_for_port, write_pid_lockfile,
 };
 
 /// Process-global snapshot of the active embedded engine, so the no-arg
@@ -95,6 +95,42 @@ fn stop_previous_llama_for_switch() -> Result<(), String> {
     Ok(())
 }
 
+fn cleanup_llama_exit_if_current(epoch: u64, model_path: &str, registration_id: &str) -> bool {
+    if !invalidate_llama_epoch_if_current(epoch) {
+        return false;
+    }
+    let mut slot = llama_engine_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .map(|info| info.model_path == model_path)
+        .unwrap_or(false)
+    {
+        *slot = None;
+    }
+    drop(slot);
+    let registration = {
+        let mut slot = llama_residency_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .map(|registration| registration.id() == registration_id)
+            .unwrap_or(false)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    drop(registration);
+    if let Some(lockfile) = pid_lockfile_path() {
+        let _ = std::fs::remove_file(lockfile);
+    }
+    true
+}
+
 fn monitor_llama_exit(epoch: u64, model_path: String, registration_id: String) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(250));
@@ -125,38 +161,7 @@ fn monitor_llama_exit(epoch: u64, model_path: String, registration_id: String) {
         if !exited {
             continue;
         }
-        if current_llama_epoch() != epoch {
-            return;
-        }
-        let mut slot = llama_engine_slot()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if slot
-            .as_ref()
-            .map(|info| info.model_path == model_path)
-            .unwrap_or(false)
-        {
-            *slot = None;
-        }
-        drop(slot);
-        let registration = {
-            let mut slot = llama_residency_slot()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if slot
-                .as_ref()
-                .map(|registration| registration.id() == registration_id)
-                .unwrap_or(false)
-            {
-                slot.take()
-            } else {
-                None
-            }
-        };
-        drop(registration);
-        if let Some(lockfile) = pid_lockfile_path() {
-            let _ = std::fs::remove_file(lockfile);
-        }
+        cleanup_llama_exit_if_current(epoch, &model_path, &registration_id);
         return;
     });
 }
@@ -375,12 +380,12 @@ pub(crate) fn bridge_stop_llama() {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_stop_llama, llama_bridge_child, llama_engine_slot, llama_residency_slot,
-        stop_previous_llama_for_switch, LlamaEngineInfo,
+        bridge_stop_llama, cleanup_llama_exit_if_current, llama_bridge_child, llama_engine_slot,
+        llama_residency_slot, stop_previous_llama_for_switch, LlamaEngineInfo,
     };
     use crate::llama_resident::LlamaResident;
     use crate::model_residency::ResidencyManager;
-    use crate::test_global_lock;
+    use crate::{next_llama_epoch, test_global_lock};
     use std::ffi::OsString;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -428,6 +433,71 @@ mod tests {
             llama_bridge_child().lock().unwrap().is_none(),
             "stop must clear the child slot"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_exit_cleanup_does_not_clear_new_runtime_state() {
+        let _g = test_global_lock();
+        let _runtime_dir_restore = RuntimeDirRestore(std::env::var_os("LUNERY_RUNTIME_DIR"));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        let runtime_dir =
+            std::env::temp_dir().join(format!("lunerylab-llama-stale-monitor-{nonce}"));
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime fixture");
+        std::env::set_var("LUNERY_RUNTIME_DIR", &runtime_dir);
+        let pid_lockfile = runtime_dir.join("llama-server.pid");
+        std::fs::write(&pid_lockfile, "replacement").expect("create pid lock fixture");
+
+        let model_path = std::env::temp_dir().join(format!("lunery-current-{nonce}.gguf"));
+        std::fs::File::create(&model_path)
+            .and_then(|file| file.set_len(1024 * 1024))
+            .expect("create model fixture");
+        let model_path = model_path.to_string_lossy().to_string();
+        let residency = Arc::new(ResidencyManager::new(1));
+        let registration = residency
+            .register_persistent(LlamaResident::new(&model_path, bridge_stop_llama))
+            .expect("register replacement residency");
+        let registration_id = registration.id().to_string();
+        *llama_residency_slot().lock().unwrap() = Some(registration);
+        *llama_engine_slot().lock().unwrap() = Some(LlamaEngineInfo {
+            endpoint: "http://127.0.0.1:2".to_string(),
+            model_path: model_path.clone(),
+        });
+        let stale_epoch = next_llama_epoch();
+        next_llama_epoch();
+        assert!(
+            !cleanup_llama_exit_if_current(stale_epoch, &model_path, &registration_id),
+            "stale exit cleanup must lose the epoch claim"
+        );
+        assert_eq!(
+            llama_engine_slot()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|info| info.model_path.as_str()),
+            Some(model_path.as_str()),
+            "stale monitor must preserve replacement engine info"
+        );
+        assert_eq!(
+            llama_residency_slot()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|registration| registration.id()),
+            Some(registration_id.as_str()),
+            "stale monitor must preserve replacement residency"
+        );
+        assert!(
+            pid_lockfile.exists(),
+            "stale monitor must preserve replacement pid lockfile"
+        );
+
+        bridge_stop_llama();
+        let _ = std::fs::remove_file(model_path);
+        let _ = std::fs::remove_dir_all(runtime_dir);
     }
 
     #[cfg(unix)]
