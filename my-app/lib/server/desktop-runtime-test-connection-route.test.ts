@@ -27,6 +27,7 @@ vi.mock("@/lib/server/byok-shared", () => ({
 }));
 
 import { POST } from "@/app/api/desktop-runtime/test-connection/route";
+import { ApiError } from "@/lib/server/errors";
 
 function request(body: unknown): NextRequest {
   return new NextRequest("http://localhost/api/desktop-runtime/test-connection", {
@@ -88,5 +89,25 @@ describe("/api/desktop-runtime/test-connection", () => {
         headers: { Authorization: "Bearer saved-key" },
       }),
     );
+  });
+
+  it("returns a structured connection failure when the keychain is unavailable", async () => {
+    mocks.tryReadByokKey.mockRejectedValue(new ApiError({
+      status: 503,
+      code: "keychain_unavailable",
+      message: 'The system keychain is unavailable for provider "openai". Unlock it and retry.',
+      retryable: true,
+    }));
+
+    const response = await POST(request({ providerId: "openai" }));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      ok: false,
+      latency_ms: 0,
+      error: 'The system keychain is unavailable for provider "openai". Unlock it and retry.',
+    });
+    expect(mocks.validateProviderEndpoint).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
