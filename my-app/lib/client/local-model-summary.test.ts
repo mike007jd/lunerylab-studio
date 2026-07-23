@@ -45,27 +45,21 @@ describe("text capability readiness", () => {
   it("does not call an installed model ready while its embedded engine is stopped", () => {
     expect(isTextCapabilityReady({
       llamaModel: "Local text model",
-      mlxModel: null,
       externalTextModel: null,
       llamaRunning: false,
-      mlxRunning: false,
     })).toBe(false);
   });
 
   it("accepts a running embedded model or a reachable external model", () => {
     expect(isTextCapabilityReady({
       llamaModel: "Local text model",
-      mlxModel: null,
       externalTextModel: null,
       llamaRunning: true,
-      mlxRunning: false,
     })).toBe(true);
     expect(isTextCapabilityReady({
       llamaModel: null,
-      mlxModel: null,
       externalTextModel: "ollama-model",
       llamaRunning: false,
-      mlxRunning: false,
     })).toBe(true);
   });
 });

@@ -14,6 +14,7 @@ import { lookup } from "node:dns/promises";
 import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import https from "node:https";
 import net from "node:net";
+import { BYOK_PROVIDERS } from "@/lib/byok-providers";
 import { ApiError } from "@/lib/server/errors";
 import { readDesktopStatusRevision } from "@/lib/server/desktop-status-revision";
 
@@ -114,6 +115,8 @@ const PROVIDER_ENV_KEYS: Record<string, readonly string[]> = {
   tripo: ["TRIPO_API_KEY"],
 };
 
+const BYOK_PROVIDER_IDS = new Set(BYOK_PROVIDERS.map(({ id }) => id));
+
 function readByokKeyFromEnv(providerId: string): string | null {
   for (const key of PROVIDER_ENV_KEYS[providerId] ?? []) {
     const value = process.env[key]?.trim();
@@ -122,21 +125,43 @@ function readByokKeyFromEnv(providerId: string): string | null {
   return null;
 }
 
+function isKnownByokProvider(providerId: string): boolean {
+  return BYOK_PROVIDER_IDS.has(providerId);
+}
+
+function keychainUnavailableError(providerId: string): ApiError {
+  return new ApiError({
+    status: 503,
+    code: "keychain_unavailable",
+    message: `The system keychain is unavailable for provider "${providerId}". Unlock it and retry.`,
+    retryable: true,
+  });
+}
+
 async function readByokKeyFromBridge(providerId: string): Promise<string | null> {
   const bridgeUrl = process.env.LUNERY_DESKTOP_BRIDGE_URL;
   const bridgeToken = process.env.LUNERY_DESKTOP_BRIDGE_TOKEN;
-  if (!bridgeUrl || !bridgeToken) return null;
+  if (!bridgeUrl || !bridgeToken) {
+    if (!isKnownByokProvider(providerId)) return null;
+    throw keychainUnavailableError(providerId);
+  }
 
-  const response = await fetch(`${bridgeUrl}/provider-secret-read`, {
-    method: "POST",
-    cache: "no-store",
-    headers: {
-      "content-type": "application/json",
-      "x-lunery-desktop-token": bridgeToken,
-    },
-    body: JSON.stringify({ providerId }),
-    signal: AbortSignal.timeout(5_000),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${bridgeUrl}/provider-secret-read`, {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        "content-type": "application/json",
+        "x-lunery-desktop-token": bridgeToken,
+      },
+      body: JSON.stringify({ providerId }),
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    throw keychainUnavailableError(providerId);
+  }
+  if (response.status === 404) return null;
   // The keychain-read bridge globally throttles secret reads (5/min). A 429 is
   // NOT "no key configured" — collapsing it to null used to surface as
   // missing_api_key, sending users to re-enter a key they already have. Raise a
@@ -149,23 +174,21 @@ async function readByokKeyFromBridge(providerId: string): Promise<string | null>
       retryable: true,
     });
   }
-  if (!response.ok) return null;
+  if (response.status === 503) {
+    throw keychainUnavailableError(providerId);
+  }
+  if (!response.ok) throw keychainUnavailableError(providerId);
 
   const data = (await response.json().catch(() => ({}))) as { key?: string };
-  return data.key?.trim() || null;
+  const key = data.key?.trim();
+  if (!key) throw keychainUnavailableError(providerId);
+  return key;
 }
 
 export async function tryReadByokKey(providerId: string): Promise<string | null> {
-  try {
-    const envKey = readByokKeyFromEnv(providerId);
-    if (envKey) return envKey;
-    return await readByokKeyFromBridge(providerId);
-  } catch (error) {
-    // Surface a real rate-limit signal; swallow only genuine
-    // absence/network/timeout failures to null (the "try" contract).
-    if (error instanceof ApiError && error.code === "keychain_rate_limited") throw error;
-    return null;
-  }
+  const envKey = readByokKeyFromEnv(providerId);
+  if (envKey) return envKey;
+  return readByokKeyFromBridge(providerId);
 }
 
 export async function readByokKey(providerId: string): Promise<string> {
@@ -191,8 +214,14 @@ export async function readByokKey(providerId: string): Promise<string> {
 // it through the cross-bundle profile revision marker.
 // ---------------------------------------------------------------------------
 
+export type KeychainSecretStatus = "present" | "missing" | "unavailable";
+
 export interface DesktopStatusSnapshot {
-  providers: Array<{ id: string; configured: boolean }>;
+  providers: Array<{
+    id: string;
+    configured: boolean;
+    keychain_status: KeychainSecretStatus;
+  }>;
   local_runtimes: Array<{ id: string; endpoint: string; status: string }>;
 }
 
@@ -202,7 +231,6 @@ interface CachedConfiguredProviderIds {
 }
 
 const STATUS_CACHE_TTL_MS = 30_000;
-const STATUS_CACHE_FAILURE_TTL_MS = 3_000;
 
 let configuredProviderIdsCache: CachedConfiguredProviderIds | null = null;
 let configuredProviderIdsRevision = readDesktopStatusRevision();
@@ -244,7 +272,7 @@ export async function fetchDesktopStatusSnapshot(): Promise<DesktopStatusSnapsho
   return fetchDesktopStatusFromBridge();
 }
 
-/** Ids of providers the desktop bridge reports as configured (keychain-backed). */
+/** Ids of providers the desktop bridge reports as configured. */
 export async function fetchConfiguredProviderIds(): Promise<Set<string>> {
   syncDesktopStatusRevision();
   const now = Date.now();
@@ -262,8 +290,12 @@ export async function fetchConfiguredProviderIds(): Promise<Set<string>> {
   const requestEpoch = configuredProviderIdsEpoch;
   const promise = (async () => {
     const snapshot = await fetchDesktopStatusFromBridge();
+    if (!snapshot) return new Set<string>();
     const configured = new Set(
-      (snapshot?.providers ?? [])
+      snapshot.providers
+        // Native `configured` already combines environment credentials with a
+        // present keychain secret. A locked keychain must not hide a provider
+        // whose credential is supplied by the environment.
         .filter((provider) => provider.configured)
         .map((provider) => provider.id),
     );
@@ -273,8 +305,7 @@ export async function fetchConfiguredProviderIds(): Promise<Set<string>> {
     ) {
       configuredProviderIdsCache = {
         value: configured,
-        expiresAt:
-          Date.now() + (snapshot ? STATUS_CACHE_TTL_MS : STATUS_CACHE_FAILURE_TTL_MS),
+        expiresAt: Date.now() + STATUS_CACHE_TTL_MS,
       };
     }
     return configured;

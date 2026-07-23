@@ -20,7 +20,8 @@ pub struct HardwareInfo {
 
 #[derive(Serialize, Clone)]
 pub struct AccelInfo {
-    /// "macos-arm64" | "windows-x64" | "linux"
+    /// Known values include "macos-arm64", "macos-x64", "windows-x64",
+    /// "windows-arm64", and "linux". Unrecognized targets stay generic.
     pub platform: &'static str,
     /// "metal" | "cuda" | "vulkan" | "cpu"
     pub gpu: String,
@@ -36,18 +37,25 @@ pub(crate) fn cached_accel() -> AccelInfo {
         .get_or_init(|| {
             let hw = detect_hardware(None);
             AccelInfo {
-                platform: if cfg!(target_os = "macos") {
-                    "macos-arm64"
-                } else if cfg!(target_os = "windows") {
-                    "windows-x64"
-                } else {
-                    "linux"
-                },
+                platform: platform_id(std::env::consts::OS, std::env::consts::ARCH),
                 gpu: hw.gpu_accel,
                 vendor: hw.gpu_vendor.unwrap_or_else(|| "Unknown".to_string()),
             }
         })
         .clone()
+}
+
+fn platform_id(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("macos", "aarch64") => "macos-arm64",
+        ("macos", "x86_64") => "macos-x64",
+        ("macos", _) => "macos",
+        ("windows", "aarch64") => "windows-arm64",
+        ("windows", "x86_64") => "windows-x64",
+        ("windows", _) => "windows",
+        ("linux", _) => "linux",
+        _ => "unknown",
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -199,4 +207,23 @@ pub(crate) fn loopback_socket_addr(endpoint: &str) -> Option<SocketAddr> {
         .to_socket_addrs()
         .ok()?
         .find(|addr| addr.ip().is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::platform_id;
+
+    #[test]
+    fn platform_id_distinguishes_intel_and_apple_silicon_macs() {
+        assert_eq!(platform_id("macos", "aarch64"), "macos-arm64");
+        assert_eq!(platform_id("macos", "x86_64"), "macos-x64");
+    }
+
+    #[test]
+    fn platform_id_distinguishes_windows_architectures() {
+        assert_eq!(platform_id("windows", "x86_64"), "windows-x64");
+        assert_eq!(platform_id("windows", "aarch64"), "windows-arm64");
+        assert_eq!(platform_id("linux", "aarch64"), "linux");
+        assert_eq!(platform_id("freebsd", "x86_64"), "unknown");
+    }
 }

@@ -35,9 +35,6 @@ export interface BootstrapSnapshot {
     defaultImageModel: string;
     defaultVideoModel: string;
   };
-  features: {
-    imageGeneration: boolean;
-  };
   providers: Record<string, ProviderSnapshot>;
   providerConnections: Record<
     string,
@@ -74,7 +71,6 @@ export function snapshotsDiffer(a: BootstrapSnapshot | null, b: BootstrapSnapsho
   if (a.app.defaultTextModel !== b.app.defaultTextModel) return true;
   if (a.app.defaultImageModel !== b.app.defaultImageModel) return true;
   if (a.app.defaultVideoModel !== b.app.defaultVideoModel) return true;
-  if (a.features.imageGeneration !== b.features.imageGeneration) return true;
   if (a.user?.id !== b.user?.id) return true;
   const prevProviderKeys = Object.keys(a.providers);
   const nextProviderKeys = Object.keys(b.providers);

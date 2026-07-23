@@ -7,10 +7,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::mlx_resident::MlxResident;
+use crate::model_residency::PersistentRegistration;
 use crate::profile::profile_runtime_root_path;
 use crate::{
-    current_engine_epoch, kill_stale_pid_if_matches, next_engine_epoch, reserve_local_port,
-    residency_global, write_pid_lockfile,
+    current_mlx_epoch, invalidate_mlx_epoch_if_current, kill_stale_pid_if_matches, next_mlx_epoch,
+    reserve_local_port, residency_global, write_pid_lockfile,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,8 +38,18 @@ pub(crate) fn mlx_engine_slot() -> &'static Mutex<Option<MlxEngineInfo>> {
 }
 
 static MLX_BRIDGE_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+static MLX_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static MLX_RESIDENCY: OnceLock<Mutex<Option<PersistentRegistration>>> = OnceLock::new();
 fn mlx_bridge_child() -> &'static Mutex<Option<Child>> {
     MLX_BRIDGE_CHILD.get_or_init(|| Mutex::new(None))
+}
+
+fn mlx_start_lock() -> &'static Mutex<()> {
+    MLX_START_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn mlx_residency_slot() -> &'static Mutex<Option<PersistentRegistration>> {
+    MLX_RESIDENCY.get_or_init(|| Mutex::new(None))
 }
 
 fn pid_lockfile_path() -> Option<PathBuf> {
@@ -178,6 +189,7 @@ fn parse_mlx_line(line: &str) -> Option<(&'static str, Option<u8>)> {
 ///   1. an HF repo id of the form `owner/name` (restricted character set), or
 ///   2. a canonicalised local path with no `..` traversal that resolves under
 ///      the models root.
+///
 /// Mirrors `engine_sd::sd_model_path_allowed` for the local-path branch.
 fn mlx_model_arg_allowed(model: &str) -> bool {
     if model.is_empty() || model.len() > 256 {
@@ -222,30 +234,19 @@ fn mlx_model_arg_allowed(model: &str) -> bool {
 /// Locate the bundled SwiftLM dir without an AppHandle (bridge threads have
 /// none). Mirrors `bridge_engine_root()` but targets the `mlx/` subdir.
 fn bridge_mlx_engine_root() -> Result<PathBuf, String> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for cand in [
-                dir.join("engine").join("mlx"),
-                dir.join("..").join("Resources").join("engine").join("mlx"),
-                dir.join("..")
-                    .join("Resources")
-                    .join("_up_")
-                    .join("engine")
-                    .join("mlx"),
-            ] {
-                if cand.exists() {
-                    return Ok(cand);
-                }
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let local = cwd.join("engine").join("mlx");
-        if local.exists() {
-            return Ok(local);
-        }
-    }
-    Err("Bundled SwiftLM (MLX) engine was not found".to_string())
+    let executable = std::env::current_exe().ok();
+    let dev_cwd = cfg!(debug_assertions)
+        .then(std::env::current_dir)
+        .transpose()
+        .map_err(|err| format!("cwd: {err}"))?;
+    crate::engine_paths::resolve_engine_path(
+        executable.as_deref(),
+        &["mlx"],
+        dev_cwd.as_deref(),
+        cfg!(debug_assertions),
+        std::path::Path::is_dir,
+    )
+    .ok_or_else(|| "Bundled SwiftLM (MLX) engine was not found".to_string())
 }
 
 /// Block until the port accepts a TCP connection or the deadline passes.
@@ -272,11 +273,11 @@ fn wait_for_port_long(port: u16, max_secs: u64) -> bool {
 /// `bridge_start_mlx` that writes the new child under the same child lock) so a
 /// monitor whose model was superseded touches nothing.
 fn mlx_commit_ready(epoch: u64, endpoint: &str, model: &str) {
-    if current_engine_epoch() != epoch {
+    if current_mlx_epoch() != epoch {
         return;
     }
     if let Ok(mut slot) = mlx_engine_slot().lock() {
-        if current_engine_epoch() != epoch {
+        if current_mlx_epoch() != epoch {
             return;
         }
         *slot = Some(MlxEngineInfo {
@@ -284,30 +285,12 @@ fn mlx_commit_ready(epoch: u64, endpoint: &str, model: &str) {
             model: model.to_string(),
         });
     }
-    // Residency registration happens AFTER port readiness — the model isn't
-    // actually consuming VRAM until SwiftLM finishes mmapping the weights.
-    // min_ram_gb=0 means "unknown" and MlxResident falls back to its safe floor.
-    if current_engine_epoch() != epoch {
-        return;
-    }
-    if let Some(residency) = residency_global() {
-        let resident = MlxResident::new(model, 0, bridge_stop_mlx);
-        if let Err(err) = residency.register(resident) {
-            // Tear down — same OOM-prevention contract as llama. Only if we are
-            // still current, so we never kill a newer model's process.
-            if current_engine_epoch() == epoch {
-                bridge_stop_mlx();
-                update_mlx_job_phase("error", Some(format!("Not enough VRAM — {err}")));
-            }
-            return;
-        }
-    }
-    if current_engine_epoch() != epoch {
+    if current_mlx_epoch() != epoch {
         return;
     }
     set_mlx_progress("ready", Some(100));
     if let Ok(mut g) = mlx_job_slot().lock() {
-        if current_engine_epoch() != epoch {
+        if current_mlx_epoch() != epoch {
             return;
         }
         if let Some(job) = g.as_mut() {
@@ -322,22 +305,39 @@ fn mlx_commit_ready(epoch: u64, endpoint: &str, model: &str) {
 /// the epoch under the child lock; because `bridge_start_mlx` writes the new
 /// child while holding that same lock, this guarantees a stale monitor can never
 /// kill the freshly-started replacement process.
-fn mlx_finalize_timeout(epoch: u64) {
-    if current_engine_epoch() != epoch {
+fn mlx_finalize_timeout(epoch: u64, registration_id: &str) {
+    if current_mlx_epoch() != epoch {
         return;
     }
-    if let Ok(mut g) = mlx_bridge_child().lock() {
-        if current_engine_epoch() == epoch {
-            if let Some(c) = g.as_mut() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-            *g = None;
+    let mut child_slot = mlx_bridge_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current_mlx_epoch() == epoch {
+        if let Some(child) = child_slot.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
+        *child_slot = None;
     }
-    if current_engine_epoch() != epoch {
+    drop(child_slot);
+    if current_mlx_epoch() != epoch {
         return;
     }
+    let registration = {
+        let mut slot = mlx_residency_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .map(|registration| registration.id() == registration_id)
+            .unwrap_or(false)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    drop(registration);
     clear_mlx_progress();
     update_mlx_job_phase(
         "error",
@@ -347,6 +347,74 @@ fn mlx_finalize_timeout(epoch: u64) {
                 .to_string(),
         ),
     );
+}
+
+fn monitor_mlx_exit(epoch: u64, model: String, registration_id: String) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(250));
+        if current_mlx_epoch() != epoch {
+            return;
+        }
+        let exited = {
+            let mut child_slot = mlx_bridge_child()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(child) = child_slot.as_mut() else {
+                return;
+            };
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    *child_slot = None;
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    *child_slot = None;
+                    true
+                }
+            }
+        };
+        if !exited {
+            continue;
+        }
+        if !invalidate_mlx_epoch_if_current(epoch) {
+            return;
+        }
+        let mut slot = mlx_engine_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .map(|info| info.model == model)
+            .unwrap_or(false)
+        {
+            *slot = None;
+        }
+        drop(slot);
+        let registration = {
+            let mut slot = mlx_residency_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot
+                .as_ref()
+                .map(|registration| registration.id() == registration_id)
+                .unwrap_or(false)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        drop(registration);
+        clear_mlx_progress();
+        update_mlx_job_phase("error", Some("SwiftLM exited unexpectedly".to_string()));
+        if let Some(lockfile) = pid_lockfile_path() {
+            let _ = std::fs::remove_file(lockfile);
+        }
+        return;
+    });
 }
 
 /// Fire-and-forget MLX activation. Spawns SwiftLM + a monitor thread, then
@@ -367,30 +435,44 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
                 .to_string(),
         );
     }
+    let _start_guard = mlx_start_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // Reject if already running this same model — short-circuit ack instead
     // of restarting (which would drop a hot multi-GB model from memory).
     {
-        let child_guard = mlx_bridge_child()
+        let mut child_guard = mlx_bridge_child()
             .lock()
-            .map_err(|_| "MLX bridge lock is poisoned".to_string())?;
-        if child_guard.is_some() {
-            let same_model = mlx_engine_slot()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let alive = child_guard
+            .as_mut()
+            .and_then(|child| child.try_wait().ok())
+            .map(|status| status.is_none())
+            .unwrap_or(false);
+        if alive {
+            let engine_model = mlx_engine_slot()
                 .lock()
-                .map_err(|_| "MLX slot lock is poisoned".to_string())?
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_ref()
-                .map(|i| i.model.as_str() == model.as_str())
+                .map(|info| info.model.clone());
+            let job = mlx_job_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let same_model = engine_model
+                .as_deref()
+                .or_else(|| job.as_ref().map(|job| job.model.as_str()))
+                .map(|active_model| active_model == model)
                 .unwrap_or(false);
             if same_model {
                 let endpoint = mlx_engine_slot()
                     .lock()
-                    .map_err(|_| "MLX slot lock is poisoned".to_string())?
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .as_ref()
                     .map(|i| i.endpoint.clone());
-                let job_id = mlx_job_slot()
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().map(|j| j.job_id.clone()))
+                let job_id = job
+                    .map(|job| job.job_id)
                     .unwrap_or_else(|| format!("mlx-{}", current_millis()));
                 return Ok(MlxStartAck {
                     job_id,
@@ -407,13 +489,17 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
     // thread from the model we just stopped now holds a stale epoch and will
     // no-op instead of touching the process we are about to spawn.
     bridge_stop_mlx();
-    let my_epoch = next_engine_epoch();
+    let my_epoch = next_mlx_epoch();
 
     let root = bridge_mlx_engine_root()?;
     let bin = root.join("SwiftLM");
     if !bin.exists() {
         return Err(format!("Bundled SwiftLM is missing: {}", bin.display()));
     }
+    let registration = residency_global()
+        .ok_or_else(|| "Residency manager is unavailable".to_string())?
+        .register_persistent(MlxResident::new(&model, 0, bridge_stop_mlx))
+        .map_err(|err| format!("Not enough VRAM for this model — {err}"))?;
 
     let mlx_bin_abspath = bin.to_string_lossy().to_string();
     let pid_lockfile = pid_lockfile_path();
@@ -465,7 +551,7 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
             for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
                 // A newer start/stop superseded us — stop writing the shared
                 // progress/job slots so we don't clobber the new model's state.
-                if current_engine_epoch() != ep {
+                if current_mlx_epoch() != ep {
                     return;
                 }
                 if let Some((phase, pct)) = parse_mlx_line(&line) {
@@ -479,7 +565,7 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
         thread::spawn(move || {
             let reader = std::io::BufReader::new(err);
             for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-                if current_engine_epoch() != ep {
+                if current_mlx_epoch() != ep {
                     return;
                 }
                 if let Some((phase, pct)) = parse_mlx_line(&line) {
@@ -492,12 +578,26 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
     {
         let mut child_guard = mlx_bridge_child()
             .lock()
-            .map_err(|_| "MLX bridge lock is poisoned".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current_mlx_epoch() != my_epoch {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("MLX start was superseded".to_string());
+        }
         if let Some(ref lockfile) = pid_lockfile {
             write_pid_lockfile(lockfile, child.id(), &bin);
         }
         *child_guard = Some(child);
     }
+    let registration_id = registration.id().to_string();
+    let mut residency_slot = mlx_residency_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current_mlx_epoch() != my_epoch {
+        return Err("MLX start was superseded".to_string());
+    }
+    *residency_slot = Some(registration);
+    drop(residency_slot);
 
     // Background monitor — waits for port bind (up to 20 min) and finalises
     // MLX_JOB + mlx_engine_slot. The caller (bridge handler) returns ack
@@ -506,13 +606,15 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
     // monitor from a superseded model can never kill the new process.
     let model_clone = model.clone();
     let endpoint_clone = endpoint.clone();
+    let timeout_registration_id = registration_id.clone();
     thread::spawn(move || {
         if wait_for_port_long(port, 1200) {
             mlx_commit_ready(my_epoch, &endpoint_clone, &model_clone);
         } else {
-            mlx_finalize_timeout(my_epoch);
+            mlx_finalize_timeout(my_epoch, &timeout_registration_id);
         }
     });
+    monitor_mlx_exit(my_epoch, model.clone(), registration_id);
 
     Ok(MlxStartAck {
         job_id,
@@ -533,32 +635,29 @@ pub(crate) fn bridge_stop_mlx() {
     // Bump the epoch FIRST so any in-flight monitor / drain thread for the model
     // we are about to kill immediately sees itself as stale and stops touching
     // shared state (and crucially, stops short of killing a future process).
-    next_engine_epoch();
+    next_mlx_epoch();
 
-    // Snapshot the repo id BEFORE clearing the engine slot — same pattern as
-    // bridge_stop_llama, lets us hand the right id to drop_model.
-    let model_id = mlx_engine_slot()
+    let registration = mlx_residency_slot()
         .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|i| i.model.clone()));
-
-    if let Ok(mut guard) = mlx_bridge_child().lock() {
-        if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait(); // reap (mirrors bridge_stop_sd)
-        }
-        *guard = None;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let mut guard = mlx_bridge_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = guard.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait(); // reap (mirrors bridge_stop_sd)
     }
-    if let Ok(mut slot) = mlx_engine_slot().lock() {
-        *slot = None;
-    }
+    *guard = None;
+    drop(guard);
+    drop(registration);
+    *mlx_engine_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     clear_mlx_progress();
     set_mlx_job(None);
     if let Some(lockfile) = pid_lockfile_path() {
         let _ = std::fs::remove_file(lockfile);
-    }
-    if let (Some(residency), Some(id)) = (residency_global(), model_id) {
-        residency.drop_model(&id);
     }
 }
 
@@ -568,7 +667,7 @@ mod tests {
         mlx_bridge_child, mlx_commit_ready, mlx_engine_slot, mlx_finalize_timeout,
         mlx_model_arg_allowed,
     };
-    use crate::{current_engine_epoch, next_engine_epoch, test_global_lock};
+    use crate::{current_mlx_epoch, next_mlx_epoch, test_global_lock};
 
     #[cfg(unix)]
     fn spawn_fake_child() -> std::process::Child {
@@ -606,10 +705,10 @@ mod tests {
         *mlx_bridge_child().lock().unwrap() = Some(b);
 
         // Capture the (soon-to-be) stale epoch, then a newer start/stop bumps it.
-        let stale = current_engine_epoch();
-        next_engine_epoch();
+        let stale = current_mlx_epoch();
+        next_mlx_epoch();
 
-        mlx_finalize_timeout(stale);
+        mlx_finalize_timeout(stale, "mlx:test");
 
         let mut guard = mlx_bridge_child().lock().unwrap();
         let still = guard.as_mut().expect("B must still be in the slot");
@@ -631,8 +730,8 @@ mod tests {
         let _g = test_global_lock();
         let child = spawn_fake_child();
         *mlx_bridge_child().lock().unwrap() = Some(child);
-        let ep = next_engine_epoch();
-        mlx_finalize_timeout(ep);
+        let ep = next_mlx_epoch();
+        mlx_finalize_timeout(ep, "mlx:test");
         assert!(
             mlx_bridge_child().lock().unwrap().is_none(),
             "current-epoch timeout must clear the child slot"
@@ -643,8 +742,8 @@ mod tests {
     fn stale_commit_ready_does_not_set_slot() {
         let _g = test_global_lock();
         *mlx_engine_slot().lock().unwrap() = None;
-        let stale = current_engine_epoch();
-        next_engine_epoch();
+        let stale = current_mlx_epoch();
+        next_mlx_epoch();
         mlx_commit_ready(stale, "http://127.0.0.1:1", "owner/model");
         assert!(
             mlx_engine_slot().lock().unwrap().is_none(),

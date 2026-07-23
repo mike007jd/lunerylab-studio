@@ -47,7 +47,7 @@ pub(crate) fn is_lmstudio_installed() -> bool {
 fn probe_lmstudio_installed() -> bool {
     #[cfg(target_os = "macos")]
     {
-        return std::path::Path::new("/Applications/LM Studio.app").exists();
+        std::path::Path::new("/Applications/LM Studio.app").exists()
     }
     #[cfg(target_os = "windows")]
     {
@@ -55,11 +55,11 @@ fn probe_lmstudio_installed() -> bool {
         if local_app_data.is_empty() {
             return false;
         }
-        return std::path::Path::new(&local_app_data)
+        std::path::Path::new(&local_app_data)
             .join("Programs")
             .join("LM Studio")
             .join("LM Studio.exe")
-            .exists();
+            .exists()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

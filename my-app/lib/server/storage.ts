@@ -65,14 +65,6 @@ function joinRuntimePath(root: string, ...parts: string[]) {
 }
 
 /**
- * Local media capability probe for the storage surface.
- * Always false: media is written only to the local filesystem.
- */
-export function isBlobStorage(): boolean {
-  return false;
-}
-
-/**
  * List every stored file under the local storage root as bucket-relative POSIX
  * paths (e.g. `generated/abc.png`, `uploads/{projectId}/x.jpg`) — the same shape
  * as an asset's `storagePath`.

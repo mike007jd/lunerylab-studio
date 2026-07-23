@@ -34,7 +34,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.fetchBootstrapData.mockResolvedValue({
     app: {},
-    features: {},
     providers: [],
     providerConnections: [],
   });

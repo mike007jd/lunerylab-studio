@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchLlamaStatus,
-  fetchMlxStatus,
   fetchRuntimeProbe,
   invalidateDesktopStatusCache,
   useDesktopAccel,
@@ -26,11 +25,6 @@ interface InstalledModelStatus {
 interface LlamaStatus {
   running: boolean;
   modelPath: string | null;
-}
-
-interface MlxStatus {
-  running: boolean;
-  model: string | null;
 }
 
 export interface LocalModelSummary {
@@ -76,22 +70,14 @@ export function isLocalModelSummaryChecking(
 
 export function isTextCapabilityReady({
   llamaModel,
-  mlxModel,
   externalTextModel,
   llamaRunning,
-  mlxRunning,
 }: {
   llamaModel: string | null;
-  mlxModel: string | null;
   externalTextModel: string | null;
   llamaRunning: boolean;
-  mlxRunning: boolean;
 }): boolean {
-  return Boolean(
-    (llamaRunning && llamaModel) ||
-    (mlxRunning && mlxModel) ||
-    externalTextModel,
-  );
+  return Boolean((llamaRunning && llamaModel) || externalTextModel);
 }
 
 // Detect Tauri WebView without import-time side effects (SSR-safe).
@@ -132,7 +118,6 @@ export function useLocalModelSummary(): LocalModelSummary {
   const accel = useDesktopAccel();
   const [installed, setInstalled] = useState<Record<string, InstalledModelStatus>>({});
   const [llama, setLlama] = useState<LlamaStatus | null>(null);
-  const [mlx, setMlx] = useState<MlxStatus | null>(null);
   const [externalTextModel, setExternalTextModel] = useState<string | null>(null);
   const [externalTextProbes, setExternalTextProbes] = useState<
     Partial<Record<ExternalTextRuntimeId, RuntimeProbeResult | null>>
@@ -148,10 +133,9 @@ export function useLocalModelSummary(): LocalModelSummary {
     if (inflightRef.current) return;
     inflightRef.current = true;
     try {
-      const [modelsRes, llamaRes, mlxRes, externalProbeResults] = await Promise.all([
+      const [modelsRes, llamaRes, externalProbeResults] = await Promise.all([
         fetch("/api/desktop-runtime/models/status", { cache: "no-store" }).catch(() => null),
         fetchLlamaStatus(),
-        fetchMlxStatus(),
         Promise.all(
           EXTERNAL_TEXT_RUNTIMES.map(({ endpoint }) => fetchRuntimeProbe(endpoint)),
         ),
@@ -165,12 +149,6 @@ export function useLocalModelSummary(): LocalModelSummary {
         const next = llamaRes as LlamaStatus;
         setLlama((prev) =>
           prev && prev.running === next.running && prev.modelPath === next.modelPath ? prev : next,
-        );
-      }
-      if (mlxRes) {
-        const next = mlxRes as MlxStatus;
-        setMlx((prev) =>
-          prev && prev.running === next.running && prev.model === next.model ? prev : next,
         );
       }
       setExternalTextModel(firstDiscoveredExternalTextModel(externalProbeResults));
@@ -202,7 +180,7 @@ export function useLocalModelSummary(): LocalModelSummary {
     void load();
 
     // Tauri event subscription — Rust watcher emits "local-runtime-changed" on
-    // llama/mlx running flag flips and MLX phase transitions. Dynamic import
+    // local-runtime state transitions. Dynamic import
     // keeps the SSR build clean (the module fails outside the WebView).
     let unlisten: (() => void) | null = null;
     let cancelled = false;
@@ -266,11 +244,7 @@ export function useLocalModelSummary(): LocalModelSummary {
           Boolean(entry.fileName && llama?.modelPath?.endsWith(entry.fileName)),
       )?.label ??
       null;
-    const mlxTextModel =
-      HF_MODEL_CATALOG.find(
-        (entry) => entry.runtimeTarget === "mlx" && mlx?.model === entry.hfRepo,
-      )?.label ?? null;
-    const currentTextModel = llamaTextModel ?? mlxTextModel ?? externalTextModel;
+    const currentTextModel = llamaTextModel ?? externalTextModel;
     const currentImageModel =
       installedItems.find((item) => item.imported && item.installed && item.capability === "image-gen")?.label ??
       HF_MODEL_CATALOG.find((entry) => entry.capability === "image-gen" && installed[entry.id]?.installed)?.label ??
@@ -278,10 +252,8 @@ export function useLocalModelSummary(): LocalModelSummary {
     const sdReady = runtimes?.some((runtime) => runtime.id === "sd-cpp" && runtime.status === "ready") ?? false;
     const hasReadyText = isTextCapabilityReady({
       llamaModel: llamaTextModel,
-      mlxModel: mlxTextModel,
       externalTextModel,
       llamaRunning: llama?.running === true,
-      mlxRunning: mlx?.running === true,
     });
     const hasReadyImage = Boolean(currentImageModel && sdReady);
     const installedCount = installedItems.filter((item) => item.installed).length;
@@ -298,5 +270,5 @@ export function useLocalModelSummary(): LocalModelSummary {
       accel,
       externalTextProbes,
     };
-  }, [accel, desktop, externalTextModel, externalTextProbes, hasLoadedRuntimeDetails, installed, llama?.modelPath, llama?.running, mlx?.model, mlx?.running, runtimes]);
+  }, [accel, desktop, externalTextModel, externalTextProbes, hasLoadedRuntimeDetails, installed, llama?.modelPath, llama?.running, runtimes]);
 }

@@ -1,7 +1,6 @@
 "use client";
 
 import { memo, useEffect, useRef, useState } from "react";
-import { formatMlxPhase, type MlxPhase } from "@/lib/mlx-phase";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -10,7 +9,7 @@ import { readResponseError } from "@/lib/client/fetch-json";
 import { cn } from "@/lib/utils";
 import { modelRunnableState } from "@/lib/hf-model-catalog";
 import { useHfDownload } from "@/hooks/use-hf-download";
-import { fetchMlxStatus, useDesktopLocalRuntimes } from "@/hooks/use-desktop-available";
+import { useDesktopLocalRuntimes } from "@/hooks/use-desktop-available";
 import type { HardwareInfo } from "@/lib/desktop-runtime";
 import type { HubModelEntry, ModelInstallStatus, QueueEntry, UiState } from "./types";
 import { MODEL_DETAILS, type CopyShape } from "./copy";
@@ -59,13 +58,6 @@ function StateBadge({ state, copy }: { state: UiState; copy: CopyShape }) {
       </Badge>
     );
   }
-  if (state === "planned") {
-    return (
-      <Badge variant="outline" className="text-(--text-muted)">
-        {copy.stateLabels.planned}
-      </Badge>
-    );
-  }
   if (state === "canceled") {
     return (
       <Badge variant="outline" className="text-(--text-muted)">
@@ -91,7 +83,6 @@ function ModelRowImpl({
   installStatus,
   runtimes,
   activeLlamaPath,
-  activeMlxModel,
   copy,
   detailsLocale,
   onStatusChange,
@@ -107,7 +98,6 @@ function ModelRowImpl({
   installStatus: ModelInstallStatus | undefined;
   runtimes: ReturnType<typeof useDesktopLocalRuntimes>;
   activeLlamaPath: string | null;
-  activeMlxModel: string | null;
   copy: CopyShape;
   detailsLocale: keyof typeof MODEL_DETAILS;
   onStatusChange: () => Promise<void>;
@@ -120,11 +110,8 @@ function ModelRowImpl({
   const dl = useHfDownload();
   const [activating, setActivating] = useState(false);
   const [activationError, setActivationError] = useState<string | null>(null);
-  const [mlxProg, setMlxProg] = useState<{ phase: MlxPhase | null; percent: number | null } | null>(null);
-  const aliveRef = useRef(true);
   const readyReportedRef = useRef(false);
 
-  useEffect(() => () => { aliveRef.current = false; }, []);
   useEffect(() => {
     if (dl.status === "ready" && !readyReportedRef.current) {
       readyReportedRef.current = true;
@@ -148,13 +135,10 @@ function ModelRowImpl({
 
   const installed = installStatus?.installed || dl.status === "ready";
   const partial = Boolean(installStatus?.partial && !installed);
-  const isMlx = entry.runtimeTarget === "mlx";
-  const isActive =
-    (entry.runtimeTarget === "llama-cpp" &&
-      (entry.modelPath
-        ? activeLlamaPath === entry.modelPath
-        : Boolean(entry.fileName && activeLlamaPath?.endsWith(entry.fileName)))) ||
-    (entry.runtimeTarget === "mlx" && activeMlxModel === entry.hfRepo);
+  const isActive = entry.runtimeTarget === "llama-cpp" &&
+    (entry.modelPath
+      ? activeLlamaPath === entry.modelPath
+      : Boolean(entry.fileName && activeLlamaPath?.endsWith(entry.fileName)));
   const activeImportDownload = Boolean(importQueueEntry && isActiveQueueStatus(importQueueEntry.status));
   const canResumeImportedDownload = Boolean(
     entry.imported &&
@@ -174,8 +158,6 @@ function ModelRowImpl({
         ? "error"
         : dl.status === "canceled"
           ? "canceled"
-          : entry.lifecycleStatus === "planned"
-            ? "planned"
           : partial
             ? "partial"
             : baseState;
@@ -183,12 +165,10 @@ function ModelRowImpl({
   const neededDisk = Math.ceil(entry.sizeBytes / 1_073_741_824);
   const diskOk = diskGb === 0 || diskGb >= neededDisk;
   const hardwareUnfit = baseState === "hardware_unfit";
-  const planned = entry.lifecycleStatus === "planned";
-  const blocked = planned || hardwareUnfit || !diskOk;
-  const canRunInline = entry.runtimeTarget === "llama-cpp" || entry.runtimeTarget === "mlx";
+  const blocked = hardwareUnfit || !diskOk;
+  const canRunInline = entry.runtimeTarget === "llama-cpp";
 
   function disabledReason(): string | undefined {
-    if (planned) return copy.disabledPlanned;
     if (!diskOk) return copy.disabledDisk(neededDisk);
     if (entry.requiresAppleSilicon && hw && !hw.apple_silicon) return copy.disabledAppleSilicon;
     if (hw && hw.ram_gb < entry.minRamGb) return copy.disabledNoRam(entry.minRamGb);
@@ -224,78 +204,10 @@ function ModelRowImpl({
     }
   }
 
-  async function activateMlx() {
-    // New flow (matches Rust bridge_start_mlx ack):
-    //   1. POST returns ≤ 200ms with `{ status: "starting" | "already_running" }`
-    //   2. We then poll GET until phase === "ready" or "error"
-    // No interleaved start + poll race: serial, predictable.
-    setActivating(true);
-    setActivationError(null);
-    setMlxProg({ phase: "downloading", percent: null });
-
-    try {
-      const startRes = await fetch("/api/desktop-runtime/mlx", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ modelId: entry.id }),
-      });
-      if (!startRes.ok) {
-        setActivationError(await readResponseError(startRes, copy.activateFailed));
-        return;
-      }
-      const ack = (await startRes.json().catch(() => ({}))) as {
-        status?: string;
-        running?: boolean;
-      };
-      if (ack.status === "already_running" || ack.running === true) {
-        await onStatusChange();
-        await onActivated?.(entry.id);
-        return;
-      }
-
-      // Poll up to 25 minutes (matches Rust 20 min wait_for_port_long + slack).
-      const deadline = Date.now() + 25 * 60 * 1000;
-      let ready = false;
-      while (aliveRef.current && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        try {
-          const d = await fetchMlxStatus();
-          if (!d) continue;
-          setMlxProg((prev) =>
-            prev && prev.phase === d.phase && prev.percent === d.percent
-              ? prev
-              : { phase: d.phase ?? "downloading", percent: d.percent ?? null },
-          );
-          if (d.running || d.phase === "ready") {
-            ready = true;
-            break;
-          }
-          if (d.phase === "error") {
-            setActivationError(d.error ?? copy.activateFailed);
-            break;
-          }
-        } catch {
-          // transient; keep polling
-        }
-      }
-      if (ready) await onActivated?.(entry.id);
-    } catch {
-      setActivationError(copy.activateFailed);
-    } finally {
-      setActivating(false);
-      setMlxProg(null);
-      await onStatusChange();
-    }
-  }
-
   async function installThenMaybeRun() {
     if (blocked || importedUnavailable || activeImportDownload) return;
     if (canResumeImportedDownload) {
       await onResumeImport(entry);
-      return;
-    }
-    if (isMlx) {
-      await activateMlx();
       return;
     }
     if (!installed) {
@@ -317,7 +229,7 @@ function ModelRowImpl({
         fileIndex: dl.fileIndex,
         fileCount: dl.fileCount,
       };
-  const showProgress = effectiveState === "downloading" && !isMlx;
+  const showProgress = effectiveState === "downloading";
   const primaryLabel = isActive
     ? copy.primaryRunning
     : installed
@@ -360,12 +272,12 @@ function ModelRowImpl({
         <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
           <StateBadge state={isActive ? "downloaded" : effectiveState} copy={copy} />
 
-          {effectiveState === "downloading" && !isMlx && activeImportDownload ? (
+          {effectiveState === "downloading" && activeImportDownload ? (
             <Button type="button" size="sm" disabled>
               <Zap className="h-3 w-3" />
               {copy.stateLabels.downloading}
             </Button>
-          ) : effectiveState === "downloading" && !isMlx ? (
+          ) : effectiveState === "downloading" ? (
             <Button type="button" size="sm" variant="ghostMuted" onClick={() => void dl.cancel()}>
               <X className="h-3 w-3" />
               {copy.actionCancel}
@@ -388,18 +300,12 @@ function ModelRowImpl({
               title={blocked ? disabledReason() : undefined}
               onClick={() => void installThenMaybeRun()}
             >
-              {installed || isMlx ? <Zap className="h-3 w-3" /> : <Download className="h-3 w-3" />}
+              {installed ? <Zap className="h-3 w-3" /> : <Download className="h-3 w-3" />}
               {primaryLabel}
             </Button>
           )}
         </div>
       </div>
-
-      {isMlx && activating && (
-        <p className="text-xs text-(--text-muted)">
-          {formatMlxPhase(mlxProg?.phase === "loading" ? copy.mlxLoading : copy.mlxDownloading, mlxProg?.percent)}
-        </p>
-      )}
 
       {showProgress && (
         <div className="space-y-1">

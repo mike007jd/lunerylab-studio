@@ -5,7 +5,8 @@ import type { AssetDTO } from "@/lib/types/api";
 import type { GenerationParameters } from "@/lib/generation-parameters";
 
 // Lightweight in-page history survives refreshes; Library remains canonical.
-// Running entries are not persisted because they cannot survive the page lifecycle.
+// Running entries are persisted as interrupted because they cannot keep a live
+// spinner across the page lifecycle.
 
 export type GenerationEntryStatus =
   | "running"
@@ -86,8 +87,160 @@ function nextId(): string {
   return `gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const STORAGE_KEY = "luna:studio-history:v1";
+/** Current Lunery Studio history key. Legacy `luna:studio-history:v1` is ignored. */
+export const STUDIO_HISTORY_STORAGE_KEY = "lunerylab:studio-history";
+const STORAGE_KEY = STUDIO_HISTORY_STORAGE_KEY;
 export const STUDIO_HISTORY_LIMIT = 60;
+
+const ENTRY_STATUSES = new Set<GenerationEntryStatus>([
+  "running",
+  "succeeded",
+  "partial",
+  "failed",
+  "canceled",
+  "interrupted",
+]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseGenerationParameters(value: unknown): GenerationParameters | null {
+  if (!isPlainObject(value)) return null;
+  const parameters: GenerationParameters = {};
+  if (value.seed !== undefined) {
+    if (!Number.isInteger(value.seed)) return null;
+    parameters.seed = value.seed as number;
+  }
+  if (value.steps !== undefined) {
+    if (!Number.isInteger(value.steps)) return null;
+    parameters.steps = value.steps as number;
+  }
+  if (value.cfg !== undefined) {
+    if (typeof value.cfg !== "number" || !Number.isFinite(value.cfg)) return null;
+    parameters.cfg = value.cfg;
+  }
+  if (value.negativePrompt !== undefined) {
+    if (typeof value.negativePrompt !== "string") return null;
+    if (value.negativePrompt) parameters.negativePrompt = value.negativePrompt;
+  }
+  return parameters;
+}
+
+function parseBatchVariants(value: unknown): GenerationBatchVariant[] | null {
+  if (value === null) return null;
+  if (!Array.isArray(value)) return null;
+  const variants: GenerationBatchVariant[] = [];
+  for (const item of value) {
+    if (!isPlainObject(item)) return null;
+    if (typeof item.key !== "string" || typeof item.label !== "string" || typeof item.promptSuffix !== "string") {
+      return null;
+    }
+    variants.push({
+      key: item.key,
+      label: item.label,
+      promptSuffix: item.promptSuffix,
+    });
+  }
+  return variants;
+}
+
+function isFiniteNumberOrNull(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isStringOrNull(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isAssetDTO(value: unknown): value is AssetDTO {
+  if (!isPlainObject(value)) return false;
+
+  for (const field of ["id", "jobId", "mimeType", "createdAt", "url"] as const) {
+    if (typeof value[field] !== "string") return false;
+  }
+  for (const field of [
+    "projectId",
+    "format",
+    "note",
+    "summary",
+    "agentTaskId",
+    "parentAssetId",
+    "deletedAt",
+  ] as const) {
+    if (!isStringOrNull(value[field])) return false;
+  }
+  if (value.kind !== "REFERENCE" && value.kind !== "GENERATED") return false;
+  if (value.origin !== "USER" && value.origin !== "TEMPLATE") return false;
+  if (value.modality !== "IMAGE" && value.modality !== "VIDEO" && value.modality !== "MODEL_3D") {
+    return false;
+  }
+  if (typeof value.byteSize !== "number" || !Number.isFinite(value.byteSize)) return false;
+  if (!isFiniteNumberOrNull(value.width)) return false;
+  if (!isFiniteNumberOrNull(value.height)) return false;
+  if (!isFiniteNumberOrNull(value.durationSeconds)) return false;
+  if (!Array.isArray(value.tags) || !value.tags.every((tag) => typeof tag === "string")) {
+    return false;
+  }
+  if (typeof value.isFavorite !== "boolean") return false;
+
+  for (const field of ["generationSeed", "generationSteps", "generationCfg"] as const) {
+    if (value[field] !== undefined && !isFiniteNumberOrNull(value[field])) return false;
+  }
+  for (const field of ["negativePrompt", "generationModel"] as const) {
+    if (value[field] !== undefined && !isStringOrNull(value[field])) return false;
+  }
+  return true;
+}
+
+function parseHistoryEntry(value: unknown): GenerationEntry | null {
+  if (!isPlainObject(value)) return null;
+  if (typeof value.id !== "string" || !value.id) return null;
+  if (value.mode !== "image" && value.mode !== "video") return null;
+  if (typeof value.status !== "string" || !ENTRY_STATUSES.has(value.status as GenerationEntryStatus)) {
+    return null;
+  }
+  if (typeof value.prompt !== "string") return null;
+  if (typeof value.modelId !== "string") return null;
+  if (typeof value.aspectRatio !== "string") return null;
+  if (!Number.isInteger(value.count) || (value.count as number) < 1) return null;
+  if (value.presetId !== null && typeof value.presetId !== "string") return null;
+  if (value.projectId !== null && typeof value.projectId !== "string") return null;
+  if (!Array.isArray(value.referenceAssetIds) || !value.referenceAssetIds.every((id) => typeof id === "string")) {
+    return null;
+  }
+  const batchVariants = parseBatchVariants(value.batchVariants);
+  if (value.batchVariants !== null && batchVariants === null) return null;
+  const generationParameters = parseGenerationParameters(value.generationParameters);
+  if (!generationParameters) return null;
+  if (!Array.isArray(value.assets) || !value.assets.every(isAssetDTO)) return null;
+  if (!Array.isArray(value.warnings) || !value.warnings.every((warning) => typeof warning === "string")) {
+    return null;
+  }
+  if (value.error !== null && typeof value.error !== "string") return null;
+  if (typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt)) return null;
+
+  const status = value.status as GenerationEntryStatus;
+  return {
+    id: value.id,
+    mode: value.mode,
+    // Persisted running cannot be live after reload.
+    status: status === "running" ? "interrupted" : status,
+    prompt: value.prompt,
+    modelId: value.modelId,
+    aspectRatio: value.aspectRatio,
+    count: value.count as number,
+    presetId: value.presetId as string | null,
+    projectId: value.projectId as string | null,
+    referenceAssetIds: value.referenceAssetIds as string[],
+    batchVariants,
+    generationParameters,
+    assets: value.assets,
+    warnings: value.warnings as string[],
+    error: value.error as string | null,
+    createdAt: value.createdAt,
+  };
+}
 
 export function prependStudioHistoryEntry(
   entries: GenerationEntry[],
@@ -96,25 +249,27 @@ export function prependStudioHistoryEntry(
   return [entry, ...entries].slice(0, STUDIO_HISTORY_LIMIT);
 }
 
-function loadInitialEntries(): GenerationEntry[] {
-  if (typeof window === "undefined") return [];
+export function loadStudioHistoryEntries(raw: string | null): GenerationEntry[] {
+  if (!raw) return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    // Filter out any persisted `running` entries — those would resurrect as
-    // ghost spinners after a refresh. Cap length defensively.
-    return parsed
-      .filter((e): e is GenerationEntry => !!e && typeof e === "object" && e.status !== "running")
-      .map((entry) => ({
-        ...entry,
-        generationParameters: entry.generationParameters ?? {},
-      }))
-      .slice(0, STUDIO_HISTORY_LIMIT);
+    const entries: GenerationEntry[] = [];
+    for (const item of parsed) {
+      const entry = parseHistoryEntry(item);
+      if (!entry) continue;
+      entries.push(entry);
+      if (entries.length >= STUDIO_HISTORY_LIMIT) break;
+    }
+    return entries;
   } catch {
     return [];
   }
+}
+
+function loadInitialEntries(): GenerationEntry[] {
+  if (typeof window === "undefined") return [];
+  return loadStudioHistoryEntries(window.localStorage.getItem(STORAGE_KEY));
 }
 
 function persistEntries(entries: GenerationEntry[]) {

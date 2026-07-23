@@ -6,7 +6,7 @@ import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 // Route delegates to the shared `fetchBootstrapData` helper (the source of
 // truth that is also consumed by the page-level server components). Keeping
 // the assembly logic in one place stops the two surfaces from drifting on
-// feature flags or provider-status shape.
+// provider-status shape.
 export async function GET() {
   try {
     const user = await requireLocalWorkspaceOwner();
@@ -20,7 +20,6 @@ export async function GET() {
         avatarUrl: user.avatarUrl,
       },
       app: data.app,
-      features: data.features,
       providers: data.providers,
       providerConnections: data.providerConnections,
     });

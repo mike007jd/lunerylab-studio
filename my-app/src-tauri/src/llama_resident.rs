@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crate::model_residency::{ModelKind, ResidentModel};
+use crate::model_residency::ResidentModel;
 
 /// Wraps the bridge-side llama-server lifecycle, the single product control
 /// surface for embedded llama.cpp.
@@ -37,23 +37,33 @@ impl LlamaResident {
     /// is the file size on disk multiplied by 1.2 to account for the KV
     /// cache and llama-server's own working memory.
     ///
-    /// Returns an Arc<dyn ResidentModel> so the caller can hand it straight
-    /// to `ResidencyManager::register`.
-    pub fn new(model_path: &str, shutdown: ShutdownFn) -> Arc<dyn ResidentModel> {
-        let id = std::path::Path::new(model_path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(model_path)
-            .to_string();
+    /// Returns a shared resident that coerces to the manager's trait object.
+    pub fn new(model_path: &str, shutdown: ShutdownFn) -> Arc<Self> {
+        let identity = std::path::Path::new(model_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(model_path));
+        let id = format!("llama:{}", identity.to_string_lossy());
 
         // GGUF on-disk size ≈ weights in memory once mmapped. KV cache grows
         // with context length; 20 % padding covers the default 4 K context
         // for the model sizes we ship (3 B – 8 B). Larger models or larger
         // contexts can blow this; the manager errors at register time, which
         // surfaces as a friendly UI error instead of a silent OOM kill.
-        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-        let mb = bytes / 1024 / 1024;
-        let with_kv = mb.saturating_mul(12) / 10;
+        let metadata_bytes = std::fs::metadata(model_path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len());
+        let Some(bytes) = metadata_bytes else {
+            return Arc::new(LlamaResident {
+                id,
+                // Fail closed against every finite residency budget. A missing
+                // or unreadable GGUF has no defensible zero-cost estimate.
+                estimated_mb: u32::MAX,
+                shutdown_fn: shutdown,
+            });
+        };
+        let mb = bytes.saturating_add(1024 * 1024 - 1) / 1024 / 1024;
+        let with_kv = (mb.saturating_mul(12) / 10).max(1);
         let estimated_mb = u32::try_from(with_kv).unwrap_or(u32::MAX);
 
         Arc::new(LlamaResident {
@@ -68,9 +78,6 @@ impl ResidentModel for LlamaResident {
     fn id(&self) -> &str {
         &self.id
     }
-    fn kind(&self) -> ModelKind {
-        ModelKind::Llm
-    }
     fn estimated_vram_mb(&self) -> u32 {
         self.estimated_mb
     }
@@ -84,6 +91,7 @@ impl ResidentModel for LlamaResident {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_residency::ResidencyManager;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Module-level counter — `ShutdownFn` is a bare `fn()` (no captures), so
@@ -94,10 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn id_is_file_basename_and_kind_is_llm() {
+    fn id_is_namespaced_canonical_identity() {
         let m = LlamaResident::new("/tmp/Llama-3-8B-Q4_K_M.gguf", fake_shutdown);
-        assert_eq!(m.id(), "Llama-3-8B-Q4_K_M.gguf");
-        assert_eq!(m.kind(), ModelKind::Llm);
+        assert_eq!(m.id(), "llama:/tmp/Llama-3-8B-Q4_K_M.gguf");
     }
 
     #[test]
@@ -109,11 +116,28 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_yields_zero_estimate_not_panic() {
-        // The model path may be invalid (caller error or race); we degrade
-        // gracefully — the manager still registers it under a 0-MB cost,
-        // never crashes Tauri startup.
+    fn missing_file_fails_closed_instead_of_registering_zero_cost() {
         let m = LlamaResident::new("/does/not/exist.gguf", fake_shutdown);
-        assert_eq!(m.estimated_vram_mb(), 0);
+        assert_eq!(m.estimated_vram_mb(), u32::MAX);
+        assert!(ResidencyManager::new(8 * 1024).register(m).is_err());
+    }
+
+    #[test]
+    fn file_size_uses_ceil_megabytes_plus_headroom() {
+        let path = std::env::temp_dir().join(format!(
+            "lunery-llama-resident-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let file = std::fs::File::create(&path).expect("create fixture");
+        file.set_len(10 * 1024 * 1024 + 1).expect("size fixture");
+
+        let m = LlamaResident::new(path.to_str().expect("utf8 path"), fake_shutdown);
+        assert_eq!(m.estimated_vram_mb(), 13);
+
+        std::fs::remove_file(path).expect("remove fixture");
     }
 }

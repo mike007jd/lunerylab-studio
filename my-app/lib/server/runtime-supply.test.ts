@@ -85,12 +85,11 @@ describe("resolveTextRuntimeSupply", () => {
     });
   });
 
-  it("continues past a reachable runtime with no models", async () => {
+  it("falls through to OpenAI-compatible discovery when Ollama reports no models", async () => {
     mocks.fetchDesktopStatusSnapshot.mockResolvedValue({
       providers: [],
       local_runtimes: [
-        { id: "mlx", endpoint: "http://127.0.0.1:9002", status: "ready" },
-        { id: "llama-cpp", endpoint: "http://127.0.0.1:9003", status: "ready" },
+        { id: "llama-cpp", endpoint: "http://127.0.0.1:9002", status: "ready" },
       ],
     });
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
@@ -102,7 +101,10 @@ describe("resolveTextRuntimeSupply", () => {
           latency_ms: 2,
         });
       }
-      if (url === "http://127.0.0.1:9003/v1/models") {
+      if (url === "http://127.0.0.1:9002/api/tags") {
+        return Response.json({ models: [] });
+      }
+      if (url === "http://127.0.0.1:9002/v1/models") {
         return Response.json({ data: [{ id: "second-runtime-model" }] });
       }
       return new Response("not found", { status: 404 });
@@ -110,20 +112,18 @@ describe("resolveTextRuntimeSupply", () => {
 
     await expect(resolveTextRuntimeSupply("local:second-runtime-model")).resolves.toMatchObject({
       backend: "local",
-      endpoint: "http://127.0.0.1:9003",
+      endpoint: "http://127.0.0.1:9002",
       modelId: "second-runtime-model",
     });
   });
 
   it("never runs a different loaded model than the one the user selected", async () => {
-    // Two runtimes online; the first-probed endpoint hosts model B, but the
-    // user selected model A which lives on the second endpoint. Unique ports
-    // avoid the module-level probe cache carrying over from earlier tests.
+    // The runtime exposes multiple loaded models; the selected model must be
+    // matched exactly rather than silently replaced with the first result.
     mocks.fetchDesktopStatusSnapshot.mockResolvedValue({
       providers: [],
       local_runtimes: [
-        { id: "mlx", endpoint: "http://127.0.0.1:9202", status: "ready" },
-        { id: "llama-cpp", endpoint: "http://127.0.0.1:9203", status: "ready" },
+        { id: "llama-cpp", endpoint: "http://127.0.0.1:9202", status: "ready" },
       ],
     });
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
@@ -132,17 +132,14 @@ describe("resolveTextRuntimeSupply", () => {
         return Response.json({ endpoint: "unused", reachable: true, latency_ms: 1 });
       }
       if (url === "http://127.0.0.1:9202/v1/models") {
-        return Response.json({ data: [{ id: "model-b" }] });
-      }
-      if (url === "http://127.0.0.1:9203/v1/models") {
-        return Response.json({ data: [{ id: "model-a" }] });
+        return Response.json({ data: [{ id: "model-b" }, { id: "model-a" }] });
       }
       return new Response("not found", { status: 404 });
     }));
 
     await expect(resolveTextRuntimeSupply("local:model-a")).resolves.toMatchObject({
       backend: "local",
-      endpoint: "http://127.0.0.1:9203",
+      endpoint: "http://127.0.0.1:9202",
       modelId: "model-a",
     });
   });

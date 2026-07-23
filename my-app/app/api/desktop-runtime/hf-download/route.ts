@@ -46,13 +46,6 @@ export async function POST(request: NextRequest) {
       { status: 404 },
     );
   }
-  if (entry.lifecycleStatus === "planned") {
-    return NextResponse.json(
-      { error: `Model ${modelId} is current but not installable until its local runtime path is verified.` },
-      { status: 409 },
-    );
-  }
-
   // Single-file callers send NO `file` → main file (byte-identical to before).
   // Multi-file callers (the FLUX kit) send `file` to pick the main file or one
   // companion; each is still an ordinary single-file resumable bridge job.

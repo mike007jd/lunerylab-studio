@@ -186,31 +186,19 @@ pub(crate) fn sd_binary_path() -> Option<PathBuf> {
     } else {
         "sd-cli"
     };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for root in [
-                dir.join("engine").join("sd"),
-                dir.join("..").join("Resources").join("engine").join("sd"),
-                dir.join("..")
-                    .join("Resources")
-                    .join("_up_")
-                    .join("engine")
-                    .join("sd"),
-            ] {
-                let cand = root.join(bin_name);
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let cand = cwd.join("engine").join("sd").join(bin_name);
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
+    let executable = std::env::current_exe().ok();
+    let dev_cwd = cfg!(debug_assertions)
+        .then(std::env::current_dir)
+        .transpose()
+        .ok()
+        .flatten();
+    crate::engine_paths::resolve_engine_path(
+        executable.as_deref(),
+        &["sd", bin_name],
+        dev_cwd.as_deref(),
+        cfg!(debug_assertions),
+        std::path::Path::is_file,
+    )
 }
 
 fn stop_sd_child() {
@@ -516,11 +504,11 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
     {
         if let Some(residency) = residency_global() {
             let resident = SdCppResident::new(&id, None, bridge_stop_sd);
-            residency.register(resident).map_err(|err| {
+            let lease = residency.register_and_activate(resident).map_err(|err| {
                 eprintln!("[lunerylab] sd residency register failed: {err}");
                 format!("Not enough VRAM for this model - {err}")
             })?;
-            residency.activate(&id)
+            Some(lease)
         } else {
             None
         }
@@ -693,14 +681,15 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
 
     // The lease drops here at end of scope, but for per-spawn SD we also
     // want the registry to forget the entry — nothing is resident between
-    // batches today. When sd-cpp becomes a real resident server, this
-    // drop_model call goes away and the lease alone keeps it hot.
+    // batches today. This is bookkeeping only: the child has already exited,
+    // so normal completion must not invoke the eviction shutdown callback and
+    // turn the finished run into a cancellation.
     if let Some(lease) = &sd_lease {
         let id = lease.model().id().to_string();
-        drop(sd_lease);
         if let Some(residency) = residency_global() {
-            residency.drop_model(&id);
+            residency.unregister(&id);
         }
+        drop(sd_lease);
     }
     Ok(results)
 }
@@ -743,6 +732,7 @@ fn sd_output_path_allowed(value: &str, root: &Path) -> bool {
 ///   1. a path under the canonical models root (catalog-downloaded models), or
 ///   2. an existing regular file (user-imported models, which the Next-side
 ///      registry validated and may live anywhere the user pointed).
+///
 /// Read-only by nature — `sd-cli` only reads the model — so the existing-file
 /// fallback does not grant arbitrary writes. Parent-dir traversal is rejected
 /// before the models-root check. Symlinks are resolved via canonicalize so a

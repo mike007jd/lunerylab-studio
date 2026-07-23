@@ -1,6 +1,6 @@
 /**
  * Local LLM client — wraps an OpenAI-compatible local endpoint
- * (Ollama, LM Studio, llama.cpp server, MLX server, etc.) via the
+ * (Ollama, LM Studio, llama.cpp server, etc.) via the
  * AI SDK's createOpenAICompatible provider.
  *
  * Exported signature mirrors the BYOK text helper so callers can swap backends

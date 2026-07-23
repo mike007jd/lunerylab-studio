@@ -164,25 +164,22 @@ describe("BYOK diffusion parameter capabilities", () => {
     negativePrompt: "blur, watermark",
   };
 
-  it("sends supported parameters to Replicate diffusion schemas", async () => {
+  it("sends only verified seed support to the exact Replicate schema", async () => {
     await expect(generateImagesReplicate(
-      { ...config, modelId: "stability-ai/sdxl" },
+      { ...config, modelId: "black-forest-labs/flux-2-pro" },
       { prompt: "poster", count: 1, generationParameters: parameters },
     )).rejects.toThrow("returned no image URLs");
 
-    expect(mocks.runReplicatePrediction).toHaveBeenCalledWith(expect.objectContaining({
-      input: expect.objectContaining({
-        seed: 4242,
-        num_inference_steps: 28,
-        guidance_scale: 5.5,
-        negative_prompt: "blur, watermark",
-      }),
-    }));
+    const providerInput = mocks.runReplicatePrediction.mock.calls[0]?.[0]?.input;
+    expect(providerInput).toMatchObject({ seed: 4242 });
+    expect(providerInput).not.toHaveProperty("num_inference_steps");
+    expect(providerInput).not.toHaveProperty("guidance_scale");
+    expect(providerInput).not.toHaveProperty("negative_prompt");
   });
 
-  it("omits unsupported parameters for arbitrary Replicate models", async () => {
+  it("omits unsupported parameters for unverified family-like Replicate models", async () => {
     await expect(generateImagesReplicate(
-      { ...config, modelId: "owner/custom-image-model" },
+      { ...config, modelId: "stability-ai/sdxl" },
       { prompt: "poster", count: 1, generationParameters: parameters },
     )).rejects.toThrow("returned no image URLs");
 
@@ -193,18 +190,30 @@ describe("BYOK diffusion parameter capabilities", () => {
     expect(providerInput).not.toHaveProperty("negative_prompt");
   });
 
-  it("sends supported Fal controls but excludes negative prompts from Flux schemas", async () => {
+  it("sends only verified seed support to an exact Fal schema", async () => {
     await expect(generateImagesFal(
-      { ...config, modelId: "fal-ai/flux/dev" },
+      { ...config, modelId: "fal-ai/flux-pro/v1.1" },
       { prompt: "poster", count: 1, generationParameters: parameters },
     )).rejects.toThrow("returned no images");
 
     const body = mocks.falQueueResult.mock.calls[0]?.[0]?.body;
-    expect(body).toMatchObject({
+    expect(body).toMatchObject({ seed: 4242 });
+    expect(body).not.toHaveProperty("num_inference_steps");
+    expect(body).not.toHaveProperty("guidance_scale");
+    expect(body).not.toHaveProperty("negative_prompt");
+  });
+
+  it("forwards every verified control for the exact Fal PuLID schema", async () => {
+    await expect(generateImagesFal(
+      { ...config, modelId: "fal-ai/flux-pulid" },
+      { prompt: "poster", count: 1, generationParameters: parameters },
+    )).rejects.toThrow("returned no images");
+
+    expect(mocks.falQueueResult.mock.calls[0]?.[0]?.body).toMatchObject({
       seed: 4242,
       num_inference_steps: 28,
       guidance_scale: 5.5,
+      negative_prompt: "blur, watermark",
     });
-    expect(body).not.toHaveProperty("negative_prompt");
   });
 });

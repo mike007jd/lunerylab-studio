@@ -47,20 +47,13 @@ describe("runtime health capability truth", () => {
 });
 
 describe("runtime health diagnostic truth", () => {
-  it("separates Apple Silicon hardware from MLX engine state", () => {
+  it("reports Apple Silicon hardware independently from engine state", () => {
     expect(hardwareHealthView(null, true, COPY.en)).toMatchObject({ state: "checking" });
     expect(hardwareHealthView(null, false, COPY.en)).toMatchObject({ statusLabel: COPY.en.checkFailed });
     expect(hardwareHealthView(accel, false, COPY.en)).toMatchObject({
       state: "ready",
       statusLabel: COPY.en.detected,
     });
-
-    expect(embeddedEngineHealthView({
-      runtime: { id: "mlx", status: "idle", installed: true },
-      label: COPY.en.mlxEngine,
-      checking: false,
-      copy: COPY.en,
-    })).toMatchObject({ state: "pending", statusLabel: COPY.en.idle });
   });
 
   it("describes a packaged image engine as installed, not image capability connected", () => {
@@ -75,14 +68,14 @@ describe("runtime health diagnostic truth", () => {
 
   it("keeps engine setup and absence distinct", () => {
     expect(embeddedEngineHealthView({
-      runtime: { id: "mlx", status: "downloading", installed: true },
-      label: COPY.en.mlxEngine,
+      runtime: { id: "llama-cpp", status: "downloading", installed: true },
+      label: COPY.en.builtInTextEngine,
       checking: false,
       copy: COPY.en,
     })).toMatchObject({ state: "pending", statusLabel: COPY.en.pending });
     expect(embeddedEngineHealthView({
-      runtime: { id: "mlx", status: "idle", installed: false },
-      label: COPY.en.mlxEngine,
+      runtime: { id: "llama-cpp", status: "idle", installed: false },
+      label: COPY.en.builtInTextEngine,
       checking: false,
       copy: COPY.en,
     })).toMatchObject({ state: "unreachable", statusLabel: COPY.en.notInstalled });

@@ -49,7 +49,6 @@ export const COPY = {
     notDetected: "Not detected",
     checkFailed: "Couldn't check",
     builtInImageEngine: "Built-in image engine",
-    mlxEngine: "Apple text engine",
     builtInTextEngine: "Built-in text engine",
     builtInDetail: "Built into Lunery",
     installed: "Installed",
@@ -83,7 +82,6 @@ export const COPY = {
     notDetected: "未检测到",
     checkFailed: "无法检查",
     builtInImageEngine: "内置图片引擎",
-    mlxEngine: "Apple 文字引擎",
     builtInTextEngine: "内置文字引擎",
     builtInDetail: "Lunery 内置",
     installed: "已安装",
@@ -121,7 +119,6 @@ export const COPY = {
     notDetected: "未偵測到",
     checkFailed: "無法檢查",
     builtInImageEngine: "內建圖片引擎",
-    mlxEngine: "Apple 文字引擎",
     builtInTextEngine: "內建文字引擎",
     builtInDetail: "Lunery 內建",
     installed: "已安裝",
@@ -381,7 +378,6 @@ export function RuntimeHealthPanel() {
   );
   const llamaRuntime = getDesktopRuntime(runtimes, "llama-cpp");
   const sdRuntime = getDesktopRuntime(runtimes, "sd-cpp");
-  const mlxRuntime = getDesktopRuntime(runtimes, "mlx");
   const capabilityChecking = available === null || localSummary.isChecking;
   const capabilityViews = [
     capabilityHealthView({
@@ -412,12 +408,6 @@ export function RuntimeHealthPanel() {
     embeddedEngineHealthView({
       runtime: llamaRuntime,
       label: copy.builtInTextEngine,
-      checking: available === null,
-      copy,
-    }),
-    embeddedEngineHealthView({
-      runtime: mlxRuntime,
-      label: copy.mlxEngine,
       checking: available === null,
       copy,
     }),

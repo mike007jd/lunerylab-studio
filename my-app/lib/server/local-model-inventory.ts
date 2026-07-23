@@ -1,4 +1,4 @@
-import { HF_MODEL_REGISTRY, type HfModelEntry } from "@/lib/hf-model-catalog";
+import { HF_MODEL_CATALOG, type HfModelEntry } from "@/lib/hf-model-catalog";
 import { readImportedModels, type ImportedModelRecord } from "@/lib/server/imported-model-registry";
 import {
   catalogModelFileStatuses,
@@ -99,7 +99,7 @@ let installStatusInflight: Promise<LocalModelInstallStatus[]> | null = null;
 
 async function readLocalModelInstallStatuses(): Promise<LocalModelInstallStatus[]> {
   const [catalogModels, importedModels] = await Promise.all([
-    Promise.all((HF_MODEL_REGISTRY as readonly HfModelEntry[]).map(catalogModelStatus)),
+    Promise.all((HF_MODEL_CATALOG as readonly HfModelEntry[]).map(catalogModelStatus)),
     Promise.all((await readImportedModels()).map(importedModelStatus)),
   ]);
 

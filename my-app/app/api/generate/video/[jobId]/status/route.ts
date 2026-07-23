@@ -1,6 +1,5 @@
-// Pure DB poll. The actual generation runs in the background via
-// waitUntil(runVideoJob(...)) — that worker is responsible for writing the
-// asset row and marking the job SUCCEEDED or FAILED.
+// Pure DB poll. The desktop-local background worker is responsible for writing
+// the asset row and marking the job SUCCEEDED or FAILED.
 // This endpoint just reflects the latest persisted state to the client.
 
 import { NextRequest, NextResponse } from "next/server";

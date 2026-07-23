@@ -180,7 +180,6 @@
   --z-floating: 20;   /* floating toolbars, docks anchored to a region */
   --z-overlay: 30;    /* per-layer toolbars, popovers, contextual menus */
   --z-modal: 50;      /* dialogs, sheets, full-screen modals */
-  --z-top: 60;        /* legacy alias — prefer --z-modal */
   --z-toast: 100;     /* transient notifications, must beat everything */
 
   --sidebar: var(--bg-surface);

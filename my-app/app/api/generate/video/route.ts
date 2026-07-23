@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { waitUntil } from "@vercel/functions";
 import { assertVideoGenerationPrismaSupport } from "@/lib/server/prisma";
 import { ApiError, jsonError } from "@/lib/server/errors";
 import { parseFormData } from "@/lib/server/http-validation";
@@ -30,14 +29,9 @@ import {
   persistUploadedImageReferenceFiles,
 } from "@/lib/server/reference-assets";
 
-// Allow long-running invocations on Vercel (max for Pro is 800s; for Hobby it
-// caps at 60s, which is too short for video). We rely on `waitUntil` to keep
-// the function alive after the HTTP response is sent so the BYOK video call can
-// complete in the background.
-//
-// On Tauri (`LUNERY_DESKTOP=1`), `waitUntil` is a no-op shim — the Promise is
-// still scheduled on the Node event loop, so fire-and-forget keeps running
-// after the response. Client polls `/api/generate/video/{jobId}/status`.
+// Desktop-local video generation: POST returns RUNNING immediately and the
+// started promise continues on the Node event loop. Terminal failures are
+// observed here; orphan reconciliation remains on the status/read path.
 export const maxDuration = 300;
 
 function generationResponse({
@@ -52,6 +46,12 @@ function generationResponse({
   projectId: string | null;
 }) {
   return NextResponse.json({ jobId, status, duration, projectId });
+}
+
+function observeVideoJob(promise: Promise<unknown>) {
+  void promise.catch((error) => {
+    console.error("[video_job_background_failed]", error);
+  });
 }
 
 export async function POST(request: NextRequest) {
@@ -92,19 +92,6 @@ export async function POST(request: NextRequest) {
         status: 400,
         code: "invalid_model",
         message: `Unknown video model: ${modelId}`,
-        retryable: false,
-      });
-    }
-
-    // Defensive legacy guard: platform-funded cloud relay is retired. If an
-    // old persisted cloud-source row is somehow picked while no BYOK provider
-    // can run it, fail fast at the route boundary.
-    if (model.source === "cloud") {
-      throw new ApiError({
-        status: 400,
-        code: "video_backend_unavailable",
-        message:
-          "This video model runs on a cloud provider that is not configured. Pick a BYOK video model in Settings (Replicate / Fal / MiniMax).",
         retryable: false,
       });
     }
@@ -194,7 +181,7 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    waitUntil(
+    observeVideoJob(
       runVideoJob({
         jobId: job.id,
         userId: user.id,
@@ -207,8 +194,6 @@ export async function POST(request: NextRequest) {
         // Freeze the backend/model resolved above so the background runner
         // can't drift if Settings change mid-flight.
         runtime: videoTarget,
-      }).catch((error) => {
-        console.error("[video_job_background_failed]", error);
       }),
     );
 

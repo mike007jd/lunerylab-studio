@@ -9,13 +9,14 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/hf-model-catalog", () => ({
-  HF_MODEL_REGISTRY: [
+  HF_MODEL_CATALOG: [
     {
       id: "catalog-sd-model",
+      sourceUrl: "https://huggingface.co/example/catalog-sd-model",
+      checkedAt: "2026-07-23",
       label: "Catalog SD Model",
       capability: "image-gen",
       runtimeTarget: "sd-cpp",
-      lifecycleStatus: "active",
       fileName: "model.safetensors",
       speedTier: "fast",
       sourceEvidence: [],

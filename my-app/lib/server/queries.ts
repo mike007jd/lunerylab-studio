@@ -39,9 +39,6 @@ export interface BootstrapData {
     defaultImageModel: string;
     defaultVideoModel: string;
   };
-  features: {
-    imageGeneration: boolean;
-  };
   providers: Record<string, ProviderStatus>;
   providerConnections: Record<string, ByokConnectionMeta>;
 }
@@ -58,9 +55,6 @@ export async function fetchBootstrapData(userId: string): Promise<BootstrapData>
       defaultTextModel: settings.defaultTextModel,
       defaultImageModel: settings.defaultImageModel,
       defaultVideoModel: settings.defaultVideoModel,
-    },
-    features: {
-      imageGeneration: true,
     },
     providers,
     providerConnections: listByokConnectionMeta(),

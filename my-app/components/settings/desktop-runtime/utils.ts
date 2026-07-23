@@ -3,7 +3,12 @@ import {
   type ByokConnectionModels,
   type ByokProviderMeta,
 } from "@/lib/byok-providers";
-import type { DesktopBridgePhase, DesktopInvoke, SavedProviderConnection } from "./types";
+import type {
+  DesktopBridgePhase,
+  DesktopInvoke,
+  ProviderConnectionStatus,
+  SavedProviderConnection,
+} from "./types";
 
 export function desktopBridgeDisabledReason(
   phase: DesktopBridgePhase,
@@ -12,6 +17,25 @@ export function desktopBridgeDisabledReason(
   if (phase === "loading") return copy.checking;
   if (phase === "unavailable") return copy.unavailable;
   return undefined;
+}
+
+export function providerSecretSourceLabel(
+  runtime: Pick<ProviderConnectionStatus, "keychain_status" | "source"> | undefined,
+  statusAvailable: boolean,
+  savedSecret: boolean,
+  copy: {
+    env: string;
+    keychain: string;
+    keychainUnavailable: string;
+    saved: string;
+    notConnected: string;
+  },
+): string {
+  if (runtime?.source === "environment") return copy.env;
+  if (runtime?.keychain_status === "unavailable") return copy.keychainUnavailable;
+  if (runtime?.source === "system-keychain") return copy.keychain;
+  if (!statusAvailable && savedSecret) return copy.saved;
+  return copy.notConnected;
 }
 /** Draft model map for the editor, seeded from a saved connection. */
 export function draftModelsFromConnection(

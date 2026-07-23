@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::model_residency::{ModelKind, ResidentModel};
+use crate::model_residency::ResidentModel;
 
 /// Coarse classifier we use to pick a default VRAM estimate when the caller
 /// passes 0 (i.e. catalog row has no explicit minRamGb). Detected from the
@@ -64,7 +64,7 @@ impl SdCppResident {
     /// Build from the model id (filename or catalog id) and an explicit MB
     /// override. Pass `Some(mb)` when the catalog row carries an exact size,
     /// `None` to fall back to the family default.
-    pub fn new(id: &str, explicit_mb: Option<u32>, shutdown: fn()) -> Arc<dyn ResidentModel> {
+    pub fn new(id: &str, explicit_mb: Option<u32>, shutdown: fn()) -> Arc<Self> {
         let estimated_mb = explicit_mb.unwrap_or_else(|| SdFamily::from_id(id).default_vram_mb());
         Arc::new(SdCppResident {
             id: id.to_string(),
@@ -77,9 +77,6 @@ impl SdCppResident {
 impl ResidentModel for SdCppResident {
     fn id(&self) -> &str {
         &self.id
-    }
-    fn kind(&self) -> ModelKind {
-        ModelKind::ImageDiffusion
     }
     fn estimated_vram_mb(&self) -> u32 {
         self.estimated_mb
@@ -134,7 +131,6 @@ mod tests {
     fn unknown_falls_back_to_family_default() {
         let m = SdCppResident::new("FLUX.1-dev-Q4_0.gguf", None, fake_shutdown);
         assert_eq!(m.estimated_vram_mb(), 12_000);
-        assert_eq!(m.kind(), ModelKind::ImageDiffusion);
     }
 
     #[test]

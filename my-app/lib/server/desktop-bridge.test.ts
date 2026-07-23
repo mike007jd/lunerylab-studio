@@ -3,16 +3,62 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { requireDesktopBridge } from "@/lib/server/desktop-bridge";
+import { proxyToBridge, requireDesktopBridge } from "@/lib/server/desktop-bridge";
 
 let tempRoot: string | null = null;
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   if (tempRoot) {
     rmSync(tempRoot, { recursive: true, force: true });
     tempRoot = null;
   }
+});
+
+describe("proxyToBridge", () => {
+  const bridge = { url: "http://127.0.0.1:49152", token: "dev-token" };
+
+  it("returns a retryable 503 when the bridge cannot be reached", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+
+    const response = await proxyToBridge(bridge, "/status");
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Desktop runtime bridge is unreachable",
+      code: "bridge_unreachable",
+      retryable: true,
+    });
+  });
+
+  it("returns a retryable 504 when the bridge request times out", async () => {
+    const timeout = Object.assign(new Error("timed out"), { name: "TimeoutError" });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(timeout));
+
+    const response = await proxyToBridge(bridge, "/status");
+
+    expect(response.status).toBe(504);
+    await expect(response.json()).resolves.toEqual({
+      error: "Desktop runtime bridge timed out",
+      code: "bridge_timeout",
+      retryable: true,
+    });
+  });
+
+  it("preserves status-route custom degradation semantics", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+
+    const response = await proxyToBridge(
+      bridge,
+      "/status",
+      undefined,
+      () => NextResponse.json({ available: false }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ available: false });
+  });
 });
 
 function makeRuntimeDir() {

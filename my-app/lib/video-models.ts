@@ -3,7 +3,7 @@
 
 import type { ModelSourceEvidence, ModelTier } from "@/lib/image-models";
 
-export type VideoModelSource = "local" | "byok" | "cloud";
+export type VideoModelSource = "local" | "byok";
 
 export interface VideoModelEntry {
   id: string;
@@ -20,15 +20,14 @@ export interface VideoModelEntry {
   requiresImageInput: boolean;
   /**
    * Whether the duration / image-input capability above is actually verified for
-   * this model. Static catalog rows are verified; a BYOK row uses a permissive
-   * working default (the user's chosen model id can be anything), so it sets this
-   * false and the UI presents those limits as estimates, not promises.
+   * this model. A BYOK row uses a permissive working default (the user's chosen
+   * model id can be anything), so it sets this false and the UI presents those
+   * limits as estimates, not promises.
    */
   capabilityVerified?: boolean;
   /**
-   * Where this model actually runs. Video has no local engine today, so all
-   * entries are "cloud" or "byok"; the field is here for picker grouping
-   * symmetry with image and forward compatibility.
+   * Where this model actually runs. Video has no local engine today, so live
+   * rows are BYOK; the field is here for picker grouping symmetry with image.
    */
   source?: VideoModelSource;
   sourceEvidence?: ModelSourceEvidence[];

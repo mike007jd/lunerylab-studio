@@ -9,28 +9,23 @@ import type { HardwareInfo } from "@/lib/desktop-runtime";
 //
 //   curl -sLI "<downloadUrl>" | grep -i x-linked-etag
 //
-// The MLX entry (`qwen2.5-7b-instruct-mlx`) is intentionally `sha256: null` —
-// it is a multi-file repo snapshot with no single hash; the runtime self-pulls
-// and verifies per-file. UI displays a "checksum advisory" banner instead.
-//
 // moondream2 removed in Package E (2026-05-20). Its catalog row had
 // runtimeTarget:"ollama" with a raw .gguf downloadUrl that Ollama cannot use.
 // Restore after `bridge_ollama_pull()` lands (requires finding the `ollama`
 // binary cross-platform + an async exec bridge command).
 //
-// Freshness baseline: 2026-07-03.
-// Current catalog rows must be both current upstream and runnable through the
-// shipped desktop bridge. Older runnable rows live in the hidden compatibility
-// registry below so existing installs can still resolve, but they are not shown
-// in the main model hub.
+// Freshness baseline: 2026-07-23.
+// Every catalog row is a currently supported product option and must be both
+// available upstream and runnable through the shipped desktop bridge. Product
+// support is not inferred from whether a model is the newest member of its
+// upstream family: smaller older models remain visible when they are the right
+// fit for lower-memory hardware.
 // ---------------------------------------------------------------------------
 
 export type ModelCapability = "planner-llm" | "vision" | "image-gen";
-export type ModelFormat = "gguf" | "mlx" | "diffusers";
-export type ModelRuntimeTarget = "llama-cpp" | "sd-cpp" | "ollama" | "lm-studio" | "mlx" | "comfyui";
-export type ModelLifecycleStatus = "current" | "compatibility" | "legacy" | "planned";
-
-export const MODEL_FRESHNESS_BASELINE = "2026-07-03";
+export type ModelFormat = "gguf" | "diffusers";
+export type ModelRuntimeTarget = "llama-cpp" | "sd-cpp" | "ollama" | "lm-studio" | "comfyui";
+export const MODEL_FRESHNESS_BASELINE = "2026-07-23";
 
 export interface ModelSourceEvidence {
   label: string;
@@ -41,15 +36,14 @@ export interface ModelSourceEvidence {
 export interface HfModelEntry {
   /** Stable internal id (never changes once published). */
   id: string;
+  /** Exact upstream repository for this downloadable leaf model. */
+  sourceUrl: string;
+  /** Date this exact leaf and its download metadata were last checked. */
+  checkedAt: string;
   capability: ModelCapability;
   label: string;
   hfRepo: string;
-  /**
-   * Primary file name within the HF repo.
-   * Empty string ("") means this is a repo-snapshot format (e.g. mlx).
-   * The download engine treats empty fileName as "repo-style"; for v1
-   * the downloadUrl is still computed from the hfRepo root.
-   */
+  /** Primary file name within the HF repo. */
   fileName: string;
   format: ModelFormat;
   /** Approximate download size in bytes (GB × 1 073 741 824). */
@@ -61,20 +55,13 @@ export interface HfModelEntry {
   sha256: string | null;
   /** Minimum system RAM required to run the model (GiB). */
   minRamGb: number;
-  /** True if the model only runs on Apple Silicon (e.g. MLX format). */
+  /** True if the model only runs on Apple Silicon. */
   requiresAppleSilicon: boolean;
   runtimeTarget: ModelRuntimeTarget;
   /** Search and filter terms that describe real user intent, not just filenames. */
   searchAliases: readonly string[];
   /** Marks the default recommendation for a capability on compatible hardware. */
   recommended: boolean;
-  /**
-   * Product lifecycle status as of `MODEL_FRESHNESS_BASELINE`.
-   * current = can be recommended, compatibility = still runnable but not a
-   * current upstream recommendation, legacy = kept only for old projects,
-   * planned = documented but not shipped/runnable.
-   */
-  lifecycleStatus: ModelLifecycleStatus;
   sourceEvidence: readonly ModelSourceEvidence[];
   freshnessExpiresAt: string;
   freshnessNote: string;
@@ -83,9 +70,7 @@ export interface HfModelEntry {
   speedTier: "fast" | "balanced" | "quality";
   offlineReady: boolean;
   /**
-   * Direct download URL. For repo-style (fileName === ""), this points to
-   * the HF repo root rather than a single file — the download engine must
-   * handle the multi-file snapshot case in a future pass.
+   * Direct URL for the primary downloadable file.
    */
   downloadUrl: string;
   /**
@@ -109,6 +94,8 @@ const GiB = 1_073_741_824;
 export const HF_MODEL_CATALOG = [
   {
     id: "qwen3.6-35b-a3b-ud-q4-k-m",
+    sourceUrl: "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "planner-llm",
     label: "Qwen3.6 35B-A3B (UD-Q4_K_M GGUF)",
     hfRepo: "unsloth/Qwen3.6-35B-A3B-GGUF",
@@ -121,7 +108,6 @@ export const HF_MODEL_CATALOG = [
     runtimeTarget: "llama-cpp",
     searchAliases: ["qwen3.6", "qwen", "hot", "popular", "current", "text", "planner", "chat", "reasoning", "gguf", "offline"],
     recommended: true,
-    lifecycleStatus: "current",
     sourceEvidence: [
       {
         label: "Qwen official Qwen3.6-35B-A3B model card",
@@ -134,9 +120,9 @@ export const HF_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
-      "Hot current Qwen MoE row verified from the official model card and a high-download GGUF release on 2026-07-03.",
+      "Current Qwen MoE row verified from the official model card and the shipped GGUF release on 2026-07-23.",
     useCaseTags: ["text", "planner", "current"],
     speedTier: "quality",
     offlineReady: true,
@@ -145,6 +131,8 @@ export const HF_MODEL_CATALOG = [
   },
   {
     id: "qwen3.6-27b-q4",
+    sourceUrl: "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "planner-llm",
     label: "Qwen3.6 27B (Q4_K_M GGUF)",
     hfRepo: "unsloth/Qwen3.6-27B-GGUF",
@@ -157,7 +145,6 @@ export const HF_MODEL_CATALOG = [
     runtimeTarget: "llama-cpp",
     searchAliases: ["qwen3.6", "qwen", "current", "text", "planner", "chat", "reasoning", "gguf", "offline"],
     recommended: true,
-    lifecycleStatus: "current",
     sourceEvidence: [
       {
         label: "Qwen official Qwen3.6-27B model card",
@@ -170,7 +157,7 @@ export const HF_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
       "Current Qwen text family row kept for machines that cannot reasonably fit the hotter MoE variant.",
     useCaseTags: ["text", "planner", "current"],
@@ -180,42 +167,9 @@ export const HF_MODEL_CATALOG = [
       "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
   },
   {
-    id: "qwen3.6-27b-mlx-optiq-4bit",
-    capability: "planner-llm",
-    label: "Qwen3.6 27B (MLX OptiQ 4-bit)",
-    hfRepo: "mlx-community/Qwen3.6-27B-OptiQ-4bit",
-    fileName: "",
-    format: "mlx",
-    sizeBytes: Math.round(15.5 * GiB),
-    sha256: null,
-    minRamGb: 32,
-    requiresAppleSilicon: true,
-    runtimeTarget: "mlx",
-    searchAliases: ["qwen3.6", "qwen", "mlx", "apple silicon", "metal", "current", "text", "planner", "offline"],
-    recommended: true,
-    lifecycleStatus: "current",
-    sourceEvidence: [
-      {
-        label: "Qwen official Qwen3.6-27B model card",
-        url: "https://huggingface.co/Qwen/Qwen3.6-27B",
-        lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
-      },
-      {
-        label: "Current MLX quantization used by this catalog",
-        url: "https://huggingface.co/mlx-community/Qwen3.6-27B-OptiQ-4bit",
-        lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
-      },
-    ],
-    freshnessExpiresAt: "2026-08-02",
-    freshnessNote:
-      "Current Qwen MLX path for Apple Silicon. Multi-file MLX repo has no single SHA-256; refresh the HF repo before future recommendation changes.",
-    useCaseTags: ["text", "apple-silicon", "current"],
-    speedTier: "quality",
-    offlineReady: true,
-    downloadUrl: "https://huggingface.co/mlx-community/Qwen3.6-27B-OptiQ-4bit",
-  },
-  {
     id: "deepseek-v4-flash-iq2xxs",
+    sourceUrl: "https://huggingface.co/antirez/deepseek-v4-gguf",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "planner-llm",
     label: "DeepSeek V4 Flash (IQ2XXS GGUF)",
     hfRepo: "antirez/deepseek-v4-gguf",
@@ -228,7 +182,6 @@ export const HF_MODEL_CATALOG = [
     runtimeTarget: "llama-cpp",
     searchAliases: ["deepseek", "deepseek v4", "v4 flash", "hot", "popular", "current", "text", "planner", "reasoning", "gguf", "offline"],
     recommended: false,
-    lifecycleStatus: "current",
     sourceEvidence: [
       {
         label: "DeepSeek official V4 Flash model card",
@@ -241,7 +194,7 @@ export const HF_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
       "Hot current DeepSeek row kept as a high-memory option; it is not recommended on ordinary laptops because the verified single-file GGUF is 80GB+.",
     useCaseTags: ["text", "current", "quality"],
@@ -252,6 +205,8 @@ export const HF_MODEL_CATALOG = [
   },
   {
     id: "flux2-dev-q4",
+    sourceUrl: "https://huggingface.co/unsloth/FLUX.2-dev-GGUF",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "image-gen",
     label: "FLUX.2 Dev (Q4_K_M GGUF)",
     hfRepo: "unsloth/FLUX.2-dev-GGUF",
@@ -267,27 +222,26 @@ export const HF_MODEL_CATALOG = [
     runtimeTarget: "sd-cpp",
     searchAliases: ["flux2", "flux.2", "flux", "current", "image", "generation", "creator", "gguf", "non-commercial"],
     recommended: false,
-    lifecycleStatus: "current",
     sourceEvidence: [
       {
         label: "Black Forest Labs official FLUX.2-dev model card",
         url: "https://huggingface.co/black-forest-labs/FLUX.2-dev",
-        lastVerifiedAt: "2026-07-03",
+        lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
       {
         label: "Current FLUX.2 GGUF quantization used by this catalog",
         url: "https://huggingface.co/unsloth/FLUX.2-dev-GGUF",
-        lastVerifiedAt: "2026-07-03",
+        lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
       {
         label: "stable-diffusion.cpp FLUX.2 runtime guide",
         url: "https://github.com/leejet/stable-diffusion.cpp/blob/master/docs/flux2.md",
-        lastVerifiedAt: "2026-07-03",
+        lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
-      "Current FLUX.2 image kit verified on 2026-07-03. The official BFL base repo is gated and non-commercial; this row uses public GGUF/decoder/text-encoder files documented for stable-diffusion.cpp.",
+      "Current FLUX.2 image kit verified on 2026-07-23. The official BFL base repo is gated and non-commercial; this row uses public GGUF/decoder/text-encoder files documented for stable-diffusion.cpp.",
     useCaseTags: ["image", "current", "quality"],
     speedTier: "quality",
     offlineReady: true,
@@ -310,15 +264,14 @@ export const HF_MODEL_CATALOG = [
       },
     ],
   },
-] as const satisfies HfModelEntry[];
-
-export const HF_COMPATIBILITY_MODEL_CATALOG = [
   {
     // Switched from the official Qwen GGUF repo to bartowski because the
     // upstream Q4_K_M was re-sharded into 2 files with no single-file URL,
     // breaking the existing downloadUrl with a 404. bartowski's variant is a
     // single 4.36 GiB file with a stable SHA-256.
     id: "qwen2.5-7b-instruct-q4",
+    sourceUrl: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "planner-llm",
     label: "Qwen 2.5 7B Instruct (Q4)",
     hfRepo: "bartowski/Qwen2.5-7B-Instruct-GGUF",
@@ -331,11 +284,10 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
     runtimeTarget: "llama-cpp",
     searchAliases: ["qwen", "text", "planner", "chat", "reasoning", "balanced", "gguf", "offline"],
     recommended: false,
-    lifecycleStatus: "compatibility",
     sourceEvidence: [
       {
-        label: "Qwen official Qwen3-8B model card",
-        url: "https://huggingface.co/Qwen/Qwen3-8B",
+        label: "Qwen official Qwen2.5-7B-Instruct model card",
+        url: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct",
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
       {
@@ -344,9 +296,9 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
-      "Qwen2.5 remains a runnable llama.cpp compatibility path. It is hidden from the main model hub because Qwen3.6 is the current Qwen family as of 2026-07-03.",
+      "Supported low-memory llama.cpp option for machines that cannot run the larger Qwen3.6 rows.",
     useCaseTags: ["text", "planner", "balanced"],
     speedTier: "balanced",
     offlineReady: true,
@@ -354,47 +306,9 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
       "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
   },
   {
-    id: "qwen2.5-7b-instruct-mlx",
-    capability: "planner-llm",
-    label: "Qwen 2.5 7B Instruct (MLX 4-bit)",
-    hfRepo: "mlx-community/Qwen2.5-7B-Instruct-4bit",
-    // MLX models are distributed as a repo snapshot (multiple weight shards + config).
-    // fileName is intentionally empty; the download engine must handle repo-style
-    // downloads (all files in the repo) in a future pass. For v1, downloadUrl
-    // points to the HF repo root page; actual automated multi-file download is
-    // out of D2 scope and clearly noted in the UI.
-    fileName: "",
-    format: "mlx",
-    sizeBytes: Math.round(4.3 * GiB),
-    sha256: null,
-    minRamGb: 8,
-    requiresAppleSilicon: true,
-    runtimeTarget: "mlx",
-    searchAliases: ["qwen", "mlx", "apple silicon", "metal", "text", "planner", "fast", "offline"],
-    recommended: false,
-    lifecycleStatus: "compatibility",
-    sourceEvidence: [
-      {
-        label: "Qwen official Qwen3-8B model card",
-        url: "https://huggingface.co/Qwen/Qwen3-8B",
-        lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
-      },
-      {
-        label: "Current MLX compatibility repo used by this catalog",
-        url: "https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit",
-        lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
-      },
-    ],
-    freshnessExpiresAt: "2026-08-02",
-    freshnessNote:
-      "MLX Qwen2.5 remains a compatibility row. It is hidden from the main model hub because Qwen3.6 MLX rows are current.",
-    useCaseTags: ["text", "apple-silicon", "fast"],
-    speedTier: "fast",
-    offlineReady: true,
-    downloadUrl: "https://huggingface.co/mlx-community/Qwen2.5-7B-Instruct-4bit",
-  },
-  {
     id: "llama-3.2-3b-instruct-q4",
+    sourceUrl: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "planner-llm",
     label: "Llama 3.2 3B Instruct (Q4)",
     hfRepo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
@@ -407,11 +321,10 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
     runtimeTarget: "llama-cpp",
     searchAliases: ["llama", "small", "fast", "low ram", "4gb", "text", "planner", "gguf", "offline"],
     recommended: false,
-    lifecycleStatus: "compatibility",
     sourceEvidence: [
       {
-        label: "Meta Llama official Hugging Face organization",
-        url: "https://huggingface.co/meta-llama/models",
+        label: "Meta official Llama-3.2-3B-Instruct model card",
+        url: "https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct",
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
       {
@@ -420,9 +333,9 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
-      "Llama 3.2 3B is a low-RAM compatibility path. It is hidden from the main model hub because Llama 4 is the current Meta generation.",
+      "Supported low-memory llama.cpp option for machines where larger planner models do not fit.",
     useCaseTags: ["text", "low-ram", "fast"],
     speedTier: "fast",
     offlineReady: true,
@@ -431,6 +344,8 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
   },
   {
     id: "flux1-schnell-q4",
+    sourceUrl: "https://huggingface.co/second-state/FLUX.1-schnell-GGUF",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "image-gen",
     label: "FLUX.1 Schnell (Q4 + companions)",
     hfRepo: "second-state/FLUX.1-schnell-GGUF",
@@ -447,11 +362,10 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
     runtimeTarget: "sd-cpp",
     searchAliases: ["flux", "image", "generation", "quality", "creator", "object", "schnell", "offline"],
     recommended: false,
-    lifecycleStatus: "compatibility",
     sourceEvidence: [
       {
-        label: "Black Forest Labs official FLUX.2-dev model card",
-        url: "https://huggingface.co/black-forest-labs/FLUX.2-dev",
+        label: "Black Forest Labs official FLUX.1-schnell model card",
+        url: "https://huggingface.co/black-forest-labs/FLUX.1-schnell",
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
       {
@@ -460,9 +374,9 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
-      "FLUX.1 Schnell GGUF is retained only for installed compatibility. FLUX.2 is the current visible catalog row.",
+      "Supported faster image-generation kit for machines that cannot fit the FLUX.2 row.",
     useCaseTags: ["image", "quality", "object"],
     speedTier: "quality",
     offlineReady: true,
@@ -494,6 +408,8 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
   },
   {
     id: "sdxl-base-1.0",
+    sourceUrl: "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "image-gen",
     label: "SDXL Base 1.0",
     hfRepo: "stabilityai/stable-diffusion-xl-base-1.0",
@@ -506,7 +422,6 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
     runtimeTarget: "sd-cpp",
     searchAliases: ["sdxl", "image", "generation", "quality", "stable diffusion", "offline"],
     recommended: false,
-    lifecycleStatus: "legacy",
     sourceEvidence: [
       {
         label: "Stability AI SDXL Base 1.0 model card",
@@ -514,9 +429,9 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
-      "SDXL Base 1.0 is a stable legacy baseline for compatibility and style coverage, not a current recommendation.",
+      "Supported SDXL baseline for broad style coverage and lower memory requirements than FLUX.2.",
     useCaseTags: ["image", "quality", "stable"],
     speedTier: "quality",
     offlineReady: true,
@@ -525,6 +440,8 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
   },
   {
     id: "sd15-emaonly",
+    sourceUrl: "https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive",
+    checkedAt: MODEL_FRESHNESS_BASELINE,
     capability: "image-gen",
     label: "Stable Diffusion 1.5 (ema-only fp16)",
     hfRepo: "Comfy-Org/stable-diffusion-v1-5-archive",
@@ -537,7 +454,6 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
     runtimeTarget: "sd-cpp",
     searchAliases: ["sd15", "stable diffusion", "image", "fast", "low ram", "safetensors", "offline"],
     recommended: false,
-    lifecycleStatus: "legacy",
     sourceEvidence: [
       {
         label: "Comfy archive of Stable Diffusion 1.5 safetensors",
@@ -545,9 +461,9 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
         lastVerifiedAt: MODEL_FRESHNESS_BASELINE,
       },
     ],
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-22",
     freshnessNote:
-      "Stable Diffusion 1.5 is retained only for low-memory legacy compatibility.",
+      "Supported low-memory Stable Diffusion option for hardware where larger image models do not fit.",
     useCaseTags: ["image", "low-ram", "fast"],
     speedTier: "fast",
     offlineReady: true,
@@ -555,17 +471,6 @@ export const HF_COMPATIBILITY_MODEL_CATALOG = [
       "https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors",
   },
 ] as const satisfies HfModelEntry[];
-
-export const HF_MODEL_REGISTRY = [
-  ...HF_MODEL_CATALOG,
-  ...HF_COMPATIBILITY_MODEL_CATALOG,
-] as const satisfies HfModelEntry[];
-
-export function listFirstRunImageModelEntries(): HfModelEntry[] {
-  return (HF_COMPATIBILITY_MODEL_CATALOG as readonly HfModelEntry[]).filter(
-    (entry) => entry.capability === "image-gen" && entry.lifecycleStatus !== "planned",
-  );
-}
 
 export type ModelRunnableState =
   | "not_downloaded"
@@ -610,7 +515,7 @@ export function modelRunnableState(
 
 /** Lookup by id — returns undefined for unknown ids. */
 export function findHfModelEntry(id: string): HfModelEntry | undefined {
-  return HF_MODEL_REGISTRY.find((entry) => entry.id === id);
+  return HF_MODEL_CATALOG.find((entry) => entry.id === id);
 }
 
 type HardwareFitInput = Pick<HardwareInfo, "ram_gb" | "apple_silicon"> | null;
@@ -618,32 +523,8 @@ type HardwareFitInput = Pick<HardwareInfo, "ram_gb" | "apple_silicon"> | null;
 /**
  * Single source of "does this model fit the machine" truth. Treats a
  * present-but-unknown runtime as available so a not-yet-downloaded model is
- * judged purely on hardware. Shared by the catalog fallback logic here and the
- * Local Models panel's fit/compat checks (via catalog-utils).
+ * judged purely on hardware. Shared by the Local Models panel's fit checks.
  */
 export function fitsHardware(entry: HfModelEntry, hw: HardwareFitInput): boolean {
   return modelRunnableState(entry, hw, true, true) !== "hardware_unfit";
-}
-
-/** True when at least one current (flagship) catalog model fits this hardware. */
-export function hasFlagshipModelForHardware(hw: HardwareFitInput): boolean {
-  return (HF_MODEL_CATALOG as readonly HfModelEntry[]).some((entry) => fitsHardware(entry, hw));
-}
-
-/**
- * When NO flagship model fits the machine's RAM, surface up to `limit`
- * hardware-fit compatibility candidates (text planner first) so a low-spec
- * first run still has at least one installable model instead of an empty list.
- * Returns [] when a flagship already fits (the user picks from the current
- * catalog) or while hardware is unknown (`hw === null` fits everything).
- */
-export function compatibilityFallbackForHardware(
-  hw: HardwareFitInput,
-  limit = 2,
-): HfModelEntry[] {
-  if (hasFlagshipModelForHardware(hw)) return [];
-  return (HF_COMPATIBILITY_MODEL_CATALOG as readonly HfModelEntry[])
-    .filter((entry) => fitsHardware(entry, hw))
-    .sort((a, b) => Number(b.capability === "planner-llm") - Number(a.capability === "planner-llm"))
-    .slice(0, limit);
 }
