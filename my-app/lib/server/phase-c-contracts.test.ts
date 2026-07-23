@@ -4,12 +4,20 @@ vi.mock("server-only", () => ({}));
 
 import { parseRequestedAspectRatio } from "@/lib/server/byok-shared";
 import {
+  assertGenerationParametersSupported,
   assertReferenceLimit,
+  buildRequestFingerprint,
+  effectiveGenerationParameters,
   parseGenerationParameters,
   parseRequestedImageCount,
 } from "@/lib/server/generate-request";
 import { clampBboxToImage } from "@/lib/server/image-compose";
 import { ApiError } from "@/lib/server/errors";
+import {
+  ALL_ADVANCED_IMAGE_PARAMETERS,
+  NO_ADVANCED_IMAGE_PARAMETERS,
+  byokImageAdvancedParameters,
+} from "@/lib/image-models";
 
 describe("parseRequestedAspectRatio (#5)", () => {
   it("accepts supported ratios and passes them through", () => {
@@ -96,6 +104,55 @@ describe("parseGenerationParameters", () => {
       formData.set(field, value);
       expect(() => parseGenerationParameters(formData)).toThrow(ApiError);
     }
+  });
+});
+
+describe("advanced generation parameter capabilities", () => {
+  const parameters = {
+    seed: 4242,
+    steps: 28,
+    cfg: 5.5,
+    negativePrompt: "blur",
+  };
+
+  it("rejects unsupported fields for OpenAI before fingerprinting", () => {
+    expect(() =>
+      assertGenerationParametersSupported(parameters, NO_ADVANCED_IMAGE_PARAMETERS),
+    ).toThrow(ApiError);
+    try {
+      assertGenerationParametersSupported(parameters, NO_ADVANCED_IMAGE_PARAMETERS);
+    } catch (error) {
+      expect((error as ApiError).status).toBe(400);
+      expect((error as ApiError).code).toBe("invalid_generation_parameter");
+    }
+  });
+
+  it("accepts full local/PuLID fields and strips fields absent from seed-only records", () => {
+    expect(() =>
+      assertGenerationParametersSupported(parameters, ALL_ADVANCED_IMAGE_PARAMETERS),
+    ).not.toThrow();
+    expect(() =>
+      assertGenerationParametersSupported(
+        parameters,
+        byokImageAdvancedParameters("fal", "fal-ai/flux-pulid"),
+      ),
+    ).not.toThrow();
+
+    const seedOnly = byokImageAdvancedParameters(
+      "replicate",
+      "black-forest-labs/flux-2-pro",
+    );
+    expect(() => assertGenerationParametersSupported(parameters, seedOnly)).toThrow(ApiError);
+    expect(effectiveGenerationParameters(parameters, seedOnly)).toEqual({ seed: 4242 });
+  });
+
+  it("keeps fingerprints equal when ignored unsupported fields are dropped", () => {
+    const capabilities = NO_ADVANCED_IMAGE_PARAMETERS;
+    const withIgnored = effectiveGenerationParameters(parameters, capabilities);
+    const without = effectiveGenerationParameters({}, capabilities);
+    expect(buildRequestFingerprint({ generationParameters: withIgnored })).toBe(
+      buildRequestFingerprint({ generationParameters: without }),
+    );
   });
 });
 

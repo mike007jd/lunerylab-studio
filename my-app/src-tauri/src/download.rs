@@ -6,7 +6,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::State;
 use tokio::io::AsyncWriteExt;
 
 use crate::get_http_client;
@@ -29,6 +28,9 @@ pub(crate) struct DownloadJob {
     pub(crate) received: u64,
     pub(crate) total: u64,
     pub(crate) error: Option<String>,
+    destination: PathBuf,
+    owns_destination: bool,
+    finished_at: Option<Instant>,
     pub(crate) cancel: Arc<AtomicBool>,
     /// Broadcast channel sender — SSE bridge subscribers drain from a receiver.
     pub(crate) tx: tokio::sync::broadcast::Sender<JobSnapshot>,
@@ -49,6 +51,9 @@ impl DownloadJob {
 /// bridge handler threads so the SSE path can drain progress from the same store.
 #[derive(Default)]
 pub struct DownloadState(pub(crate) Mutex<HashMap<String, DownloadJob>>);
+
+const TERMINAL_HISTORY_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_TERMINAL_HISTORY: usize = 128;
 
 /// Synchronous entry point for starting a download job — called from the bridge
 /// handler. Validates state, inserts the job record, then spawns an async task
@@ -92,17 +97,23 @@ pub(crate) fn hf_download_start_inner(
     }
 
     // Create destination parent directory.
-    if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Could not create model directory: {err}"))?;
-        let root = canonical_models_root_for_path(&dest_path)?;
-        let parent_canon = parent
-            .canonicalize()
-            .map_err(|err| format!("Could not verify model directory: {err}"))?;
-        if !parent_canon.starts_with(&root) {
-            return Err("Download destination escapes the model directory".to_string());
-        }
+    let parent = dest_path
+        .parent()
+        .ok_or_else(|| "Download destination must include a parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not create model directory: {err}"))?;
+    let root = canonical_models_root_for_path(&dest_path)?;
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|err| format!("Could not verify model directory: {err}"))?;
+    if !parent_canon.starts_with(&root) {
+        return Err("Download destination escapes the model directory".to_string());
     }
+    let destination = parent_canon.join(
+        dest_path
+            .file_name()
+            .ok_or_else(|| "Download destination must point to a file".to_string())?,
+    );
 
     // Set up a broadcast channel for SSE progress ticks (capacity 64 frames).
     let (tx, _) = tokio::sync::broadcast::channel::<JobSnapshot>(64);
@@ -113,45 +124,96 @@ pub(crate) fn hf_download_start_inner(
             .0
             .lock()
             .map_err(|_| "Download state lock poisoned".to_string())?;
-        // E1: Sweep terminal jobs before inserting to bound HashMap growth.
-        // Only "ready", "error", and "canceled" are swept — active ("queued",
-        // "downloading") and any cancel-flagged in-flight jobs are left intact.
-        // Done here (not on terminal transition) so post-completion status/SSE
-        // reads for the just-finished job are never affected.
-        guard.retain(|_, job| !matches!(job.status.as_str(), "ready" | "error" | "canceled"));
-        if let Some(existing) = guard.get(&job_id) {
-            if existing.status == "downloading" {
-                return Err("Job already in progress".to_string());
-            }
-        }
-        guard.insert(
-            job_id.clone(),
-            DownloadJob {
-                status: "queued".to_string(),
-                received: 0,
-                total: 0,
-                error: None,
-                cancel: Arc::clone(&cancel),
-                tx: tx.clone(),
-            },
-        );
+        reserve_download_job(
+            &mut guard,
+            &job_id,
+            destination,
+            Arc::clone(&cancel),
+            tx.clone(),
+        )?;
     }
 
     let state_clone = Arc::clone(&state);
     tauri::async_runtime::spawn(async move {
-        run_download_task(
+        run_download_task(DownloadTask {
             url,
             dest,
             part_path,
             sha256,
             job_id,
-            state_clone,
+            state: state_clone,
             tx,
             cancel,
-        )
+        })
         .await;
     });
 
+    Ok(())
+}
+
+fn is_terminal_download_status(status: &str) -> bool {
+    matches!(status, "ready" | "error" | "canceled")
+}
+
+fn prune_download_history(jobs: &mut HashMap<String, DownloadJob>, now: Instant) {
+    jobs.retain(|_, job| {
+        job.owns_destination
+            || job
+                .finished_at
+                .map(|finished| now.saturating_duration_since(finished) <= TERMINAL_HISTORY_TTL)
+                .unwrap_or(true)
+    });
+
+    let mut terminal = jobs
+        .iter()
+        .filter(|(_, job)| !job.owns_destination)
+        .map(|(job_id, job)| (job_id.clone(), job.finished_at.unwrap_or(now)))
+        .collect::<Vec<_>>();
+    if terminal.len() <= MAX_TERMINAL_HISTORY {
+        return;
+    }
+    terminal.sort_by_key(|(_, finished_at)| *finished_at);
+    let remove_count = terminal.len() - MAX_TERMINAL_HISTORY;
+    for (job_id, _) in terminal.into_iter().take(remove_count) {
+        jobs.remove(&job_id);
+    }
+}
+
+fn reserve_download_job(
+    jobs: &mut HashMap<String, DownloadJob>,
+    job_id: &str,
+    destination: PathBuf,
+    cancel: Arc<AtomicBool>,
+    tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+) -> Result<(), String> {
+    prune_download_history(jobs, Instant::now());
+    if jobs
+        .get(job_id)
+        .map(|job| job.owns_destination)
+        .unwrap_or(false)
+    {
+        return Err("Job already in progress".to_string());
+    }
+    if jobs
+        .values()
+        .any(|job| job.owns_destination && job.destination == destination)
+    {
+        return Err("Download destination already has an active job".to_string());
+    }
+    jobs.insert(
+        job_id.to_string(),
+        DownloadJob {
+            status: "queued".to_string(),
+            received: 0,
+            total: 0,
+            error: None,
+            destination,
+            owns_destination: true,
+            finished_at: None,
+            cancel,
+            tx,
+        },
+    );
     Ok(())
 }
 
@@ -286,7 +348,7 @@ pub(crate) fn validate_hf_download_dest(value: &str) -> Result<PathBuf, String> 
 
 /// Core async download task — streams response body to a `.part` file with
 /// resume support (Range header), optional SHA-256 verification, and cancel.
-async fn run_download_task(
+struct DownloadTask {
     url: String,
     dest: String,
     part_path: PathBuf,
@@ -295,7 +357,19 @@ async fn run_download_task(
     state: Arc<DownloadState>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
     cancel: Arc<AtomicBool>,
-) {
+}
+
+async fn run_download_task(task: DownloadTask) {
+    let DownloadTask {
+        url,
+        dest,
+        part_path,
+        sha256,
+        job_id,
+        state,
+        tx,
+        cancel,
+    } = task;
     let dest_path = PathBuf::from(&dest);
     if dest_path.is_file() {
         let existing_dest_bytes = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -304,51 +378,51 @@ async fn run_download_task(
         } else {
             None
         };
-        if sha256.is_some() || linked_etag.is_some() {
-            match sha256_file_from_disk(&dest_path).await {
-                Ok(actual)
-                    if compare_download_hashes(
-                        &actual,
-                        sha256.as_deref(),
-                        linked_etag.as_deref(),
-                    )
-                    .is_ok() =>
-                {
-                    update_job_status(
-                        &state,
-                        &job_id,
-                        &tx,
-                        "ready",
-                        existing_dest_bytes,
-                        existing_dest_bytes,
-                        None,
-                    );
-                    return;
-                }
-                Ok(_) => {
-                    let _ = tokio::fs::remove_file(&dest_path).await;
-                }
-                Err(err) => {
-                    set_job_error(
-                        &state,
-                        &job_id,
-                        &tx,
-                        &format!("Could not verify existing file: {err}"),
-                    );
-                    return;
-                }
-            }
-        } else {
-            update_job_status(
+        if sha256.is_none() && linked_etag.is_none() {
+            set_job_error(
                 &state,
                 &job_id,
                 &tx,
-                "ready",
-                existing_dest_bytes,
-                existing_dest_bytes,
-                None,
+                "Existing model file cannot be trusted because no SHA-256 or HF x-linked-etag is available.",
             );
             return;
+        }
+        match sha256_file_from_disk(&dest_path).await {
+            Ok(actual) => {
+                match compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref()) {
+                    Ok(()) => {
+                        update_job_status(
+                            &state,
+                            &job_id,
+                            &tx,
+                            "ready",
+                            existing_dest_bytes,
+                            existing_dest_bytes,
+                            None,
+                        );
+                        return;
+                    }
+                    Err(message) => {
+                        let message = cleanup_failed_download(
+                            &dest_path,
+                            &message,
+                            "Untrusted destination file",
+                        )
+                        .await;
+                        set_job_error(&state, &job_id, &tx, &message);
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                set_job_error(
+                    &state,
+                    &job_id,
+                    &tx,
+                    &format!("Could not verify existing file: {err}"),
+                );
+                return;
+            }
         }
     }
 
@@ -440,28 +514,18 @@ async fn run_download_task(
                 let actual = match sha256_file_from_disk(&part_path).await {
                     Ok(digest) => digest,
                     Err(err) => {
-                        let _ = tokio::fs::remove_file(&part_path).await;
-                        set_job_error(
-                            &state,
-                            &job_id,
-                            &tx,
-                            &format!(
-                                "Could not verify completed partial download: {err}. Part file removed."
-                            ),
-                        );
+                        let primary = format!("Could not verify completed partial download: {err}");
+                        let message =
+                            cleanup_failed_download(&part_path, &primary, "Part file").await;
+                        set_job_error(&state, &job_id, &tx, &message);
                         return;
                     }
                 };
                 if let Err(message) =
                     compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref())
                 {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    set_job_error(
-                        &state,
-                        &job_id,
-                        &tx,
-                        &format!("{message}. Part file removed."),
-                    );
+                    let message = cleanup_failed_download(&part_path, &message, "Part file").await;
+                    set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
                 if let Err(err) = tokio::fs::rename(&part_path, &dest).await {
@@ -485,15 +549,11 @@ async fn run_download_task(
                 return;
             }
             PartialDownloadState::Oversized => {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                set_job_error(
-                    &state,
-                    &job_id,
-                    &tx,
-                    &format!(
-                        "Partial download is larger than the remote file ({existing_bytes} > {remote_total}). Part file removed; retry the download."
-                    ),
+                let primary = format!(
+                    "Partial download is larger than the remote file ({existing_bytes} > {remote_total})"
                 );
+                let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                set_job_error(&state, &job_id, &tx, &message);
                 return;
             }
             PartialDownloadState::Incomplete => {
@@ -524,6 +584,15 @@ async fn run_download_task(
     let mut linked_etag = linked_etag_from_headers(response.headers());
     if linked_etag.is_none() && sha256.is_none() {
         linked_etag = fetch_hf_linked_etag(&url).await.ok().flatten();
+    }
+    if sha256.is_none() && linked_etag.is_none() {
+        set_job_error(
+            &state,
+            &job_id,
+            &tx,
+            "Download cannot be verified because no SHA-256 or HF x-linked-etag is available.",
+        );
+        return;
     }
 
     // Determine whether this is a genuine resume (206) or a full-body response (200).
@@ -653,13 +722,10 @@ async fn run_download_task(
     loop {
         if cancel.load(Ordering::Relaxed) {
             if let Err(err) = file.flush().await {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                set_job_error(
-                    &state,
-                    &job_id,
-                    &tx,
-                    &format!("Could not preserve canceled partial download: {err}"),
-                );
+                let primary = format!("Could not preserve canceled partial download: {err}");
+                drop(file);
+                let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                set_job_error(&state, &job_id, &tx, &message);
                 return;
             }
             update_job_status(&state, &job_id, &tx, "canceled", received, total, None);
@@ -671,8 +737,10 @@ async fn run_download_task(
             Some(Ok(chunk)) => {
                 // chunk is bytes::Bytes (owned, Sized)
                 if let Err(err) = file.write_all(chunk.as_ref()).await {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    set_job_error(&state, &job_id, &tx, &format!("Write error: {err}"));
+                    let primary = format!("Write error: {err}");
+                    drop(file);
+                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
                 received += chunk.len() as u64;
@@ -687,15 +755,12 @@ async fn run_download_task(
             }
             Some(Err(ref err)) => {
                 if let Err(flush_err) = file.flush().await {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    set_job_error(
-                        &state,
-                        &job_id,
-                        &tx,
-                        &format!(
-                            "Stream error: {err}. Partial download could not be preserved: {flush_err}"
-                        ),
+                    let primary = format!(
+                        "Stream error: {err}. Partial download could not be preserved: {flush_err}"
                     );
+                    drop(file);
+                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
                 update_job_status(
@@ -717,8 +782,10 @@ async fn run_download_task(
 
     // Flush and close the file.
     if let Err(err) = file.flush().await {
-        let _ = tokio::fs::remove_file(&part_path).await;
-        set_job_error(&state, &job_id, &tx, &format!("Flush error: {err}"));
+        let primary = format!("Flush error: {err}");
+        drop(file);
+        let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+        set_job_error(&state, &job_id, &tx, &message);
         return;
     }
     drop(file);
@@ -742,13 +809,9 @@ async fn run_download_task(
             None => match sha256_file_from_disk(&part_path).await {
                 Ok(digest) => digest,
                 Err(err) => {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    set_job_error(
-                        &state,
-                        &job_id,
-                        &tx,
-                        &format!("Could not verify download integrity: {err}. Part file removed."),
-                    );
+                    let primary = format!("Could not verify download integrity: {err}");
+                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
             },
@@ -756,13 +819,8 @@ async fn run_download_task(
         if let Err(message) =
             compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref())
         {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            set_job_error(
-                &state,
-                &job_id,
-                &tx,
-                &format!("{message}. Part file removed."),
-            );
+            let message = cleanup_failed_download(&part_path, &message, "Part file").await;
+            set_job_error(&state, &job_id, &tx, &message);
             return;
         }
     }
@@ -877,6 +935,12 @@ fn compare_download_hashes(
     sha256: Option<&str>,
     linked_etag: Option<&str>,
 ) -> Result<(), String> {
+    if sha256.is_none() && linked_etag.is_none() {
+        return Err(
+            "Download cannot be verified because no SHA-256 or HF x-linked-etag is available"
+                .to_string(),
+        );
+    }
     if let Some(expected) = sha256 {
         let expected_lc = expected.to_ascii_lowercase();
         if actual != expected_lc {
@@ -893,6 +957,24 @@ fn compare_download_hashes(
         }
     }
     Ok(())
+}
+
+fn cleanup_result_message(
+    primary: &str,
+    label: &str,
+    result: Result<(), std::io::Error>,
+) -> String {
+    match result {
+        Ok(()) => format!("{primary}. {label} removed."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!("{primary}. {label} was already absent.")
+        }
+        Err(error) => format!("{primary}. Could not remove {label}: {error}"),
+    }
+}
+
+async fn cleanup_failed_download(path: &Path, primary: &str, label: &str) -> String {
+    cleanup_result_message(primary, label, tokio::fs::remove_file(path).await)
 }
 
 pub(crate) fn update_job_status(
@@ -916,6 +998,10 @@ pub(crate) fn update_job_status(
             job.received = received;
             job.total = total;
             job.error = error;
+            if is_terminal_download_status(status) {
+                job.owns_destination = false;
+                job.finished_at = Some(Instant::now());
+            }
         }
     }
     // Broadcast — ignore send errors (no active SSE subscriber is fine).
@@ -931,76 +1017,13 @@ pub(crate) fn set_job_error(
     update_job_status(state, job_id, tx, "error", 0, 0, Some(message.to_string()));
 }
 
-/// Tauri command wrapper for starting a download (direct IPC path).
-#[tauri::command]
-pub(crate) async fn hf_download_start(
-    url: String,
-    dest: String,
-    sha256: Option<String>,
-    job_id: String,
-    state: State<'_, Arc<DownloadState>>,
-) -> Result<(), String> {
-    hf_download_start_inner(url, dest, sha256, job_id, Arc::clone(&state))
-}
-
-#[tauri::command]
-pub(crate) fn hf_download_cancel(job_id: String, state: State<'_, Arc<DownloadState>>) {
-    if let Ok(guard) = state.0.lock() {
-        if let Some(job) = guard.get(&job_id) {
-            job.cancel.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-#[tauri::command]
-pub(crate) fn hf_download_status(
-    job_id: String,
-    state: State<'_, Arc<DownloadState>>,
-) -> serde_json::Value {
-    state
-        .0
-        .lock()
-        .ok()
-        .and_then(|guard| {
-            guard
-                .get(&job_id)
-                .map(|job| serde_json::to_value(job.snapshot()).ok())
-        })
-        .flatten()
-        .unwrap_or_else(
-            || serde_json::json!({ "status": "unknown", "received": 0, "total": 0, "error": null }),
-        )
-}
-
-#[tauri::command]
-pub(crate) fn hf_download_list(state: State<'_, Arc<DownloadState>>) -> serde_json::Value {
-    let jobs: Vec<serde_json::Value> = state
-        .0
-        .lock()
-        .map(|guard| {
-            guard
-                .iter()
-                .map(|(id, job)| {
-                    serde_json::json!({
-                        "jobId": id,
-                        "status": job.status,
-                        "received": job.received,
-                        "total": job.total,
-                        "error": job.error,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    serde_json::json!({ "jobs": jobs })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_partial_download, linked_etag_from_headers, parse_content_range_total,
-        run_download_task, sha256_file_from_disk, validate_hf_download_dest, DownloadJob,
-        DownloadState, PartialDownloadState,
+        classify_partial_download, cleanup_result_message, compare_download_hashes,
+        linked_etag_from_headers, parse_content_range_total, reserve_download_job,
+        run_download_task, sha256_file_from_disk, update_job_status, validate_hf_download_dest,
+        DownloadJob, DownloadState, DownloadTask, PartialDownloadState, MAX_TERMINAL_HISTORY,
     };
     use crate::test_global_lock;
     use reqwest::header::{HeaderMap, HeaderValue};
@@ -1128,6 +1151,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verification_requires_a_trusted_digest() {
+        let actual = "b338a7ab5c81600a54be46c4cf950edb3761a52ae163e419beafd250976fb566";
+        assert!(compare_download_hashes(actual, None, None)
+            .expect_err("missing digest must fail closed")
+            .contains("cannot be verified"));
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_the_primary_integrity_error() {
+        let message = cleanup_result_message(
+            "SHA-256 mismatch",
+            "Part file",
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cleanup denied",
+            )),
+        );
+        assert!(message.starts_with("SHA-256 mismatch."));
+        assert!(message.contains("Could not remove Part file"));
+        assert!(!message.contains("Part file removed"));
+    }
+
+    #[test]
+    fn active_destination_is_exclusive_until_every_terminal_state() {
+        for terminal in ["ready", "error", "canceled"] {
+            let destination = unique_test_path("owned-download.gguf");
+            let state = Arc::new(DownloadState::default());
+            let (first_tx, _) = tokio::sync::broadcast::channel(2);
+            {
+                let mut jobs = state.0.lock().expect("download state lock");
+                reserve_download_job(
+                    &mut jobs,
+                    "first",
+                    destination.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    first_tx.clone(),
+                )
+                .expect("first reservation should succeed");
+            }
+
+            let (blocked_tx, _) = tokio::sync::broadcast::channel(2);
+            let blocked = {
+                let mut jobs = state.0.lock().expect("download state lock");
+                reserve_download_job(
+                    &mut jobs,
+                    "second",
+                    destination.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    blocked_tx,
+                )
+                .expect_err("same active destination must be rejected")
+            };
+            assert!(blocked.contains("active job"));
+
+            update_job_status(&state, "first", &first_tx, terminal, 10, 10, None);
+            let (released_tx, _) = tokio::sync::broadcast::channel(2);
+            let mut jobs = state.0.lock().expect("download state lock");
+            assert_eq!(
+                jobs.get("first").expect("terminal history remains").status,
+                terminal
+            );
+            reserve_download_job(
+                &mut jobs,
+                "second",
+                destination,
+                Arc::new(AtomicBool::new(false)),
+                released_tx,
+            )
+            .expect("terminal job should release destination ownership");
+            assert!(jobs.contains_key("first"), "completion stays observable");
+        }
+    }
+
+    #[test]
+    fn terminal_download_history_is_bounded() {
+        let state = Arc::new(DownloadState::default());
+        for index in 0..(MAX_TERMINAL_HISTORY + 10) {
+            let job_id = format!("terminal-{index}");
+            let (tx, _) = tokio::sync::broadcast::channel(2);
+            {
+                let mut jobs = state.0.lock().expect("download state lock");
+                reserve_download_job(
+                    &mut jobs,
+                    &job_id,
+                    unique_test_path(&format!("terminal-{index}.gguf")),
+                    Arc::new(AtomicBool::new(false)),
+                    tx.clone(),
+                )
+                .expect("reserve terminal fixture");
+            }
+            update_job_status(&state, &job_id, &tx, "ready", 1, 1, None);
+        }
+
+        let (active_tx, _) = tokio::sync::broadcast::channel(2);
+        let mut jobs = state.0.lock().expect("download state lock");
+        reserve_download_job(
+            &mut jobs,
+            "active",
+            unique_test_path("active-history-bound.gguf"),
+            Arc::new(AtomicBool::new(false)),
+            active_tx,
+        )
+        .expect("trigger terminal history pruning");
+        assert!(jobs.contains_key("active"));
+        assert!(jobs.values().filter(|job| !job.owns_destination).count() <= MAX_TERMINAL_HISTORY);
+    }
+
     #[tokio::test]
     async fn existing_complete_dest_marks_ready_without_network() {
         let dest_path = unique_test_path("complete-dest.bin");
@@ -1151,22 +1282,25 @@ mod tests {
                     received: 0,
                     total: 0,
                     error: None,
+                    destination: dest_path.clone(),
+                    owns_destination: true,
+                    finished_at: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
             );
         }
 
-        run_download_task(
-            "https://huggingface.co/org/repo/resolve/main/model.gguf".to_string(),
-            dest_path.to_string_lossy().to_string(),
-            part_path.clone(),
-            Some(sha),
-            job_id.clone(),
-            Arc::clone(&state),
+        run_download_task(DownloadTask {
+            url: "https://huggingface.co/org/repo/resolve/main/model.gguf".to_string(),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path: part_path.clone(),
+            sha256: Some(sha),
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
             tx,
             cancel,
-        )
+        })
         .await;
 
         let snapshot = {
@@ -1184,6 +1318,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_dest_without_trusted_digest_never_marks_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("read test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept metadata request");
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write metadata response");
+        });
+
+        let dest_path = unique_test_path("unverified-existing.bin");
+        let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.to_string_lossy()));
+        tokio::fs::write(&dest_path, b"unverified")
+            .await
+            .expect("write existing dest");
+        let state = Arc::new(DownloadState::default());
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job_id = "existing-unverified-dest".to_string();
+        {
+            let mut guard = state.0.lock().expect("download state lock");
+            guard.insert(
+                job_id.clone(),
+                DownloadJob {
+                    status: "queued".to_string(),
+                    received: 0,
+                    total: 0,
+                    error: None,
+                    destination: dest_path.clone(),
+                    owns_destination: true,
+                    finished_at: None,
+                    cancel: Arc::clone(&cancel),
+                    tx: tx.clone(),
+                },
+            );
+        }
+
+        run_download_task(DownloadTask {
+            url: format!("http://{addr}/model.bin"),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path: part_path.clone(),
+            sha256: None,
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
+            tx,
+            cancel,
+        })
+        .await;
+        server.join().expect("metadata server should finish");
+
+        let snapshot = {
+            let guard = state.0.lock().expect("download state lock");
+            guard.get(&job_id).expect("job should exist").snapshot()
+        };
+        assert_eq!(snapshot.status, "error");
+        assert!(snapshot
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cannot be trusted"));
+        assert!(
+            dest_path.exists(),
+            "unverified existing file is not trusted or overwritten"
+        );
+        assert!(!part_path.exists());
+
+        let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[tokio::test]
+    async fn existing_dest_hash_mismatch_fails_closed_and_removes_untrusted_file() {
+        let dest_path = unique_test_path("mismatched-existing.bin");
+        let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.to_string_lossy()));
+        tokio::fs::write(&dest_path, b"corrupt")
+            .await
+            .expect("write existing dest");
+        let state = Arc::new(DownloadState::default());
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job_id = "existing-mismatched-dest".to_string();
+        {
+            let mut guard = state.0.lock().expect("download state lock");
+            guard.insert(
+                job_id.clone(),
+                DownloadJob {
+                    status: "queued".to_string(),
+                    received: 0,
+                    total: 0,
+                    error: None,
+                    destination: dest_path.clone(),
+                    owns_destination: true,
+                    finished_at: None,
+                    cancel: Arc::clone(&cancel),
+                    tx: tx.clone(),
+                },
+            );
+        }
+
+        run_download_task(DownloadTask {
+            url: "https://huggingface.co/org/repo/resolve/main/model.gguf".to_string(),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path,
+            sha256: Some("0".repeat(64)),
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
+            tx,
+            cancel,
+        })
+        .await;
+
+        let snapshot = {
+            let guard = state.0.lock().expect("download state lock");
+            guard.get(&job_id).expect("job should exist").snapshot()
+        };
+        assert_eq!(snapshot.status, "error");
+        assert!(snapshot
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("SHA-256 mismatch"));
+        assert!(
+            !dest_path.exists(),
+            "hash-mismatched destination must not remain ready"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_error_keeps_partial_file_for_retry() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("read test server address");
@@ -1192,7 +1455,9 @@ mod tests {
             let mut buffer = [0u8; 1024];
             let _ = stream.read(&mut buffer);
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\npartial")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Linked-ETag: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\npartial",
+                )
                 .expect("write truncated response");
         });
 
@@ -1211,22 +1476,25 @@ mod tests {
                     received: 0,
                     total: 0,
                     error: None,
+                    destination: dest_path.clone(),
+                    owns_destination: true,
+                    finished_at: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
             );
         }
 
-        run_download_task(
-            format!("http://{addr}/model.bin"),
-            dest_path.to_string_lossy().to_string(),
-            part_path.clone(),
-            None,
-            job_id.clone(),
-            Arc::clone(&state),
+        run_download_task(DownloadTask {
+            url: format!("http://{addr}/model.bin"),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path: part_path.clone(),
+            sha256: None,
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
             tx,
             cancel,
-        )
+        })
         .await;
         server.join().expect("test server thread should finish");
 

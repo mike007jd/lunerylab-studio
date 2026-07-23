@@ -88,11 +88,10 @@ export function requireDesktopBridge():
  * The raw `fetch` to the local Rust bridge can reject (process down, socket
  * refused, timeout) — left unguarded that rejection crashes the route handler
  * and the client gets an opaque 500 / connection-reset instead of a typed
- * payload. This wrapper turns any transport failure into a controlled
- * "bridge is not available" response (the same shape `requireDesktopBridge`
- * emits when the bridge is absent), so every desktop-runtime route degrades
- * uniformly. Pass `onUnreachable` to customise that payload (e.g. status
- * polling wants `{ available: false }`).
+ * payload. This wrapper distinguishes a timeout from an unreachable bridge so
+ * callers receive a retryable typed error instead of confusing either case
+ * with "desktop mode is absent". Pass `onUnreachable` to customise that
+ * payload (e.g. status polling wants `{ available: false }`).
  *
  * Only use this for short-lived control calls — it applies a hard timeout so
  * a hung bridge never wedges a request indefinitely. Streaming endpoints
@@ -123,11 +122,18 @@ export async function proxyToBridge(
       body: init?.body,
       signal: AbortSignal.timeout(init?.timeoutMs ?? 15000),
     });
-  } catch {
+  } catch (error) {
     if (onUnreachable) return onUnreachable();
+    const timedOut = error instanceof Error && error.name === "TimeoutError";
     return NextResponse.json(
-      { error: "Desktop runtime bridge is not available" },
-      { status: 404 },
+      {
+        error: timedOut
+          ? "Desktop runtime bridge timed out"
+          : "Desktop runtime bridge is unreachable",
+        code: timedOut ? "bridge_timeout" : "bridge_unreachable",
+        retryable: true,
+      },
+      { status: timedOut ? 504 : 503 },
     );
   }
 

@@ -18,10 +18,10 @@ export const metadata: Metadata = {
 export const dynamic = "force-dynamic";
 
 async function getInitialBootstrap(): Promise<BootstrapSnapshot> {
-  const { app, features, providers, providerConnections } = await fetchBootstrapData(
+  const { app, providers, providerConnections } = await fetchBootstrapData(
     LOCAL_WORKSPACE_OWNER.id,
   );
-  return { user: LOCAL_WORKSPACE_OWNER, app, features, providers, providerConnections };
+  return { user: LOCAL_WORKSPACE_OWNER, app, providers, providerConnections };
 }
 
 export default async function ConsoleLayout({ children }: { children: React.ReactNode }) {

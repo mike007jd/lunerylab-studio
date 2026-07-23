@@ -1,8 +1,6 @@
-// Background video job runner. Called via fire-and-forget from API routes /
-// agent runner; on Vercel the caller should wrap this in `waitUntil(...)` so
-// the function instance stays alive long enough for the BYOK video call to
-// complete (typically 1–10 minutes). On Tauri, `waitUntil` is a
-// no-op shim and the Promise simply lives on the Node event loop.
+// Background video job runner. The desktop-local API starts and observes this
+// promise on the long-lived Node process; completion typically takes 1–10
+// minutes, and persisted job state is reconciled by the status endpoint.
 //
 // The backend + model are resolved by the caller (via `resolveVideoRuntime`)
 // and frozen into `input.runtime` at submission time; this runner trusts that

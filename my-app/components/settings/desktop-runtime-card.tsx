@@ -32,6 +32,7 @@ import {
   desktopBridgeDisabledReason,
   draftModelsFromConnection,
   providerMeta,
+  providerSecretSourceLabel,
   removeProviderCredentials,
   runProviderSaveSingleFlight,
   saveProviderConnectionTransaction,
@@ -210,6 +211,7 @@ function DesktopRuntimeCardContent({
             ...provider,
             configured,
             source: nextSource,
+            keychain_status: configured ? "present" : "missing",
           };
         }),
       };
@@ -235,17 +237,10 @@ function DesktopRuntimeCardContent({
         auth: runtime?.auth ?? "API key",
         configured: Boolean(saved && hasRuntimeSecret),
         meta,
-        source:
-          runtime?.source === "environment"
-            ? copy.env
-            : runtime?.source === "system-keychain"
-              ? copy.keychain
-              : !status && savedSecret
-                ? copy.saved
-                : copy.notConnected,
+        source: providerSecretSourceLabel(runtime, Boolean(status), savedSecret, copy),
       };
     });
-  }, [capability, connections, copy.env, copy.keychain, copy.notConnected, copy.saved, runtimeProviderById, status]);
+  }, [capability, connections, copy, runtimeProviderById, status]);
 
   const activeMeta = providerMeta(draftProvider);
   const visibleRoles = useMemo<ByokModelRole[] | undefined>(() => {

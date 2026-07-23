@@ -57,19 +57,17 @@ function compareFirstRunImageModels(a: HubModelEntry, b: HubModelEntry): number 
 export function selectQuickStartImageModels({
   entries,
   installStatuses,
-  activeMlxModel,
   hw,
   limit = 4,
 }: {
   entries: readonly HubModelEntry[];
   installStatuses: InstallStatusMap;
-  activeMlxModel: string | null;
   hw: HardwareInfo | null;
   limit?: number;
 }): HubModelEntry[] {
   const imageEntries = entries.filter((entry) => entry.capability === "image-gen");
   const installedImage = imageEntries.filter(
-    (entry) => installStatuses[entry.id]?.installed || activeMlxModel === entry.hfRepo,
+    (entry) => installStatuses[entry.id]?.installed,
   );
   if (installedImage.length > 0) return installedImage.slice(0, limit);
 
@@ -93,7 +91,6 @@ export function searchText(entry: HubModelEntry): string {
     entry.format,
     entry.runtimeTarget,
     entry.capability,
-    entry.lifecycleStatus,
     entry.freshnessNote,
     entry.speedTier,
     entry.recommended ? "current highlighted" : "",
@@ -110,6 +107,8 @@ export function importedStatusToEntry(status: ModelInstallStatus): HubModelEntry
   const sizeBytes = Math.max(status.totalBytes || 0, status.installedBytes || 0);
   return {
     id: status.id,
+    sourceUrl: status.url ?? status.modelPath ?? "",
+    checkedAt: new Date().toISOString().slice(0, 10),
     label: status.label || fileName,
     hfRepo: "",
     fileName,
@@ -122,7 +121,6 @@ export function importedStatusToEntry(status: ModelInstallStatus): HubModelEntry
     capability: status.capability,
     searchAliases: ["imported", "local", "custom", status.source ?? "", status.modelPath ?? ""],
     recommended: false,
-    lifecycleStatus: "compatibility",
     sourceEvidence: [
       {
         label: status.source === "local-path" ? "User imported local model" : "User imported Hugging Face URL",
@@ -169,7 +167,7 @@ export function writeStoredExternalRuntimes(items: ExternalRuntimeModel[]) {
 }
 
 export function runtimeAvailable(entry: HubModelEntry, runtimes: ReturnType<typeof useDesktopLocalRuntimes>): boolean | undefined {
-  if (entry.runtimeTarget === "llama-cpp" || entry.runtimeTarget === "mlx") return true;
+  if (entry.runtimeTarget === "llama-cpp") return true;
   const runtime = runtimes?.find((item) => item.id === entry.runtimeTarget);
   if (!runtime) return undefined;
   if (entry.runtimeTarget === "sd-cpp") return runtime.status === "ready";
@@ -180,9 +178,7 @@ export function isAccelMatch(entry: HubModelEntry, accel: AccelInfo | null): boo
   if (!accel) return false;
   switch (accel.gpu) {
     case "metal":
-      // MLX always; sd-cpp/llama-cpp also benefit from Metal but the strongest
-      // GPU fit signal is MLX (Apple-Silicon-only weights).
-      return entry.runtimeTarget === "mlx" || entry.requiresAppleSilicon;
+      return entry.requiresAppleSilicon || entry.runtimeTarget === "sd-cpp" || entry.runtimeTarget === "llama-cpp";
     case "cuda":
     case "vulkan":
       // Image kits (sd-cpp) and large LLMs benefit most on discrete GPUs.

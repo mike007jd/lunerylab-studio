@@ -25,6 +25,78 @@ pub(crate) struct ProviderSecretStatus {
     secret_store: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeychainSecretState {
+    Present,
+    Missing,
+    Unavailable,
+}
+
+impl KeychainSecretState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub(crate) fn is_present(self) -> bool {
+        self == Self::Present
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderSecretReadError {
+    InvalidProvider,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderSecretMutationError {
+    InvalidProvider,
+    InvalidSecret,
+    Unavailable,
+}
+
+impl ProviderSecretMutationError {
+    pub(crate) fn public_message(self) -> &'static str {
+        match self {
+            Self::InvalidProvider => "Invalid provider id",
+            Self::InvalidSecret => "API key is required",
+            Self::Unavailable => "System keychain is unavailable",
+        }
+    }
+}
+
+impl Serialize for ProviderSecretMutationError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.public_message())
+    }
+}
+
+impl ProviderSecretReadError {
+    pub(crate) fn audit_reason(self) -> &'static str {
+        match self {
+            Self::InvalidProvider => "invalid_provider",
+            Self::Missing => "missing",
+            Self::Unavailable => "keychain_unavailable",
+        }
+    }
+
+    pub(crate) fn public_message(self) -> &'static str {
+        match self {
+            Self::InvalidProvider => "Invalid provider id",
+            Self::Missing => "Provider secret is not configured",
+            Self::Unavailable => "System keychain is unavailable",
+        }
+    }
+}
+
 pub(crate) fn validate_provider_id(provider_id: &str) -> Result<(), String> {
     let ok = !provider_id.is_empty()
         && provider_id.len() <= 64
@@ -38,10 +110,9 @@ pub(crate) fn validate_provider_id(provider_id: &str) -> Result<(), String> {
     }
 }
 
-pub(crate) fn provider_entry(provider_id: &str) -> Result<Entry, String> {
-    keyring::use_native_store(true).map_err(|err| format!("Keychain unavailable: {err}"))?;
-    Entry::new(KEYCHAIN_SERVICE, provider_id)
-        .map_err(|err| format!("Could not open keychain entry: {err}"))
+pub(crate) fn provider_entry(provider_id: &str) -> Result<Entry, ProviderSecretMutationError> {
+    keyring::use_native_store(true).map_err(|_| ProviderSecretMutationError::Unavailable)?;
+    Entry::new(KEYCHAIN_SERVICE, provider_id).map_err(|_| ProviderSecretMutationError::Unavailable)
 }
 
 /// Sliding-window rate limit shared by the /provider-secret-read endpoint —
@@ -81,29 +152,45 @@ pub(crate) fn audit_secret_read(provider_id: &str, allowed: bool, reason: &str) 
     );
 }
 
-pub(crate) fn has_keychain_secret(provider_id: &str) -> bool {
-    provider_entry(provider_id)
-        .and_then(|entry| entry.get_password().map_err(|err| err.to_string()))
-        .is_ok()
+fn classify_keychain_read_error(error: KeyringError) -> ProviderSecretReadError {
+    match error {
+        KeyringError::NoEntry => ProviderSecretReadError::Missing,
+        _ => ProviderSecretReadError::Unavailable,
+    }
+}
+
+fn classify_keychain_mutation_error(_error: KeyringError) -> ProviderSecretMutationError {
+    ProviderSecretMutationError::Unavailable
+}
+
+pub(crate) fn keychain_secret_state(provider_id: &str) -> KeychainSecretState {
+    let Ok(entry) = provider_entry(provider_id) else {
+        return KeychainSecretState::Unavailable;
+    };
+    match entry.get_password() {
+        Ok(_) => KeychainSecretState::Present,
+        Err(KeyringError::NoEntry) => KeychainSecretState::Missing,
+        Err(_) => KeychainSecretState::Unavailable,
+    }
 }
 
 #[tauri::command]
 pub(crate) fn save_provider_secret(
     payload: ProviderSecretPayload,
-) -> Result<ProviderSecretStatus, String> {
+) -> Result<ProviderSecretStatus, ProviderSecretMutationError> {
     if payload.provider_id.trim().is_empty() {
-        return Err("Provider id is required".to_string());
+        return Err(ProviderSecretMutationError::InvalidProvider);
     }
     if payload.api_key.trim().is_empty() {
-        return Err("API key is required".to_string());
+        return Err(ProviderSecretMutationError::InvalidSecret);
     }
 
     let provider_id = payload.provider_id.trim().to_string();
-    validate_provider_id(&provider_id)?;
+    validate_provider_id(&provider_id).map_err(|_| ProviderSecretMutationError::InvalidProvider)?;
     let entry = provider_entry(&provider_id)?;
     entry
         .set_password(payload.api_key.trim())
-        .map_err(|err| format!("Could not save provider secret: {err}"))?;
+        .map_err(classify_keychain_mutation_error)?;
 
     Ok(ProviderSecretStatus {
         provider_id,
@@ -116,27 +203,27 @@ pub(crate) fn save_provider_secret(
 /// SECURITY: the key is returned to the Rust bridge only and is NEVER logged.
 /// Do not expose this as a Tauri command; `/provider-secret-read` adds token
 /// auth, loopback checks, rate limiting, and audit logs around this helper.
-pub(crate) fn get_provider_secret(payload: ProviderIdPayload) -> Result<String, String> {
+pub(crate) fn get_provider_secret(
+    payload: ProviderIdPayload,
+) -> Result<String, ProviderSecretReadError> {
     let provider_id = payload.provider_id.trim().to_string();
     if provider_id.is_empty() {
-        return Err("Provider id is required".to_string());
+        return Err(ProviderSecretReadError::InvalidProvider);
     }
-    validate_provider_id(&provider_id)?;
-    let entry = provider_entry(&provider_id)?;
-    entry
-        .get_password()
-        .map_err(|err| format!("Could not read provider secret: {err}"))
+    validate_provider_id(&provider_id).map_err(|_| ProviderSecretReadError::InvalidProvider)?;
+    let entry = provider_entry(&provider_id).map_err(|_| ProviderSecretReadError::Unavailable)?;
+    entry.get_password().map_err(classify_keychain_read_error)
 }
 
 #[tauri::command]
 pub(crate) fn delete_provider_secret(
     payload: ProviderIdPayload,
-) -> Result<ProviderSecretStatus, String> {
+) -> Result<ProviderSecretStatus, ProviderSecretMutationError> {
     let provider_id = payload.provider_id.trim().to_string();
     if provider_id.is_empty() {
-        return Err("Provider id is required".to_string());
+        return Err(ProviderSecretMutationError::InvalidProvider);
     }
-    validate_provider_id(&provider_id)?;
+    validate_provider_id(&provider_id).map_err(|_| ProviderSecretMutationError::InvalidProvider)?;
 
     let entry = provider_entry(&provider_id)?;
     match entry.delete_credential() {
@@ -145,6 +232,52 @@ pub(crate) fn delete_provider_secret(
             configured: false,
             secret_store: "system-keychain",
         }),
-        Err(err) => Err(format!("Could not delete provider secret: {err}")),
+        Err(err) => Err(classify_keychain_mutation_error(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        classify_keychain_mutation_error, classify_keychain_read_error,
+        ProviderSecretMutationError, ProviderSecretReadError,
+    };
+    use keyring_core::Error as KeyringError;
+
+    #[test]
+    fn no_entry_is_a_normal_missing_secret() {
+        assert_eq!(
+            classify_keychain_read_error(KeyringError::NoEntry),
+            ProviderSecretReadError::Missing
+        );
+    }
+
+    #[test]
+    fn storage_access_failures_are_unavailable_without_backend_details() {
+        let backend_error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "locked");
+        assert_eq!(
+            classify_keychain_read_error(KeyringError::NoStorageAccess(Box::new(backend_error))),
+            ProviderSecretReadError::Unavailable
+        );
+        assert_eq!(
+            ProviderSecretReadError::Unavailable.public_message(),
+            "System keychain is unavailable"
+        );
+    }
+
+    #[test]
+    fn mutation_failures_are_typed_without_backend_details() {
+        let backend_error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "backend-password-do-not-leak",
+        );
+        let error = classify_keychain_mutation_error(KeyringError::NoStorageAccess(Box::new(
+            backend_error,
+        )));
+        assert_eq!(error, ProviderSecretMutationError::Unavailable);
+        assert_eq!(error.public_message(), "System keychain is unavailable");
+        assert!(!error
+            .public_message()
+            .contains("backend-password-do-not-leak"));
     }
 }

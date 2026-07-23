@@ -1,5 +1,5 @@
 import type { Prisma } from "@prisma/client";
-import sharp from "sharp";
+import sharp, { type Metadata } from "sharp";
 import { prisma } from "@/lib/server/prisma";
 import { ApiError } from "@/lib/server/errors";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
@@ -91,7 +91,7 @@ export async function validateFiles(
     // Decompression-bomb guard: a 1 MB PNG can claim to be 100k × 100k.
     // sharp.metadata() reads the header only (cheap) and reports the declared
     // dimensions; reject anything bigger than maxDimension on either axis.
-    let metadata: sharp.Metadata;
+    let metadata: Metadata;
     try {
       metadata = await sharp(buffer).metadata();
     } catch {

@@ -1,9 +1,19 @@
 import "server-only";
 
-import type { ImageModelEntry } from "@/lib/image-models";
-import { HF_MODEL_REGISTRY, type HfModelEntry } from "@/lib/hf-model-catalog";
+import {
+  localImageAdvancedParameters,
+  type ImageModelEntry,
+} from "@/lib/image-models";
+import { HF_MODEL_CATALOG, type HfModelEntry } from "@/lib/hf-model-catalog";
 import { readImportedModels, type ImportedModelRecord } from "@/lib/server/imported-model-registry";
 import { catalogModelInstalled, modelFileExists } from "@/lib/server/local-model-files";
+
+function withLocalAdvancedParameters(entry: ImageModelEntry): ImageModelEntry {
+  return {
+    ...entry,
+    advancedParameters: localImageAdvancedParameters(),
+  };
+}
 
 export interface LocalImageRuntimeAvailability {
   sdCpp: boolean;
@@ -15,19 +25,18 @@ function isRunnableSdCppImageEntry(entry: HfModelEntry | undefined): entry is Hf
     entry &&
       entry.capability === "image-gen" &&
       entry.runtimeTarget === "sd-cpp" &&
-      entry.lifecycleStatus !== "planned" &&
       entry.fileName,
   );
 }
 
 function findRegistryEntry(modelId: string): HfModelEntry | undefined {
-  return (HF_MODEL_REGISTRY as readonly HfModelEntry[]).find((entry) => entry.id === modelId);
+  return (HF_MODEL_CATALOG as readonly HfModelEntry[]).find((entry) => entry.id === modelId);
 }
 
 export async function isKnownLocalImageModelId(modelId?: string): Promise<boolean> {
   if (!modelId) return false;
   const catalog = findRegistryEntry(modelId);
-  if (catalog?.capability === "image-gen") return catalog.lifecycleStatus !== "planned";
+  if (catalog?.capability === "image-gen") return true;
   if (modelId.startsWith("imported-sd-cpp-") || modelId.startsWith("imported-comfyui-")) {
     return true;
   }
@@ -72,7 +81,7 @@ export async function resolveInstalledSdCppImageModel(
   const imported = installedImports[0];
   if (imported) return { id: imported.id };
 
-  const catalogIds = (HF_MODEL_REGISTRY as readonly HfModelEntry[])
+  const catalogIds = (HF_MODEL_CATALOG as readonly HfModelEntry[])
     .filter(isRunnableSdCppImageEntry)
     .map((entry) => entry.id);
   for (const id of catalogIds) {
@@ -137,7 +146,7 @@ export async function getInstalledCatalogImageModels(
   availability: LocalImageRuntimeAvailability,
 ): Promise<ImageModelEntry[]> {
   if (!availability.sdCpp) return [];
-  const entries = (HF_MODEL_REGISTRY as readonly HfModelEntry[]).filter(
+  const entries = (HF_MODEL_CATALOG as readonly HfModelEntry[]).filter(
     isRunnableSdCppImageEntry,
   );
   const installed = await Promise.all(
@@ -146,7 +155,7 @@ export async function getInstalledCatalogImageModels(
 
   return installed
     .filter((item) => item.ready)
-    .map(({ entry }) => catalogImageModelEntry(entry));
+    .map(({ entry }) => withLocalAdvancedParameters(catalogImageModelEntry(entry)));
 }
 
 export async function getImportedImageModels(
@@ -166,7 +175,7 @@ export async function getImportedImageModels(
 
   return installed
     .filter((item) => item.ready)
-    .map(({ record }) => importedImageModelEntry(record));
+    .map(({ record }) => withLocalAdvancedParameters(importedImageModelEntry(record)));
 }
 
 export async function getLocalImageModels(
@@ -189,7 +198,7 @@ export async function resolveLocalImageModelEntry(
     isRunnableSdCppImageEntry(catalogEntry) &&
     (await catalogModelInstalled(catalogEntry))
   ) {
-    return catalogImageModelEntry(catalogEntry);
+    return withLocalAdvancedParameters(catalogImageModelEntry(catalogEntry));
   }
 
   const imported = (await readImportedModels()).find((record) => record.id === modelId);
@@ -202,5 +211,5 @@ export async function resolveLocalImageModelEntry(
   ) {
     return undefined;
   }
-  return importedImageModelEntry(imported);
+  return withLocalAdvancedParameters(importedImageModelEntry(imported));
 }

@@ -3,7 +3,7 @@ import { MODEL_DETAILS } from "@/components/settings/local-models/copy";
 import { selectQuickStartImageModels } from "@/components/settings/local-models/catalog-utils";
 import type { HubModelEntry, InstallStatusMap } from "@/components/settings/local-models/types";
 import type { HardwareInfo } from "@/lib/desktop-runtime";
-import { HF_MODEL_REGISTRY } from "@/lib/hf-model-catalog";
+import { HF_MODEL_CATALOG } from "@/lib/hf-model-catalog";
 
 const apple32: HardwareInfo = {
   arch: "arm64",
@@ -14,12 +14,12 @@ const apple32: HardwareInfo = {
   disk_available_gb: 200,
 };
 
-const imageEntries = (HF_MODEL_REGISTRY as readonly HubModelEntry[]).filter(
+const imageEntries = (HF_MODEL_CATALOG as readonly HubModelEntry[]).filter(
   (entry) => entry.capability === "image-gen",
 );
 
 describe("local model UI copy", () => {
-  it("does not describe uninstalled compatibility rows as installed", () => {
+  it("does not describe uninstalled catalog rows as installed", () => {
     for (const locale of Object.values(MODEL_DETAILS)) {
       for (const details of Object.values(locale)) {
         expect(details.bestFor).not.toMatch(/Installed|已安装|已安裝/);
@@ -34,7 +34,6 @@ describe("selectQuickStartImageModels", () => {
     const shortlist = selectQuickStartImageModels({
       entries: imageEntries,
       installStatuses: {},
-      activeMlxModel: null,
       hw: apple32,
     });
 
@@ -59,7 +58,6 @@ describe("selectQuickStartImageModels", () => {
     const shortlist = selectQuickStartImageModels({
       entries: imageEntries,
       installStatuses,
-      activeMlxModel: null,
       hw: apple32,
     });
 
@@ -87,7 +85,6 @@ describe("selectQuickStartImageModels", () => {
     const shortlist = selectQuickStartImageModels({
       entries: imageEntries,
       installStatuses,
-      activeMlxModel: null,
       hw: apple32,
     });
 

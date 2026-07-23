@@ -33,7 +33,6 @@ export const COPY = {
       downloaded: "Ready",
       missing_runtime: "Local AI not ready",
       hardware_unfit: "Not compatible",
-      planned: "Planned",
       error: "Error",
       canceled: "Paused",
     },
@@ -67,9 +66,6 @@ export const COPY = {
     disabledNoRam: (need: number) => `Requires ${need} GB RAM`,
     disabledAppleSilicon: "Apple Silicon only",
     disabledDisk: (need: number) => `Requires ~${need} GB free disk`,
-    disabledPlanned: "Not available yet",
-    mlxDownloading: "Downloading model",
-    mlxLoading: "Loading model",
     runtimeMissing: "Local AI isn't ready yet. Check Local AI status.",
     activateFailed: "Could not start this model. Check Local AI status and try again.",
     tags: {
@@ -145,7 +141,6 @@ export const COPY = {
       downloaded: "已就绪",
       missing_runtime: "本地 AI 未就绪",
       hardware_unfit: "不兼容",
-      planned: "规划中",
       error: "错误",
       canceled: "已暂停",
     },
@@ -179,9 +174,6 @@ export const COPY = {
     disabledNoRam: (need: number) => `需要 ${need} GB 内存`,
     disabledAppleSilicon: "仅支持 Apple Silicon",
     disabledDisk: (need: number) => `需要约 ${need} GB 可用磁盘`,
-    disabledPlanned: "暂未支持",
-    mlxDownloading: "下载模型中",
-    mlxLoading: "加载中",
     runtimeMissing: "本地 AI 尚未就绪，请检查本地 AI 状态。",
     activateFailed: "无法启动该模型，请检查本地 AI 状态后重试。",
     tags: {
@@ -257,7 +249,6 @@ export const COPY = {
       downloaded: "已就緒",
       missing_runtime: "本地 AI 未就緒",
       hardware_unfit: "不相容",
-      planned: "規劃中",
       error: "錯誤",
       canceled: "已暫停",
     },
@@ -291,9 +282,6 @@ export const COPY = {
     disabledNoRam: (need: number) => `需要 ${need} GB 記憶體`,
     disabledAppleSilicon: "僅支援 Apple Silicon",
     disabledDisk: (need: number) => `需要約 ${need} GB 可用磁碟`,
-    disabledPlanned: "暫未支援",
-    mlxDownloading: "下載模型中",
-    mlxLoading: "載入中",
     runtimeMissing: "本地 AI 尚未就緒，請檢查本地 AI 狀態。",
     activateFailed: "無法啟動該模型，請檢查本地 AI 狀態後重試。",
     tags: {
@@ -347,10 +335,6 @@ export const MODEL_DETAILS = {
       bestFor: "Current local text planning when the larger hot model is too heavy.",
       why: "Keeps the model hub current while staying within a more realistic single-file install size.",
     },
-    "qwen3.6-27b-mlx-optiq-4bit": {
-      bestFor: "Current Apple Silicon text planning with MLX acceleration.",
-      why: "Mac-native current Qwen path for users who want a resident local engine.",
-    },
     "deepseek-v4-flash-iq2xxs": {
       bestFor: "High-memory machines that need a hot DeepSeek local text model.",
       why: "Included for current popularity and official V4 Flash lineage; ordinary laptops are blocked by the RAM gate.",
@@ -362,10 +346,6 @@ export const MODEL_DETAILS = {
     "qwen2.5-7b-instruct-q4": {
       bestFor: "Fast low-RAM text option.",
       why: "Kept as a runnable option for smaller machines and existing local setups.",
-    },
-    "qwen2.5-7b-instruct-mlx": {
-      bestFor: "Fast Apple Silicon text option.",
-      why: "Kept as a Mac-friendly local option for smaller machines and existing setups.",
     },
     "llama-3.2-3b-instruct-q4": {
       bestFor: "Small low-RAM text option.",
@@ -393,10 +373,6 @@ export const MODEL_DETAILS = {
       bestFor: "当更大的热门模型过重时，用作当前代本地文本规划。",
       why: "保持模型中心当前代，同时维持更现实的单文件安装体积。",
     },
-    "qwen3.6-27b-mlx-optiq-4bit": {
-      bestFor: "适合 Apple 芯片的当前代 MLX 文本规划。",
-      why: "给需要本机常驻文本引擎的 Mac 用户保留当前代路径。",
-    },
     "deepseek-v4-flash-iq2xxs": {
       bestFor: "适合高内存机器的热门 DeepSeek 本地文本模型。",
       why: "因当前热度和官方 V4 Flash 来源纳入；普通笔记本会被 RAM 门槛拦住。",
@@ -408,10 +384,6 @@ export const MODEL_DETAILS = {
     "qwen2.5-7b-instruct-q4": {
       bestFor: "适合低内存机器的快速文本选项。",
       why: "作为小内存机器和已有本地配置的可运行选项保留。",
-    },
-    "qwen2.5-7b-instruct-mlx": {
-      bestFor: "适合 Apple 芯片的快速文本选项。",
-      why: "作为更适合小内存 Mac 的本地选项保留。",
     },
     "llama-3.2-3b-instruct-q4": {
       bestFor: "适合低内存机器的小型文本选项。",
@@ -439,10 +411,6 @@ export const MODEL_DETAILS = {
       bestFor: "當更大的熱門模型過重時，用作當前代本地文字規劃。",
       why: "保持模型中心當前代，同時維持更實際的單一檔案安裝體積。",
     },
-    "qwen3.6-27b-mlx-optiq-4bit": {
-      bestFor: "適合 Apple 晶片的當前代 MLX 文字規劃。",
-      why: "給需要本機常駐文字引擎的 Mac 使用者保留當前代路徑。",
-    },
     "deepseek-v4-flash-iq2xxs": {
       bestFor: "適合高記憶體機器的熱門 DeepSeek 本地文字模型。",
       why: "因當前熱度和官方 V4 Flash 來源納入；普通筆電會被 RAM 門檻擋住。",
@@ -454,10 +422,6 @@ export const MODEL_DETAILS = {
     "qwen2.5-7b-instruct-q4": {
       bestFor: "適合低記憶體機器的快速文字選項。",
       why: "作為小記憶體機器和既有本機設定的可執行選項保留。",
-    },
-    "qwen2.5-7b-instruct-mlx": {
-      bestFor: "適合 Apple 晶片的快速文字選項。",
-      why: "作為更適合小記憶體 Mac 的本機選項保留。",
     },
     "llama-3.2-3b-instruct-q4": {
       bestFor: "適合低記憶體機器的小型文字選項。",

@@ -2,12 +2,15 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use crate::llama_resident::LlamaResident;
+use crate::model_residency::PersistentRegistration;
 use crate::profile::profile_runtime_root_path;
 use crate::{
-    current_engine_epoch, kill_stale_pid_if_matches, next_engine_epoch, reserve_local_port,
-    residency_global, wait_for_port, write_pid_lockfile,
+    current_llama_epoch, invalidate_llama_epoch_if_current, kill_stale_pid_if_matches,
+    next_llama_epoch, reserve_local_port, residency_global, wait_for_port, write_pid_lockfile,
 };
 
 /// Process-global snapshot of the active embedded engine, so the no-arg
@@ -44,8 +47,18 @@ pub(crate) struct LlamaServerStatus {
 // ---------------------------------------------------------------------------
 
 static LLAMA_BRIDGE_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+static LLAMA_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static LLAMA_RESIDENCY: OnceLock<Mutex<Option<PersistentRegistration>>> = OnceLock::new();
 fn llama_bridge_child() -> &'static Mutex<Option<Child>> {
     LLAMA_BRIDGE_CHILD.get_or_init(|| Mutex::new(None))
+}
+
+fn llama_start_lock() -> &'static Mutex<()> {
+    LLAMA_START_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn llama_residency_slot() -> &'static Mutex<Option<PersistentRegistration>> {
+    LLAMA_RESIDENCY.get_or_init(|| Mutex::new(None))
 }
 
 fn pid_lockfile_path() -> Option<PathBuf> {
@@ -54,28 +67,120 @@ fn pid_lockfile_path() -> Option<PathBuf> {
         .map(|runtime| runtime.join("llama-server.pid"))
 }
 
-/// Resolve the bundled engine dir without an AppHandle (bridge threads have none).
-fn bridge_engine_root() -> Result<PathBuf, String> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for cand in [
-                dir.join("engine"),
-                dir.join("..").join("Resources").join("engine"),
-                dir.join("..").join("Resources").join("_up_").join("engine"),
-            ] {
-                if cand.exists() {
-                    return Ok(cand);
+fn stop_previous_llama_for_switch() -> Result<(), String> {
+    // Keep the lifecycle reservation until the old child is fully reaped, then
+    // release it before the replacement can reserve budget or spawn.
+    let registration = llama_residency_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    llama_engine_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+
+    let mut child_guard = llama_bridge_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = child_guard.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *child_guard = None;
+    if let Some(lockfile) = pid_lockfile_path() {
+        let _ = std::fs::remove_file(lockfile);
+    }
+    drop(child_guard);
+    drop(registration);
+    Ok(())
+}
+
+fn cleanup_llama_exit_if_current(epoch: u64, model_path: &str, registration_id: &str) -> bool {
+    if !invalidate_llama_epoch_if_current(epoch) {
+        return false;
+    }
+    let mut slot = llama_engine_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .map(|info| info.model_path == model_path)
+        .unwrap_or(false)
+    {
+        *slot = None;
+    }
+    drop(slot);
+    let registration = {
+        let mut slot = llama_residency_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .map(|registration| registration.id() == registration_id)
+            .unwrap_or(false)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    drop(registration);
+    if let Some(lockfile) = pid_lockfile_path() {
+        let _ = std::fs::remove_file(lockfile);
+    }
+    true
+}
+
+fn monitor_llama_exit(epoch: u64, model_path: String, registration_id: String) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(250));
+        if current_llama_epoch() != epoch {
+            return;
+        }
+        let exited = {
+            let mut child_slot = llama_bridge_child()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(child) = child_slot.as_mut() else {
+                return;
+            };
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    *child_slot = None;
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    *child_slot = None;
+                    true
                 }
             }
+        };
+        if !exited {
+            continue;
         }
-    }
-    let local = std::env::current_dir()
-        .map_err(|e| format!("cwd: {e}"))?
-        .join("engine");
-    if local.exists() {
-        return Ok(local);
-    }
-    Err("Bundled llama.cpp engine was not found".to_string())
+        cleanup_llama_exit_if_current(epoch, &model_path, &registration_id);
+        return;
+    });
+}
+
+/// Resolve the bundled engine dir without an AppHandle (bridge threads have none).
+fn bridge_engine_root() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().ok();
+    let dev_cwd = cfg!(debug_assertions)
+        .then(std::env::current_dir)
+        .transpose()
+        .map_err(|err| format!("cwd: {err}"))?;
+    crate::engine_paths::resolve_engine_path(
+        executable.as_deref(),
+        &[],
+        dev_cwd.as_deref(),
+        cfg!(debug_assertions),
+        std::path::Path::is_dir,
+    )
+    .ok_or_else(|| "Bundled llama.cpp engine was not found".to_string())
 }
 
 /// Start the embedded llama.cpp server through the private HTTP bridge.
@@ -87,43 +192,49 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
     if !PathBuf::from(&model_path).is_file() {
         return Err(format!("Model file not found: {model_path}"));
     }
+    let model_path = PathBuf::from(&model_path)
+        .canonicalize()
+        .map_err(|err| format!("Could not resolve model path: {err}"))?
+        .to_string_lossy()
+        .to_string();
+    let _start_guard = llama_start_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    {
+    let current = llama_engine_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let alive = {
         let mut child_guard = llama_bridge_child()
             .lock()
-            .map_err(|_| "Llama bridge lock is poisoned".to_string())?;
-        if let Some(child) = child_guard.as_mut() {
-            let alive = child.try_wait().map_err(|err| err.to_string())?.is_none();
-            let same_model = llama_engine_slot()
-                .lock()
-                .map_err(|_| "Llama slot lock is poisoned".to_string())?
-                .as_ref()
-                .map(|i| i.model_path.as_str() == model_path.as_str())
-                .unwrap_or(false);
-            if alive && same_model {
-                let endpoint = llama_engine_slot()
-                    .lock()
-                    .map_err(|_| "Llama slot lock is poisoned".to_string())?
-                    .as_ref()
-                    .map(|i| i.endpoint.clone())
-                    .ok_or_else(|| "Llama endpoint is missing".to_string())?;
-                return Ok(LlamaServerStatus {
-                    running: true,
-                    endpoint: Some(endpoint),
-                    model_path: Some(model_path),
-                });
-            }
-            let _ = child.kill();
-            let _ = child.wait(); // reap, don't leave a zombie
-            *child_guard = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        child_guard
+            .as_mut()
+            .map(|child| child.try_wait().map(|status| status.is_none()))
+            .transpose()
+            .map_err(|err| err.to_string())?
+            .unwrap_or(false)
+    };
+    if alive {
+        if let Some(info) = current
+            .as_ref()
+            .filter(|info| info.model_path == model_path)
+        {
+            return Ok(LlamaServerStatus {
+                running: true,
+                endpoint: Some(info.endpoint.clone()),
+                model_path: Some(model_path),
+            });
         }
     }
+    stop_previous_llama_for_switch()?;
 
     // We are committing to spawn a new child — bump the epoch so any stale
     // residency-teardown / rollback from a previous start no-ops, then capture
     // our own epoch for the rollback guard below.
-    next_engine_epoch();
-    let my_epoch = current_engine_epoch();
+    next_llama_epoch();
+    let my_epoch = current_llama_epoch();
 
     let root = bridge_engine_root()?;
     let bin = root.join(if cfg!(windows) {
@@ -138,6 +249,11 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
         ));
     }
 
+    let registration = residency_global()
+        .ok_or_else(|| "Residency manager is unavailable".to_string())?
+        .register_persistent(LlamaResident::new(&model_path, bridge_stop_llama))
+        .map_err(|err| format!("Not enough VRAM for this model — {err}"))?;
+
     let bin_abspath = bin.to_string_lossy().to_string();
     let pid_lockfile = pid_lockfile_path();
     if let Some(ref lockfile) = pid_lockfile {
@@ -146,7 +262,7 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
 
     let port = reserve_local_port()?;
     let endpoint = format!("http://127.0.0.1:{port}");
-    let child = Command::new(&bin)
+    let mut child = Command::new(&bin)
         .arg("--model")
         .arg(&model_path)
         .arg("--host")
@@ -163,7 +279,12 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
     {
         let mut child_guard = llama_bridge_child()
             .lock()
-            .map_err(|_| "Llama bridge lock is poisoned".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current_llama_epoch() != my_epoch {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Llama start was superseded".to_string());
+        }
         if let Some(ref lockfile) = pid_lockfile {
             write_pid_lockfile(lockfile, child.id(), &bin);
         }
@@ -176,9 +297,9 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
     // clear the child + engine slots, and remove the lockfile — but only while
     // we are still the current epoch, so we never tear down a concurrent start.
     if let Err(err) = wait_for_port(port) {
-        if current_engine_epoch() == my_epoch {
+        if current_llama_epoch() == my_epoch {
             if let Ok(mut guard) = llama_bridge_child().lock() {
-                if current_engine_epoch() == my_epoch {
+                if current_llama_epoch() == my_epoch {
                     if let Some(child) = guard.as_mut() {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -198,26 +319,30 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
 
     // Commit the engine slot only after readiness succeeds, and only if we are
     // still current.
-    if current_engine_epoch() == my_epoch {
-        if let Ok(mut slot) = llama_engine_slot().lock() {
-            *slot = Some(LlamaEngineInfo {
-                endpoint: endpoint.clone(),
-                model_path: model_path.clone(),
-            });
+    if current_llama_epoch() == my_epoch {
+        let mut engine_slot = llama_engine_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current_llama_epoch() != my_epoch {
+            return Err("Llama start was superseded".to_string());
         }
-    }
-
-    // Best-effort residency registration. Failure here means VRAM is over
-    // budget even after evicting every non-active model — we surface a
-    // friendly error to the bridge caller, after tearing down the just-
-    // started llama child so we don't leave it leaking the VRAM the user
-    // explicitly told us they don't have.
-    if let Some(residency) = residency_global() {
-        let resident = LlamaResident::new(&model_path, bridge_stop_llama);
-        if let Err(err) = residency.register(resident) {
-            bridge_stop_llama();
-            return Err(format!("Not enough VRAM for this model — {err}"));
+        *engine_slot = Some(LlamaEngineInfo {
+            endpoint: endpoint.clone(),
+            model_path: model_path.clone(),
+        });
+        drop(engine_slot);
+        let registration_id = registration.id().to_string();
+        let mut residency_slot = llama_residency_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current_llama_epoch() != my_epoch {
+            return Err("Llama start was superseded".to_string());
         }
+        *residency_slot = Some(registration);
+        drop(residency_slot);
+        monitor_llama_exit(my_epoch, model_path.clone(), registration_id);
+    } else {
+        return Err("Llama start was superseded".to_string());
     }
 
     Ok(LlamaServerStatus {
@@ -229,44 +354,40 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
 
 pub(crate) fn bridge_stop_llama() {
     // Invalidate any in-flight start's epoch first.
-    next_engine_epoch();
-
-    // Snapshot the model id BEFORE we wipe the slot, so we can tell the
-    // residency manager which entry to forget. Done outside the residency
-    // lock to avoid lock ordering issues.
-    let model_id = llama_engine_slot()
+    next_llama_epoch();
+    let registration = llama_residency_slot()
         .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|i| i.model_path.clone()))
-        .and_then(|p| {
-            std::path::Path::new(&p)
-                .file_name()
-                .and_then(|s| s.to_str().map(|s| s.to_string()))
-        });
-
-    if let Ok(mut guard) = llama_bridge_child().lock() {
-        if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait(); // reap (mirrors bridge_stop_mlx / bridge_stop_sd)
-        }
-        *guard = None;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let mut guard = llama_bridge_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = guard.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait(); // reap (mirrors bridge_stop_mlx / bridge_stop_sd)
     }
-    if let Ok(mut slot) = llama_engine_slot().lock() {
-        *slot = None;
-    }
+    *guard = None;
+    drop(guard);
+    drop(registration);
+    *llama_engine_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     if let Some(lockfile) = pid_lockfile_path() {
         let _ = std::fs::remove_file(lockfile);
-    }
-    if let (Some(residency), Some(id)) = (residency_global(), model_id) {
-        residency.drop_model(&id);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_stop_llama, llama_bridge_child};
-    use crate::test_global_lock;
+    use super::{
+        bridge_stop_llama, cleanup_llama_exit_if_current, llama_bridge_child, llama_engine_slot,
+        llama_residency_slot, stop_previous_llama_for_switch, LlamaEngineInfo,
+    };
+    use crate::llama_resident::LlamaResident;
+    use crate::model_residency::ResidencyManager;
+    use crate::{next_llama_epoch, test_global_lock};
     use std::ffi::OsString;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct RuntimeDirRestore(Option<OsString>);
@@ -312,5 +433,145 @@ mod tests {
             llama_bridge_child().lock().unwrap().is_none(),
             "stop must clear the child slot"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_exit_cleanup_does_not_clear_new_runtime_state() {
+        let _g = test_global_lock();
+        let _runtime_dir_restore = RuntimeDirRestore(std::env::var_os("LUNERY_RUNTIME_DIR"));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        let runtime_dir =
+            std::env::temp_dir().join(format!("lunerylab-llama-stale-monitor-{nonce}"));
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime fixture");
+        std::env::set_var("LUNERY_RUNTIME_DIR", &runtime_dir);
+        let pid_lockfile = runtime_dir.join("llama-server.pid");
+        std::fs::write(&pid_lockfile, "replacement").expect("create pid lock fixture");
+
+        let model_path = std::env::temp_dir().join(format!("lunery-current-{nonce}.gguf"));
+        std::fs::File::create(&model_path)
+            .and_then(|file| file.set_len(1024 * 1024))
+            .expect("create model fixture");
+        let model_path = model_path.to_string_lossy().to_string();
+        let residency = Arc::new(ResidencyManager::new(1));
+        let registration = residency
+            .register_persistent(LlamaResident::new(&model_path, bridge_stop_llama))
+            .expect("register replacement residency");
+        let registration_id = registration.id().to_string();
+        *llama_residency_slot().lock().unwrap() = Some(registration);
+        *llama_engine_slot().lock().unwrap() = Some(LlamaEngineInfo {
+            endpoint: "http://127.0.0.1:2".to_string(),
+            model_path: model_path.clone(),
+        });
+        let stale_epoch = next_llama_epoch();
+        next_llama_epoch();
+        assert!(
+            !cleanup_llama_exit_if_current(stale_epoch, &model_path, &registration_id),
+            "stale exit cleanup must lose the epoch claim"
+        );
+        assert_eq!(
+            llama_engine_slot()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|info| info.model_path.as_str()),
+            Some(model_path.as_str()),
+            "stale monitor must preserve replacement engine info"
+        );
+        assert_eq!(
+            llama_residency_slot()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|registration| registration.id()),
+            Some(registration_id.as_str()),
+            "stale monitor must preserve replacement residency"
+        );
+        assert!(
+            pid_lockfile.exists(),
+            "stale monitor must preserve replacement pid lockfile"
+        );
+
+        bridge_stop_llama();
+        let _ = std::fs::remove_file(model_path);
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_switch_unregisters_old_residency_before_new_child_exists() {
+        let _g = test_global_lock();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        let old_path = std::env::temp_dir().join(format!("lunery-old-{nonce}.gguf"));
+        let new_path = std::env::temp_dir().join(format!("lunery-new-{nonce}.gguf"));
+        std::fs::File::create(&old_path)
+            .and_then(|file| file.set_len(1024 * 1024))
+            .expect("create old model fixture");
+        std::fs::File::create(&new_path)
+            .and_then(|file| file.set_len(1024 * 1024))
+            .expect("create new model fixture");
+
+        let residency = Arc::new(ResidencyManager::new(1));
+        let old_registration = residency
+            .register_persistent(LlamaResident::new(
+                old_path.to_str().expect("utf8 old path"),
+                bridge_stop_llama,
+            ))
+            .expect("register old residency");
+        *llama_residency_slot().lock().unwrap() = Some(old_registration);
+        *llama_engine_slot().lock().unwrap() = Some(LlamaEngineInfo {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            model_path: old_path.to_string_lossy().to_string(),
+        });
+        *llama_bridge_child().lock().unwrap() = Some(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn old child"),
+        );
+
+        stop_previous_llama_for_switch().expect("stop old model");
+        assert!(llama_engine_slot().lock().unwrap().is_none());
+        assert!(llama_bridge_child().lock().unwrap().is_none());
+
+        *llama_bridge_child().lock().unwrap() = Some(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn replacement child"),
+        );
+        *llama_engine_slot().lock().unwrap() = Some(LlamaEngineInfo {
+            endpoint: "http://127.0.0.1:2".to_string(),
+            model_path: new_path.to_string_lossy().to_string(),
+        });
+        let replacement_registration = residency
+            .register_persistent(LlamaResident::new(
+                new_path.to_str().expect("utf8 new path"),
+                bridge_stop_llama,
+            ))
+            .expect("register replacement residency");
+        *llama_residency_slot().lock().unwrap() = Some(replacement_registration);
+        let replacement_alive = llama_bridge_child()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("replacement child remains registered")
+            .try_wait()
+            .expect("inspect replacement child")
+            .is_none();
+        assert!(
+            replacement_alive,
+            "stale residency killed replacement child"
+        );
+
+        stop_previous_llama_for_switch().expect("cleanup replacement");
+        let _ = std::fs::remove_file(old_path);
+        let _ = std::fs::remove_file(new_path);
     }
 }

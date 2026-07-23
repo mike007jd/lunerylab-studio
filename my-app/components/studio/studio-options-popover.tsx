@@ -15,7 +15,11 @@ import {
 } from "@/components/ui/select";
 import { useI18n } from "@/lib/i18n/provider";
 import { ASPECT_RATIOS } from "@/lib/constants/generation";
-import type { ImageModelEntry } from "@/lib/image-models";
+import {
+  resolveImageAdvancedParameters,
+  supportsAnyAdvancedImageParameter,
+  type ImageModelEntry,
+} from "@/lib/image-models";
 import type { VideoModelEntry } from "@/lib/video-models";
 import type { StylePreset } from "@/lib/presets/style-presets";
 import type { ProjectOption } from "@/components/studio/studio-constants";
@@ -241,6 +245,16 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
   const summary = mode === "image"
     ? formatGenerationOptionsSummary(aspectRatio, outputCount)
     : `${videoDuration}s`;
+  const selectedImageModel = imageModels.find(
+    (model) => model.id === activeImageModelId || model.providerModelId === activeImageModelId,
+  );
+  const advancedCapabilities = resolveImageAdvancedParameters(selectedImageModel);
+  const showAdvanced = supportsAnyAdvancedImageParameter(advancedCapabilities);
+  const advancedFieldCount = [
+    advancedCapabilities.seed,
+    advancedCapabilities.steps,
+    advancedCapabilities.cfg,
+  ].filter(Boolean).length;
 
   return (
     <Popover>
@@ -315,69 +329,89 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
               </div>
             </div>
 
-            <AdvancedDisclosure title={labels.advanced}>
-              <div className="grid grid-cols-3 gap-2">
-                <label className="space-y-1">
-                  <FieldLabel>{labels.seed}</FieldLabel>
-                  <Input
-                    type="number"
-                    min={GENERATION_PARAMETER_LIMITS.seed.min}
-                    max={GENERATION_PARAMETER_LIMITS.seed.max}
-                    value={generationParameters.seed ?? ""}
-                    placeholder={labels.seedRandom}
-                    onChange={(event) => onGenerationParametersChange({
-                      ...generationParameters,
-                      seed: event.target.value ? Number(event.target.value) : undefined,
-                    })}
-                    className="h-8 text-xs"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <FieldLabel>{labels.steps}</FieldLabel>
-                  <Input
-                    type="number"
-                    min={GENERATION_PARAMETER_LIMITS.steps.min}
-                    max={GENERATION_PARAMETER_LIMITS.steps.max}
-                    value={generationParameters.steps ?? ""}
-                    placeholder={labels.automatic}
-                    onChange={(event) => onGenerationParametersChange({
-                      ...generationParameters,
-                      steps: event.target.value ? Number(event.target.value) : undefined,
-                    })}
-                    className="h-8 text-xs"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <FieldLabel>{labels.cfg}</FieldLabel>
-                  <Input
-                    type="number"
-                    min={GENERATION_PARAMETER_LIMITS.cfg.min}
-                    max={GENERATION_PARAMETER_LIMITS.cfg.max}
-                    step="0.5"
-                    value={generationParameters.cfg ?? ""}
-                    placeholder={labels.automatic}
-                    onChange={(event) => onGenerationParametersChange({
-                      ...generationParameters,
-                      cfg: event.target.value ? Number(event.target.value) : undefined,
-                    })}
-                    className="h-8 text-xs"
-                  />
-                </label>
-              </div>
-              <label className="block space-y-1">
-                <FieldLabel>{labels.negativePrompt}</FieldLabel>
-                <Textarea
-                  value={generationParameters.negativePrompt ?? ""}
-                  maxLength={GENERATION_PARAMETER_LIMITS.negativePromptMaxLength}
-                  rows={2}
-                  onChange={(event) => onGenerationParametersChange({
-                    ...generationParameters,
-                    negativePrompt: event.target.value || undefined,
-                  })}
-                  className="min-h-16 resize-none text-xs"
-                />
-              </label>
-            </AdvancedDisclosure>
+            {showAdvanced ? (
+              <AdvancedDisclosure title={labels.advanced}>
+                {advancedFieldCount > 0 ? (
+                  <div
+                    className={
+                      advancedFieldCount === 1
+                        ? "grid grid-cols-1 gap-2"
+                        : advancedFieldCount === 2
+                          ? "grid grid-cols-2 gap-2"
+                          : "grid grid-cols-3 gap-2"
+                    }
+                  >
+                    {advancedCapabilities.seed ? (
+                      <label className="space-y-1">
+                        <FieldLabel>{labels.seed}</FieldLabel>
+                        <Input
+                          type="number"
+                          min={GENERATION_PARAMETER_LIMITS.seed.min}
+                          max={GENERATION_PARAMETER_LIMITS.seed.max}
+                          value={generationParameters.seed ?? ""}
+                          placeholder={labels.seedRandom}
+                          onChange={(event) => onGenerationParametersChange({
+                            ...generationParameters,
+                            seed: event.target.value ? Number(event.target.value) : undefined,
+                          })}
+                          className="h-8 text-xs"
+                        />
+                      </label>
+                    ) : null}
+                    {advancedCapabilities.steps ? (
+                      <label className="space-y-1">
+                        <FieldLabel>{labels.steps}</FieldLabel>
+                        <Input
+                          type="number"
+                          min={GENERATION_PARAMETER_LIMITS.steps.min}
+                          max={GENERATION_PARAMETER_LIMITS.steps.max}
+                          value={generationParameters.steps ?? ""}
+                          placeholder={labels.automatic}
+                          onChange={(event) => onGenerationParametersChange({
+                            ...generationParameters,
+                            steps: event.target.value ? Number(event.target.value) : undefined,
+                          })}
+                          className="h-8 text-xs"
+                        />
+                      </label>
+                    ) : null}
+                    {advancedCapabilities.cfg ? (
+                      <label className="space-y-1">
+                        <FieldLabel>{labels.cfg}</FieldLabel>
+                        <Input
+                          type="number"
+                          min={GENERATION_PARAMETER_LIMITS.cfg.min}
+                          max={GENERATION_PARAMETER_LIMITS.cfg.max}
+                          step="0.5"
+                          value={generationParameters.cfg ?? ""}
+                          placeholder={labels.automatic}
+                          onChange={(event) => onGenerationParametersChange({
+                            ...generationParameters,
+                            cfg: event.target.value ? Number(event.target.value) : undefined,
+                          })}
+                          className="h-8 text-xs"
+                        />
+                      </label>
+                    ) : null}
+                  </div>
+                ) : null}
+                {advancedCapabilities.negativePrompt ? (
+                  <label className="block space-y-1">
+                    <FieldLabel>{labels.negativePrompt}</FieldLabel>
+                    <Textarea
+                      value={generationParameters.negativePrompt ?? ""}
+                      maxLength={GENERATION_PARAMETER_LIMITS.negativePromptMaxLength}
+                      rows={2}
+                      onChange={(event) => onGenerationParametersChange({
+                        ...generationParameters,
+                        negativePrompt: event.target.value || undefined,
+                      })}
+                      className="min-h-16 resize-none text-xs"
+                    />
+                  </label>
+                ) : null}
+              </AdvancedDisclosure>
+            ) : null}
           </div>
         ) : null}
 

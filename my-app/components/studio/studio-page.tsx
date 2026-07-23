@@ -75,6 +75,10 @@ import {
 import { buildDefaultProjectName } from "@/lib/project-name";
 import { createProject as createProjectRequest } from "@/lib/client/projects";
 import type { GenerationParameters } from "@/lib/generation-parameters";
+import {
+  filterGenerationParametersToCapabilities,
+  resolveImageAdvancedParameters,
+} from "@/lib/image-models";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -326,6 +330,21 @@ export function StudioPage({
   // Handlers
   // ---------------------------------------------------------------------------
 
+  const handleImageModelChange = useCallback((modelId: string) => {
+    setSelectedModel(modelId);
+    const selected = imageModels.find(
+      (model) => model.id === modelId || model.providerModelId === modelId,
+    );
+    // Drop advanced fields the newly selected model cannot honor so the UI and
+    // the next request fingerprint stay aligned with provider capabilities.
+    setGenerationParameters((previous) =>
+      filterGenerationParametersToCapabilities(
+        previous,
+        resolveImageAdvancedParameters(selected),
+      ),
+    );
+  }, [imageModels]);
+
   const handleOpenFilePicker = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
@@ -483,10 +502,23 @@ export function StudioPage({
       form.append("count", String(params.count));
       form.append("aspectRatio", params.aspectRatio);
       form.append("modelId", params.modelId);
-      if (params.generationParameters.seed !== undefined) form.append("seed", String(params.generationParameters.seed));
-      if (params.generationParameters.steps !== undefined) form.append("steps", String(params.generationParameters.steps));
-      if (params.generationParameters.cfg !== undefined) form.append("cfg", String(params.generationParameters.cfg));
-      if (params.generationParameters.negativePrompt) form.append("negativePrompt", params.generationParameters.negativePrompt);
+      const requestModel = imageModels.find(
+        (model) => model.id === params.modelId || model.providerModelId === params.modelId,
+      );
+      const effectiveParameters = filterGenerationParametersToCapabilities(
+        params.generationParameters,
+        resolveImageAdvancedParameters(
+          requestModel ?? {
+            id: params.modelId,
+            providerModelId: params.modelId,
+            source: params.modelId.startsWith("byok:") ? "byok" : undefined,
+          },
+        ),
+      );
+      if (effectiveParameters.seed !== undefined) form.append("seed", String(effectiveParameters.seed));
+      if (effectiveParameters.steps !== undefined) form.append("steps", String(effectiveParameters.steps));
+      if (effectiveParameters.cfg !== undefined) form.append("cfg", String(effectiveParameters.cfg));
+      if (effectiveParameters.negativePrompt) form.append("negativePrompt", effectiveParameters.negativePrompt);
       if (params.projectId) form.append("projectId", params.projectId);
       if (params.presetId) form.append("presetId", params.presetId);
       for (const id of params.referenceAssetIds) {
@@ -512,7 +544,7 @@ export function StudioPage({
           warnings: outcome.warnings,
           error: outcome.error,
           generationParameters: {
-            ...params.generationParameters,
+            ...effectiveParameters,
             ...(firstAsset?.generationSeed == null ? {} : { seed: firstAsset.generationSeed }),
             ...(firstAsset?.generationSteps == null ? {} : { steps: firstAsset.generationSteps }),
             ...(firstAsset?.generationCfg == null ? {} : { cfg: firstAsset.generationCfg }),
@@ -533,7 +565,7 @@ export function StudioPage({
         }
       }
     },
-    [history, t],
+    [history, imageModels, t],
   );
 
   const handleGenerate = useCallback(async () => {
@@ -744,7 +776,7 @@ export function StudioPage({
             projectId: entry.projectId,
             referenceAssetIds: entry.referenceAssetIds,
             uploadedFiles: [],
-            generationParameters: entry.generationParameters ?? {},
+            generationParameters: entry.generationParameters,
           });
           if (outcome.status === "failed") {
             setError(outcome.error ?? t("studio.generationFailed"));
@@ -798,10 +830,18 @@ export function StudioPage({
   const handleReuseParameters = useCallback((entryId: string) => {
     const entry = history.find(entryId);
     if (!entry || entry.mode !== "image") return;
-    setGenerationParameters(entry.generationParameters ?? {});
+    const selected = imageModels.find(
+      (model) => model.id === activeImageModelId || model.providerModelId === activeImageModelId,
+    );
+    setGenerationParameters(
+      filterGenerationParametersToCapabilities(
+        entry.generationParameters,
+        resolveImageAdvancedParameters(selected),
+      ),
+    );
     setNotice(t("studio.parametersReused"));
     textareaRef.current?.focus();
-  }, [history, t]);
+  }, [activeImageModelId, history, imageModels, t]);
 
   const handleCancelGeneration = useCallback(
     async (entryId: string) => {
@@ -1022,7 +1062,7 @@ export function StudioPage({
                 imageModels={imageModels}
                 activeImageModelId={activeImageModelId}
                 hasImageModels={hasImageModels}
-                onImageModelChange={setSelectedModel}
+                onImageModelChange={handleImageModelChange}
                 aspectRatio={aspectRatio}
                 onAspectRatioChange={setAspectRatio}
                 candidateCount={imageOutputCount}

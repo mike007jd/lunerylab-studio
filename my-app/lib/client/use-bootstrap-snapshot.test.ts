@@ -13,7 +13,6 @@ function snapshot(): BootstrapSnapshot {
       defaultImageModel: "",
       defaultVideoModel: "",
     },
-    features: { imageGeneration: true },
     providers: { openai: { configured: true, source: "keychain" } },
     providerConnections: {
       openai: {

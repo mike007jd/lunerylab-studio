@@ -1,6 +1,7 @@
 mod download;
 mod engine_llama;
 mod engine_mlx;
+mod engine_paths;
 mod engine_sd;
 mod external_apps;
 mod hardware;
@@ -14,9 +15,7 @@ mod secrets;
 mod security;
 mod vram_probe;
 
-use crate::download::{
-    hf_download_cancel, hf_download_list, hf_download_start, hf_download_status, DownloadState,
-};
+use crate::download::DownloadState;
 use crate::engine_llama::{bridge_stop_llama, llama_engine_slot};
 use crate::engine_mlx::{bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot};
 use crate::engine_sd::{bridge_stop_sd, sd_binary_path};
@@ -24,11 +23,11 @@ use crate::external_apps::{is_lmstudio_installed, is_ollama_installed};
 use crate::hardware::{cached_accel, detect_hardware, probe_local_runtime, AccelInfo};
 use crate::http_bridge::start_desktop_bridge;
 use crate::profile::{ensure_profile_dirs, profile_dirs, ProfileDirs, ProfileStorageDirs};
-use crate::secrets::{delete_provider_secret, has_keychain_secret, save_provider_secret};
+use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
 use crate::security::bridge_token;
 
-use model_residency::{ModelKind, ResidencyManager};
+use model_residency::ResidencyManager;
 use serde::Serialize;
 #[cfg(not(debug_assertions))]
 use sha2::{Digest, Sha256};
@@ -213,6 +212,7 @@ struct ProviderConnectionStatus {
     configured: bool,
     source: &'static str,
     secret_store: &'static str,
+    keychain_status: &'static str,
 }
 
 #[derive(Serialize)]
@@ -259,31 +259,48 @@ fn has_env_key(keys: &[&str]) -> bool {
     keys.iter().any(|key| std::env::var_os(key).is_some())
 }
 
-/// Monotonic process-lifecycle epoch shared by all local inference engines
-/// (llama / mlx / sd). Every engine `start`/`stop` bumps it via
-/// `next_engine_epoch()` and captures the returned value as "my epoch". The
-/// background monitor / stdout-stderr drain threads spawned by a start compare
-/// their captured epoch against `current_engine_epoch()` BEFORE mutating any
-/// global child / job / slot or killing a process. A mismatch means a newer
-/// start (or a stop) has superseded this thread, so it exits silently and never
-/// touches shared state — this is what stops an old MLX monitor from killing the
-/// freshly-started replacement process after a model switch.
-///
-/// A single global counter is enough: each engine only ever compares against its
-/// own captured value, and a monotonic counter (unlike a PID) can never be
-/// reused, so there is no ABA hazard.
-static ENGINE_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Engine-local lifecycle epochs. Llama and MLX monitors must only be
+/// invalidated by a newer lifecycle of the same engine; sharing one counter
+/// caused a stop in either backend to orphan the other's monitor and cleanup.
+static LLAMA_EPOCH: AtomicU64 = AtomicU64::new(0);
+static MLX_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// Bump the shared engine epoch and return the new value (the caller's own
-/// epoch for this start/stop).
-pub(crate) fn next_engine_epoch() -> u64 {
-    ENGINE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
+pub(crate) fn next_llama_epoch() -> u64 {
+    LLAMA_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-/// Read the current shared engine epoch. Background threads compare this against
-/// their captured epoch before mutating shared state.
-pub(crate) fn current_engine_epoch() -> u64 {
-    ENGINE_EPOCH.load(Ordering::SeqCst)
+pub(crate) fn current_llama_epoch() -> u64 {
+    LLAMA_EPOCH.load(Ordering::SeqCst)
+}
+
+pub(crate) fn invalidate_llama_epoch_if_current(expected: u64) -> bool {
+    LLAMA_EPOCH
+        .compare_exchange(
+            expected,
+            expected.wrapping_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
+pub(crate) fn next_mlx_epoch() -> u64 {
+    MLX_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+pub(crate) fn current_mlx_epoch() -> u64 {
+    MLX_EPOCH.load(Ordering::SeqCst)
+}
+
+pub(crate) fn invalidate_mlx_epoch_if_current(expected: u64) -> bool {
+    MLX_EPOCH
+        .compare_exchange(
+            expected,
+            expected.wrapping_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
 }
 
 /// Process-wide serialization lock for tests that mutate the shared engine epoch
@@ -651,25 +668,28 @@ fn write_pid_lockfile(lockfile: &Path, pid: u32, abspath: &Path) {
 
 #[cfg(not(debug_assertions))]
 fn desktop_server_root(app: &AppHandle) -> Result<PathBuf, String> {
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        for bundled in [
-            resource_dir.join("desktop-server"),
-            resource_dir.join("_up_").join("desktop-server"),
-        ] {
-            if bundled.exists() {
-                return Ok(bundled);
-            }
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|err| format!("Could not resolve bundled resource directory: {err}"))?;
+    bundled_desktop_server_root(&resource_dir)
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn bundled_desktop_server_root(resource_dir: &Path) -> Result<PathBuf, String> {
+    for bundled in [
+        resource_dir.join("desktop-server"),
+        resource_dir.join("_up_").join("desktop-server"),
+    ] {
+        if bundled.is_dir() {
+            return Ok(bundled);
         }
     }
 
-    let local = std::env::current_dir()
-        .map_err(|err| format!("Could not resolve current directory: {err}"))?
-        .join("desktop-server");
-    if local.exists() {
-        return Ok(local);
-    }
-
-    Err("Bundled desktop server resources were not found".to_string())
+    Err(
+        "Bundled desktop server resources were not found in the Tauri resource directory"
+            .to_string(),
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -795,20 +815,21 @@ fn provider_status(
     env_keys: &[&str],
 ) -> ProviderConnectionStatus {
     let env_configured = has_env_key(env_keys);
-    let keychain_configured = has_keychain_secret(id);
+    let keychain_status = keychain_secret_state(id);
     ProviderConnectionStatus {
         id,
         label,
         auth: "API key",
-        configured: env_configured || keychain_configured,
+        configured: env_configured || keychain_status.is_present(),
         source: if env_configured {
             "environment"
-        } else if keychain_configured {
+        } else if keychain_status.is_present() {
             "system-keychain"
         } else {
             "none"
         },
         secret_store: "system-keychain",
+        keychain_status: keychain_status.as_str(),
     }
 }
 
@@ -1258,88 +1279,6 @@ fn write_desktop_dev_bridge_file(
     Ok(path)
 }
 
-// ---------------------------------------------------------------------------
-// ModelResidency bridge commands — surface VRAM usage / budget to the UI so a
-// Settings slider can tune the per-process budget at runtime. The actual
-// caller integration (sd-cpp, llama-server, MLX) lands in a follow-up to keep
-// this introduction focused on data plumbing.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Serialize)]
-pub struct ResidencyStatusPayload {
-    pub current_usage_mb: u32,
-    pub budget_mb_hint: u32,
-}
-
-/// QUARANTINED (dead-code-and-docs-cleanup-loop 2026-07-03): orphan command
-/// wrapper. No JS/HTTP consumer (no `app/api/desktop-runtime/*` route, no
-/// `invoke('residency_status')`, no Tauri event). Added in `acacfcc` for a
-/// "future Settings VRAM panel" that was never built. The underlying
-/// `ResidencyManager` / `residency_global()` IS live (engine wiring); only
-/// these thin command wrappers are orphan. Gate-not-provable (deleting a
-/// registered `#[tauri::command]` does not break `cargo build`), so
-/// quarantined via annotation rather than direct-deleted. Decision next
-/// release cycle: either ship the Settings VRAM panel or remove the trio.
-#[tauri::command]
-fn residency_status(state: State<'_, Arc<ResidencyManager>>) -> ResidencyStatusPayload {
-    ResidencyStatusPayload {
-        current_usage_mb: state.current_usage_mb(),
-        // Surface the live budget so a Settings slider can render its
-        // current position without a separate query — 0 still means
-        // "unlimited" to the front end.
-        budget_mb_hint: state.budget_mb(),
-    }
-}
-
-/// QUARANTINED (dead-code-and-docs-cleanup-loop 2026-07-03): see
-/// `residency_status` above — orphan command wrapper, no JS/HTTP consumer,
-/// planned Settings VRAM panel never built. Remove next release cycle unless
-/// the panel ships.
-#[tauri::command]
-fn residency_set_budget(state: State<'_, Arc<ResidencyManager>>, budget_mb: u32) {
-    state.set_budget_mb(budget_mb);
-}
-
-/// Per-model snapshot for the Settings VRAM panel — id / kind label / cost
-/// in MB / idle seconds / active-lease flag. The `kind` is stringified here
-/// so the TS layer doesn't have to mirror the Rust enum.
-#[derive(Clone, Serialize)]
-pub struct ResidencyActiveModelPayload {
-    pub id: String,
-    pub kind: &'static str,
-    pub vram_mb: u32,
-    pub last_used_secs_ago: u64,
-    pub is_active: bool,
-}
-
-/// QUARANTINED (dead-code-and-docs-cleanup-loop 2026-07-03): see
-/// `residency_status` above — orphan command wrapper, no JS/HTTP consumer,
-/// planned Settings VRAM panel never built. Remove next release cycle unless
-/// the panel ships.
-#[tauri::command]
-fn residency_active_models(
-    state: State<'_, Arc<ResidencyManager>>,
-) -> Vec<ResidencyActiveModelPayload> {
-    state
-        .active_models()
-        .into_iter()
-        .map(|s| ResidencyActiveModelPayload {
-            id: s.id,
-            kind: kind_label(s.kind),
-            vram_mb: s.vram_mb,
-            last_used_secs_ago: s.last_used_secs_ago,
-            is_active: s.is_active,
-        })
-        .collect()
-}
-
-fn kind_label(k: ModelKind) -> &'static str {
-    match k {
-        ModelKind::Llm => "llm",
-        ModelKind::ImageDiffusion => "image-diffusion",
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let download_state = Arc::new(DownloadState::default());
@@ -1348,10 +1287,9 @@ pub fn run() {
     let startup_download_state = Arc::clone(&download_state);
     #[cfg(debug_assertions)]
     let dev_bridge_download_state = Arc::clone(&download_state);
-    // VRAM budget comes from `vram_probe`: total RAM / 3 * 2 on Apple
-    // Silicon (unified memory), a conservative 8 GB on consumer NVIDIA /
-    // Windows, 0 (unlimited) elsewhere. The user can override via the
-    // Settings slider — `residency_set_budget` flips this at runtime.
+    // Initialize a finite residency budget from current measured hardware.
+    // The probe owns platform-specific safety margins; the runtime manager
+    // enforces that single startup fact for every registered local engine.
     let detected = vram_probe::detect_budget_mb();
     let residency = Arc::new(ResidencyManager::new(detected));
     // Make the manager reachable from bridge threads (no Tauri State) via
@@ -1361,7 +1299,6 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(desktop_state)
         .manage(Arc::clone(&download_state))
-        .manage(Arc::clone(&residency))
         .setup(move |app| {
             #[cfg(debug_assertions)]
             {
@@ -1447,13 +1384,6 @@ pub fn run() {
             retry_desktop_runtime,
             detect_hardware,
             probe_local_runtime,
-            hf_download_start,
-            hf_download_cancel,
-            hf_download_status,
-            hf_download_list,
-            residency_status,
-            residency_set_budget,
-            residency_active_models,
         ]);
 
     let app = match builder.build(tauri::generate_context!()) {
@@ -1548,15 +1478,21 @@ mod desktop_server_lifecycle_tests {
 
 #[cfg(test)]
 mod engine_epoch_tests {
-    use crate::{current_engine_epoch, next_engine_epoch, test_global_lock};
+    use crate::{
+        current_llama_epoch, current_mlx_epoch, next_llama_epoch, next_mlx_epoch, test_global_lock,
+    };
 
     #[test]
-    fn epoch_is_strictly_monotonic() {
+    fn engine_epochs_are_monotonic_and_independent() {
         let _g = test_global_lock();
-        let a = next_engine_epoch();
-        let b = next_engine_epoch();
-        assert!(b > a, "each bump must strictly increase the epoch");
-        assert_eq!(current_engine_epoch(), b, "current reflects the last bump");
+        let llama_before = current_llama_epoch();
+        let mlx_before = current_mlx_epoch();
+        let llama = next_llama_epoch();
+        assert!(llama > llama_before);
+        assert_eq!(current_mlx_epoch(), mlx_before);
+        let mlx = next_mlx_epoch();
+        assert!(mlx > mlx_before);
+        assert_eq!(current_llama_epoch(), llama);
     }
 }
 
@@ -1613,11 +1549,13 @@ mod log_rotation_tests {
 mod bridge_security_tests {
     use crate::download::{models_root_path, validate_hf_download_dest, validate_hf_download_url};
     use crate::hardware::loopback_socket_addr;
+    #[cfg(debug_assertions)]
     use crate::profile::ProfileDirs;
     use crate::{
-        command_line_matches_expected_binary, test_global_lock, write_desktop_dev_bridge_file,
-        DesktopBridge,
+        bundled_desktop_server_root, command_line_matches_expected_binary, test_global_lock,
     };
+    #[cfg(debug_assertions)]
+    use crate::{write_desktop_dev_bridge_file, DesktopBridge};
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1657,6 +1595,7 @@ mod bridge_security_tests {
         std::env::temp_dir().join(format!("lunery-{name}-{nanos}"))
     }
 
+    #[cfg(debug_assertions)]
     fn test_profile_dirs(root: PathBuf) -> ProfileDirs {
         let data = root.join("data");
         ProfileDirs {
@@ -1669,6 +1608,32 @@ mod bridge_security_tests {
             root,
             data,
         }
+    }
+
+    #[test]
+    fn bundled_server_root_accepts_only_tauri_resource_layouts() {
+        let resource_dir = unique_test_profile("tauri-resources");
+        let cwd_fallback = resource_dir.join("cwd").join("desktop-server");
+        std::fs::create_dir_all(&cwd_fallback).expect("create unrelated desktop server");
+
+        assert!(bundled_desktop_server_root(&resource_dir).is_err());
+
+        let direct = resource_dir.join("desktop-server");
+        std::fs::create_dir_all(&direct).expect("create direct resource layout");
+        assert_eq!(
+            bundled_desktop_server_root(&resource_dir).expect("direct layout"),
+            direct
+        );
+        std::fs::remove_dir_all(resource_dir.join("desktop-server")).expect("remove direct layout");
+
+        let tauri_up = resource_dir.join("_up_").join("desktop-server");
+        std::fs::create_dir_all(&tauri_up).expect("create _up_ resource layout");
+        assert_eq!(
+            bundled_desktop_server_root(&resource_dir).expect("_up_ layout"),
+            tauri_up
+        );
+
+        let _ = std::fs::remove_dir_all(resource_dir);
     }
 
     #[test]
@@ -1687,7 +1652,7 @@ mod bridge_security_tests {
         assert!(!command_line_matches_expected_binary(executable, ""));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     #[test]
     fn desktop_dev_bridge_file_is_owner_only_even_when_reused() {
         use std::os::unix::fs::PermissionsExt;

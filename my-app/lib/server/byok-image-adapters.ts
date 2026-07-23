@@ -28,6 +28,10 @@ import {
 } from "@/lib/server/byok-provider-clients";
 import type { GenerateImageInput, GeneratedImage } from "@/lib/server/generation-types";
 import { normalizeGenerationParameters } from "@/lib/generation-parameters";
+import {
+  byokImageAdvancedParameters,
+  filterGenerationParametersToCapabilities,
+} from "@/lib/image-models";
 
 export interface ResolvedByokConfig {
   apiKey: string;
@@ -331,16 +335,17 @@ export async function generateImagesReplicate(
   const { width, height } = aspectRatioToSize(input.aspectRatio);
 
   const refUrls = await prepareReferenceDataUrls(input);
-  const requestedParameters = normalizeGenerationParameters(input.generationParameters ?? {});
-  const supportsParameters = /(?:stable-diffusion|sdxl)/i.test(config.modelId);
-  const parameterInput = supportsParameters
-    ? {
-        ...(requestedParameters.seed === undefined ? {} : { seed: requestedParameters.seed }),
-        ...(requestedParameters.steps === undefined ? {} : { num_inference_steps: requestedParameters.steps }),
-        ...(requestedParameters.cfg === undefined ? {} : { guidance_scale: requestedParameters.cfg }),
-        ...(requestedParameters.negativePrompt ? { negative_prompt: requestedParameters.negativePrompt } : {}),
-      }
-    : {};
+  const capabilities = byokImageAdvancedParameters("replicate", config.modelId);
+  const requestedParameters = filterGenerationParametersToCapabilities(
+    normalizeGenerationParameters(input.generationParameters ?? {}),
+    capabilities,
+  );
+  const parameterInput = {
+    ...(requestedParameters.seed === undefined ? {} : { seed: requestedParameters.seed }),
+    ...(requestedParameters.steps === undefined ? {} : { num_inference_steps: requestedParameters.steps }),
+    ...(requestedParameters.cfg === undefined ? {} : { guidance_scale: requestedParameters.cfg }),
+    ...(requestedParameters.negativePrompt ? { negative_prompt: requestedParameters.negativePrompt } : {}),
+  };
   const prediction = await runReplicatePrediction({
     apiKey: config.apiKey,
     apiBase,
@@ -375,7 +380,9 @@ export async function generateImagesReplicate(
     });
   }
   const images = await Promise.all(urls.map((url) => downloadImageFromUrl(url)));
-  if (!supportsParameters) return images;
+  if (!capabilities.seed && !capabilities.steps && !capabilities.cfg && !capabilities.negativePrompt) {
+    return images;
+  }
   return images.map((image) => ({
     ...image,
     generationParameters: {
@@ -407,17 +414,19 @@ export async function generateImagesFal(
   const { width, height } = aspectRatioToSize(input.aspectRatio);
 
   const refUrls = await prepareReferenceDataUrls(input);
-  const requestedParameters = normalizeGenerationParameters(input.generationParameters ?? {});
-  const supportsParameters = /(?:flux|stable-diffusion|sdxl|sd3|lora|bria)/i.test(config.modelId);
-  const supportsNegativePrompt = /(?:stable-diffusion|sdxl|sd3|lora|inpaint)/i.test(config.modelId);
+  const capabilities = byokImageAdvancedParameters("fal", config.modelId);
+  const requestedParameters = filterGenerationParametersToCapabilities(
+    normalizeGenerationParameters(input.generationParameters ?? {}),
+    capabilities,
+  );
   const body = {
     prompt: input.prompt,
     image_size: { width, height },
     num_images: requested,
-    ...(supportsParameters && requestedParameters.seed !== undefined ? { seed: requestedParameters.seed } : {}),
-    ...(supportsParameters && requestedParameters.steps !== undefined ? { num_inference_steps: requestedParameters.steps } : {}),
-    ...(supportsParameters && requestedParameters.cfg !== undefined ? { guidance_scale: requestedParameters.cfg } : {}),
-    ...(supportsNegativePrompt && requestedParameters.negativePrompt ? { negative_prompt: requestedParameters.negativePrompt } : {}),
+    ...(requestedParameters.seed !== undefined ? { seed: requestedParameters.seed } : {}),
+    ...(requestedParameters.steps !== undefined ? { num_inference_steps: requestedParameters.steps } : {}),
+    ...(requestedParameters.cfg !== undefined ? { guidance_scale: requestedParameters.cfg } : {}),
+    ...(requestedParameters.negativePrompt ? { negative_prompt: requestedParameters.negativePrompt } : {}),
     ...buildReferencePayload("fal", config.modelId, refUrls),
   };
 
@@ -431,14 +440,16 @@ export async function generateImagesFal(
     abortSignal: input.abortSignal,
   });
   const images = await extractFalImages(payload, "Fal");
-  if (!supportsParameters) return images;
+  if (!capabilities.seed && !capabilities.steps && !capabilities.cfg && !capabilities.negativePrompt) {
+    return images;
+  }
   return images.map((image) => ({
     ...image,
     generationParameters: {
       seed: typeof payload.seed === "number" ? payload.seed : requestedParameters.seed ?? null,
       steps: requestedParameters.steps ?? null,
       cfg: requestedParameters.cfg ?? null,
-      negativePrompt: supportsNegativePrompt ? requestedParameters.negativePrompt ?? null : null,
+      negativePrompt: capabilities.negativePrompt ? requestedParameters.negativePrompt ?? null : null,
       modelId: config.modelId,
     },
   }));

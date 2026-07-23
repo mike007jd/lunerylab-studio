@@ -144,7 +144,7 @@ async function openDesktopDatabase(dataRoot, migrationsDir) {
 
 // Crash recovery: this desktop runtime is single-process, so any GenerationJob
 // still marked RUNNING at boot is necessarily orphaned — the process that was
-// driving it (its in-process `waitUntil` worker) died when the app last closed.
+// driving it (its in-process background worker) died when the app last closed.
 // Without this, those jobs would spin forever in the UI. We fail them once, at
 // boot, before the Next server starts handling requests (so it can never catch a
 // job legitimately started by the current process).

@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export default async function SettingsRoute() {
   await ensureLocalWorkspaceOwner();
-  const { app, features, providers, providerConnections } = await fetchBootstrapData(
+  const { app, providers, providerConnections } = await fetchBootstrapData(
     LOCAL_WORKSPACE_OWNER.id,
   );
 
@@ -20,7 +20,6 @@ export default async function SettingsRoute() {
           avatarUrl: LOCAL_WORKSPACE_OWNER.avatarUrl,
         },
         app,
-        features,
         providers,
         providerConnections,
       }}

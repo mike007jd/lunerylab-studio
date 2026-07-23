@@ -20,7 +20,8 @@ use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
 use crate::secrets::{
     audit_secret_read, delete_provider_secret, get_provider_secret, save_provider_secret,
-    secret_read_rate_limit_ok, ProviderIdPayload, ProviderSecretPayload,
+    secret_read_rate_limit_ok, ProviderIdPayload, ProviderSecretMutationError,
+    ProviderSecretPayload, ProviderSecretReadError,
 };
 use crate::security::{bridge_token, constant_time_eq, host_is_loopback};
 use crate::DesktopBridge;
@@ -107,7 +108,7 @@ fn read_http_request(
 fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let _ = stream.write_all(response.as_bytes());
 }
@@ -152,7 +153,7 @@ fn percent_decode(input: &str) -> String {
 
 /// Extract the value of the first occurrence of `key` from a
 /// `application/x-www-form-urlencoded` query string (e.g. `"a=1&b=2"`).
-fn query_param<'a>(query: &'a str, key: &str) -> Option<String> {
+fn query_param(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key {
@@ -385,23 +386,59 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
             Err(err) => bridge_error(&mut stream, "500 Internal Server Error", &err.to_string()),
         },
         ("POST", "/provider-secret") => {
-            match serde_json::from_str::<ProviderSecretPayload>(&body)
-                .map_err(|err| err.to_string())
-                .and_then(save_provider_secret)
-                .and_then(|payload| serde_json::to_string(&payload).map_err(|err| err.to_string()))
-            {
-                Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
-                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            let payload = match serde_json::from_str::<ProviderSecretPayload>(&body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    bridge_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        "Invalid provider secret request",
+                    );
+                    return;
+                }
+            };
+            match save_provider_secret(payload) {
+                Ok(status) => match serde_json::to_string(&status) {
+                    Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+                    Err(_) => bridge_error(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "Could not encode provider secret status",
+                    ),
+                },
+                Err(error) => bridge_error(
+                    &mut stream,
+                    provider_secret_mutation_http_status(error),
+                    error.public_message(),
+                ),
             }
         }
         ("DELETE", "/provider-secret") => {
-            match serde_json::from_str::<ProviderIdPayload>(&body)
-                .map_err(|err| err.to_string())
-                .and_then(delete_provider_secret)
-                .and_then(|payload| serde_json::to_string(&payload).map_err(|err| err.to_string()))
-            {
-                Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
-                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            let payload = match serde_json::from_str::<ProviderIdPayload>(&body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    bridge_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        "Invalid provider secret request",
+                    );
+                    return;
+                }
+            };
+            match delete_provider_secret(payload) {
+                Ok(status) => match serde_json::to_string(&status) {
+                    Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+                    Err(_) => bridge_error(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "Could not encode provider secret status",
+                    ),
+                },
+                Err(error) => bridge_error(
+                    &mut stream,
+                    provider_secret_mutation_http_status(error),
+                    error.public_message(),
+                ),
             }
         }
         ("POST", "/provider-secret-read") => {
@@ -425,27 +462,40 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
                 );
                 return;
             }
-            match serde_json::from_str::<ProviderIdPayload>(&body)
-                .map_err(|err| err.to_string())
-                .and_then(|payload| {
-                    let provider_id = payload.provider_id.clone();
-                    match get_provider_secret(payload) {
-                        Ok(key) => {
-                            audit_secret_read(&provider_id, true, "ok");
-                            Ok(key)
-                        }
-                        Err(err) => {
-                            audit_secret_read(&provider_id, false, "lookup_failed");
-                            Err(err)
-                        }
+            let payload = match serde_json::from_str::<ProviderIdPayload>(&body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    audit_secret_read("unknown", false, "invalid_request");
+                    bridge_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        "Invalid secret-read request",
+                    );
+                    return;
+                }
+            };
+            let provider_id = payload.provider_id.clone();
+            match get_provider_secret(payload) {
+                Ok(key) => {
+                    audit_secret_read(&provider_id, true, "ok");
+                    match serde_json::to_string(&serde_json::json!({ "key": key })) {
+                        Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+                        Err(_) => bridge_error(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "Could not serialize secret response",
+                        ),
                     }
-                })
-                .and_then(|key| {
-                    serde_json::to_string(&serde_json::json!({ "key": key }))
-                        .map_err(|err| err.to_string())
-                }) {
-                Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
-                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+                }
+                Err(error) => {
+                    audit_secret_read(&provider_id, false, error.audit_reason());
+                    let status = match error {
+                        ProviderSecretReadError::InvalidProvider => "400 Bad Request",
+                        ProviderSecretReadError::Missing => "404 Not Found",
+                        ProviderSecretReadError::Unavailable => "503 Service Unavailable",
+                    };
+                    bridge_error(&mut stream, status, error.public_message());
+                }
             }
         }
         ("GET", "/hardware") => {
@@ -757,6 +807,14 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
 /// user (most calls finish in <100ms); anything beyond returns 429.
 const BRIDGE_MAX_IN_FLIGHT: usize = 8;
 
+fn provider_secret_mutation_http_status(error: ProviderSecretMutationError) -> &'static str {
+    match error {
+        ProviderSecretMutationError::InvalidProvider
+        | ProviderSecretMutationError::InvalidSecret => "400 Bad Request",
+        ProviderSecretMutationError::Unavailable => "503 Service Unavailable",
+    }
+}
+
 pub(crate) fn start_desktop_bridge(
     download_state: Arc<DownloadState>,
 ) -> Result<DesktopBridge, String> {
@@ -793,4 +851,29 @@ pub(crate) fn start_desktop_bridge(
     });
 
     Ok(DesktopBridge { port, token })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_secret_mutation_http_status, ProviderSecretMutationError};
+
+    #[test]
+    fn provider_secret_validation_errors_map_to_bad_request() {
+        assert_eq!(
+            provider_secret_mutation_http_status(ProviderSecretMutationError::InvalidProvider),
+            "400 Bad Request"
+        );
+        assert_eq!(
+            provider_secret_mutation_http_status(ProviderSecretMutationError::InvalidSecret),
+            "400 Bad Request"
+        );
+    }
+
+    #[test]
+    fn provider_secret_store_outages_map_to_service_unavailable() {
+        assert_eq!(
+            provider_secret_mutation_http_status(ProviderSecretMutationError::Unavailable),
+            "503 Service Unavailable"
+        );
+    }
 }

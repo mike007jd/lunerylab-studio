@@ -41,10 +41,6 @@ describe("writeFilesOrCleanup (#7)", () => {
     );
   });
 
-  it("reports local-only media capability", () => {
-    expect(storage.isBlobStorage()).toBe(false);
-  });
-
   it("keeps pure local read/write/delete and not-found behavior", async () => {
     const stored = await storage.restoreStoredFile({
       storagePath: "generated/local-only.png",

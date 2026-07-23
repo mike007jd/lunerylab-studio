@@ -44,16 +44,6 @@ export function catalogModelFiles(entry: HfModelEntry): Array<{ fileName: string
 export async function catalogModelFileStatuses(entry: HfModelEntry): Promise<LocalModelFileStatus[]> {
   return Promise.all(
     catalogModelFiles(entry).map(async (file) => {
-      if (!entry.fileName && entry.runtimeTarget === "mlx") {
-        return {
-          fileName: file.fileName,
-          installed: false,
-          partial: false,
-          bytes: 0,
-          expectedBytes: file.expectedBytes,
-        };
-      }
-
       const dest = modelCachePath(entry.runtimeTarget, file.fileName);
       const [complete, partial] = await Promise.all([
         modelFileExists(dest),

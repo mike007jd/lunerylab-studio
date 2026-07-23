@@ -64,7 +64,7 @@ export interface ExternalRuntimeModel {
 
 export type RuntimeTargetOption = Extract<ModelRuntimeTarget, "llama-cpp" | "sd-cpp" | "ollama" | "lm-studio" | "comfyui">;
 
-export type UiState = ModelRunnableState | "partial" | "downloading" | "error" | "canceled" | "planned";
+export type UiState = ModelRunnableState | "partial" | "downloading" | "error" | "canceled";
 
 /** External runtime install state — drives the three-state UX in the panel. */
 export interface RuntimeInstallEntry {

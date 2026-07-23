@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import type { AccelInfo, HardwareInfo, RuntimeProbeResult } from "@/lib/desktop-runtime";
-import type { MlxPhase } from "@/lib/mlx-phase";
 
 // ---------------------------------------------------------------------------
 // Module-level in-flight / short-TTL cache
@@ -30,15 +29,6 @@ interface LlamaStatus {
   running: boolean;
   endpoint?: string | null;
   modelPath: string | null;
-}
-
-interface MlxStatus {
-  running: boolean;
-  endpoint?: string | null;
-  model: string | null;
-  phase?: MlxPhase | null;
-  percent?: number | null;
-  error?: string | null;
 }
 
 export interface DesktopStatus {
@@ -171,10 +161,6 @@ export function getDesktopRuntime(
 
 export async function fetchLlamaStatus(): Promise<LlamaStatus | null> {
   return fetchJsonOrNull<LlamaStatus>("/api/desktop-runtime/llama", { cache: "no-store" });
-}
-
-export async function fetchMlxStatus(): Promise<MlxStatus | null> {
-  return fetchJsonOrNull<MlxStatus>("/api/desktop-runtime/mlx", { cache: "no-store" });
 }
 
 export async function fetchRuntimeProbe(

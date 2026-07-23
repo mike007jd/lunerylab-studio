@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
  * The one runtime-health presentation row.
  *
  * Every local runtime — endpoint-probed (Ollama / LM Studio / ComfyUI) or
- * embedded (llama.cpp / sd.cpp / MLX) — renders through this row. Behaviour
+ * embedded (llama.cpp / sd.cpp) — renders through this row. Behaviour
  * differences are expressed as typed view data plus an optional action, never
  * as a second copy of the row chrome.
  */

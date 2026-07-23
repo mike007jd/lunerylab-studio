@@ -12,7 +12,7 @@ import {
 } from "@/components/motion/motion-primitives";
 import { lunaMotion } from "@/components/design-system/grammar/motion";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
-import { resolveSelectableImageModelId, useModelCatalog } from "@/lib/client/use-model-catalog";
+import { useModelCatalog } from "@/lib/client/use-model-catalog";
 import { useI18n } from "@/lib/i18n/provider";
 import { useT } from "@/lib/i18n/useT";
 import { cn } from "@/lib/utils";
@@ -144,9 +144,7 @@ export function SettingsPage({
   const reduced = useMotionReducedPreference();
   const { imageModels, videoModels, loading: modelsLoading } = useModelCatalog();
   const [bootstrap, setBootstrap] = useState(initialData);
-  const [defaultModel, setDefaultModel] = useState(
-    initialData.app.defaultImageModel || "",
-  );
+  const [defaultImageModelDraft, setDefaultImageModelDraft] = useState<string | null>(null);
   const [defaultTextModelDraft, setDefaultTextModelDraft] = useState<string | null>(null);
   const [defaultVideoModelDraft, setDefaultVideoModelDraft] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -189,12 +187,11 @@ export function SettingsPage({
   // right now), not the persisted server default — otherwise a seeded default
   // of "en" would keep "English" checked while the UI renders in Chinese.
   const selectedLocale = locale as Locale;
-  const selectableDefaultModel = resolveSelectableImageModelId(imageModels, defaultModel, "");
-  const persistedDefaultModel = resolveSelectableImageModelId(
-    imageModels,
+  const selectableDefaultModel = resolveSettingsModelValue(
     bootstrap.app.defaultImageModel,
-    "",
+    defaultImageModelDraft,
   );
+  const persistedDefaultModel = bootstrap.app.defaultImageModel;
   const modelChanged = selectableDefaultModel !== persistedDefaultModel;
   const saveDisabled = saving || modelsLoading || !modelChanged;
   const defaultTextModel = resolveSettingsModelValue(
@@ -273,6 +270,7 @@ export function SettingsPage({
     setFeedback(null);
     try {
       await patchSettings({ defaultImageModel: selectableDefaultModel });
+      setDefaultImageModelDraft(null);
       setFeedback({ tone: "success", text: t("settings.saved") });
     } catch (error) {
       setFeedback({ tone: "error", text: toErrorMessage(error, t("settings.saveError")) });
@@ -380,7 +378,7 @@ export function SettingsPage({
                   feedback={feedback}
                   locale={selectedLocale}
                   models={imageModels}
-                  onModelChange={setDefaultModel}
+                  onModelChange={setDefaultImageModelDraft}
                   onSave={() => void handleSaveModel()}
                   saving={saving}
                 />

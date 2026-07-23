@@ -5,7 +5,6 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   fetchDesktopHardware,
   fetchLlamaStatus,
-  fetchMlxStatus,
   fetchRuntimeProbe,
   useDesktopAccel,
   useDesktopAvailable,
@@ -22,10 +21,7 @@ import { readResponseError } from "@/lib/client/fetch-json";
 import { invalidateBootstrapSnapshot } from "@/lib/client/use-bootstrap-snapshot";
 import { cn } from "@/lib/utils";
 import {
-  compatibilityFallbackForHardware,
-  HF_COMPATIBILITY_MODEL_CATALOG,
   HF_MODEL_CATALOG,
-  listFirstRunImageModelEntries,
   type HfModelEntry,
   type ModelCapability,
 } from "@/lib/hf-model-catalog";
@@ -85,7 +81,6 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [installStatuses, setInstallStatuses] = useState<InstallStatusMap>({});
   const [activeLlamaPath, setActiveLlamaPath] = useState<string | null>(null);
-  const [activeMlxModel, setActiveMlxModel] = useState<string | null>(null);
   const [queueEntries, setQueueEntries] = useState<Record<string, QueueEntry>>({});
   const [externalRuntimes, setExternalRuntimes] = useState<ExternalRuntimeModel[]>([]);
   const [runtimeTarget, setRuntimeTarget] = useState<RuntimeTargetOption>("llama-cpp");
@@ -103,18 +98,14 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
   }, []);
 
   const refreshLocalState = useCallback(async () => {
-    const [statuses, llama, mlx] = await Promise.all([
+    const [statuses, llama] = await Promise.all([
       fetchInstallStatuses(),
       fetchLlamaStatus(),
-      fetchMlxStatus(),
     ]);
     if (!panelMountedRef.current) return;
     setInstallStatuses(statuses);
     if (llama) {
       setActiveLlamaPath(llama.running ? llama.modelPath : null);
-    }
-    if (mlx) {
-      setActiveMlxModel(mlx.running ? mlx.model : null);
     }
   }, []);
 
@@ -450,25 +441,8 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
       .map(importedStatusToEntry)
       .filter((entry): entry is HubModelEntry => entry !== null);
     const importedIds = new Set(importedEntries.map((entry) => entry.id));
-    // Image creation is the first-run path, so runnable small image models stay
-    // discoverable even when the flagship FLUX.2 row fits. Text compatibility
-    // rows remain hidden unless installed/active or needed as low-spec fallback.
-    const compatibilityById = new Map<string, HfModelEntry>();
-    for (const entry of listFirstRunImageModelEntries()) {
-      compatibilityById.set(entry.id, entry);
-    }
-    for (const entry of HF_COMPATIBILITY_MODEL_CATALOG as readonly HfModelEntry[]) {
-      const status = installStatuses[entry.id];
-      if (status?.installed || status?.partial || activeMlxModel === entry.hfRepo) {
-        compatibilityById.set(entry.id, entry);
-      }
-    }
-    for (const entry of compatibilityFallbackForHardware(hw)) {
-      compatibilityById.set(entry.id, entry);
-    }
     const merged: HubModelEntry[] = [
       ...(HF_MODEL_CATALOG as readonly HfModelEntry[]).filter((entry) => !importedIds.has(entry.id)),
-      ...[...compatibilityById.values()].filter((entry) => !importedIds.has(entry.id)),
       ...importedEntries,
     ];
     // Stable accel-aware sort within capability groups: entries that match the
@@ -478,7 +452,7 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
       const bMatch = isAccelMatch(b, accel) ? 1 : 0;
       return bMatch - aMatch;
     });
-  }, [accel, activeMlxModel, hw, installStatuses]);
+  }, [accel, installStatuses]);
 
   // Flat result set, no stacked capability groups. A search spans every category
   // (so you never miss a model because the wrong tab is active); with no query we
@@ -486,7 +460,7 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
   const visibleEntries = useMemo(() => {
     const q = query.trim().toLowerCase();
     return hubEntries.filter((entry) => {
-      const installed = Boolean(installStatuses[entry.id]?.installed || activeMlxModel === entry.hfRepo);
+      const installed = Boolean(installStatuses[entry.id]?.installed);
       const compatible = isHardwareFit(entry, hw);
       if (statusFilter === "recommended" && (!entry.recommended || !compatible)) return false;
       if (statusFilter === "installed" && !installed) return false;
@@ -495,7 +469,7 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
       if (q) return searchText(entry).includes(q);
       return entry.capability === category;
     });
-  }, [activeMlxModel, allowedCategories, category, hubEntries, hw, installStatuses, query, statusFilter]);
+  }, [allowedCategories, category, hubEntries, hw, installStatuses, query, statusFilter]);
 
   const categoryCounts = useMemo(() => {
     const counts: Record<ModelCapability, number> = { "planner-llm": 0, "image-gen": 0, vision: 0 };
@@ -505,18 +479,17 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
 
   const installedCount = hubEntries.filter((entry) => {
     const status = installStatuses[entry.id];
-    return status?.installed || activeMlxModel === entry.hfRepo;
+    return status?.installed;
   }).length;
   const fitCount = hubEntries.filter((entry) => isHardwareFit(entry, hw)).length;
   const categoryFilterApplied = query.trim().length === 0;
   const runningLabel =
     hubEntries.find(
       (entry) =>
-        (entry.runtimeTarget === "llama-cpp" &&
-          (entry.modelPath
-            ? activeLlamaPath === entry.modelPath
-            : Boolean(entry.fileName && activeLlamaPath?.endsWith(entry.fileName)))) ||
-        (entry.runtimeTarget === "mlx" && activeMlxModel === entry.hfRepo),
+        entry.runtimeTarget === "llama-cpp" &&
+        (entry.modelPath
+          ? activeLlamaPath === entry.modelPath
+          : Boolean(entry.fileName && activeLlamaPath?.endsWith(entry.fileName))),
     )?.label ?? null;
 
   // Beginner quick-start: the few image models that matter. Show what's
@@ -532,10 +505,9 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
     return selectQuickStartImageModels({
       entries: hubEntries,
       installStatuses,
-      activeMlxModel,
       hw,
     });
-  }, [activeMlxModel, capability, hubEntries, hw, installStatuses]);
+  }, [capability, hubEntries, hw, installStatuses]);
 
   const renderModelRow = (entry: HubModelEntry) => (
     <ModelRow
@@ -546,7 +518,6 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
       installStatus={installStatuses[entry.id]}
       runtimes={runtimes}
       activeLlamaPath={activeLlamaPath}
-      activeMlxModel={activeMlxModel}
       copy={copy}
       detailsLocale={detailsLocale}
       onStatusChange={refreshLocalState}

@@ -243,14 +243,10 @@ async function tryResolveLocal(
     if (explicitLocalModel && !requestedLocalImageModel) return null;
     endpointsToProbe = ["http://127.0.0.1:8188"];
   } else {
-    const mlx = status.local_runtimes.find(
-      (runtime) => runtime.id === "mlx" && runtime.status === "ready" && /^https?:\/\//.test(runtime.endpoint),
-    );
     const llama = status.local_runtimes.find(
       (runtime) => runtime.id === "llama-cpp" && runtime.status === "ready" && /^https?:\/\//.test(runtime.endpoint),
     );
     endpointsToProbe = [
-      ...(mlx ? [mlx.endpoint] : []),
       ...(llama ? [llama.endpoint] : []),
       ...DEFAULT_LOCAL_TEXT_ENDPOINTS,
     ];

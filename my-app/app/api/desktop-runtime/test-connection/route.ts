@@ -27,7 +27,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { requireDesktopBridge } from "@/lib/server/desktop-bridge";
 import { parseJsonBody } from "@/lib/server/http-validation";
-import { jsonError } from "@/lib/server/errors";
+import { ApiError, jsonError } from "@/lib/server/errors";
 import { findByokProvider } from "@/lib/byok-providers";
 import { getByokConnectionMeta } from "@/lib/server/byok-connection-store";
 import { tryReadByokKey, validateProviderEndpoint } from "@/lib/server/byok-shared";
@@ -148,7 +148,19 @@ export async function POST(request: NextRequest) {
 
   const draftApiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
   const endpointOverride = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
-  const apiKey = draftApiKey || await tryReadByokKey(providerId);
+  let apiKey = draftApiKey;
+  if (!apiKey) {
+    try {
+      apiKey = await tryReadByokKey(providerId) ?? "";
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+      return NextResponse.json({
+        ok: false,
+        latency_ms: 0,
+        error: error.message,
+      });
+    }
+  }
   if (!apiKey) {
     return NextResponse.json({
       ok: false,

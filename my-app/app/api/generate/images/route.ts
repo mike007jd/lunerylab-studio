@@ -20,8 +20,10 @@ import { createOrReplayGenerationJob } from "@/lib/server/idempotency";
 import { createRouteTelemetry } from "@/lib/server/route-telemetry";
 import { resolveImageModelForGeneration } from "@/lib/server/resolve-image-model";
 import {
+  assertGenerationParametersSupported,
   assertReferenceLimit,
   buildRequestFingerprint,
+  effectiveGenerationParameters,
   firstNonEmptyFormString,
   getUploadedFiles,
   parseRequestedImageCount,
@@ -40,6 +42,7 @@ import {
 } from "@/lib/server/reference-assets";
 import { finishSdProgress, resolveSdRunId } from "@/lib/server/sd-progress";
 import { generationAssetProvenance } from "@/lib/generation-parameters";
+import { resolveImageAdvancedParameters } from "@/lib/image-models";
 
 function toJobPayload(job: {
   id: string;
@@ -114,7 +117,7 @@ export async function POST(request: NextRequest) {
 
     const rawPrompt = trimFormString(formData, "prompt");
     const count = parseRequestedImageCount(formData.get("count"));
-    const generationParameters = parseGenerationParameters(formData);
+    const requestedGenerationParameters = parseGenerationParameters(formData);
     // Reject an unsupported ratio (e.g. "2:1") with 400 instead of silently
     // snapping to 1:1 — the request and the output must agree.
     const aspectRatioRaw = formData.get("aspectRatio");
@@ -184,6 +187,12 @@ export async function POST(request: NextRequest) {
       requiresEdit: requiresEditModel,
     });
     const modelEntry = resolvedModel.model;
+    const advancedCapabilities = resolveImageAdvancedParameters(modelEntry);
+    assertGenerationParametersSupported(requestedGenerationParameters, advancedCapabilities);
+    const generationParameters = effectiveGenerationParameters(
+      requestedGenerationParameters,
+      advancedCapabilities,
+    );
     const pendingProvider = "pending";
 
     const projectId = await resolveOwnedProjectId(providedProjectId, user.id);

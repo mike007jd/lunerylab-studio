@@ -84,17 +84,9 @@ const stalePhraseFiles = [
 ];
 
 const currentCatalogForbiddenPatterns = [
-  /qwen2\.5/i,
-  /llama-3\.2/i,
-  /Llama 3\.2/i,
-  /flux1/i,
-  /FLUX\.1/i,
-  /sdxl/i,
-  /SDXL/i,
-  /sd15/i,
-  /Stable Diffusion 1\.5/i,
-  /Llama 4/i,
-  /llama4/i,
+  /lifecycleStatus\s*:/,
+  /fileName:\s*""/,
+  /runtimeTarget:\s*"mlx"/,
 ];
 
 const currentCatalogRequiredPatterns = [

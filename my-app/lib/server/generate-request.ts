@@ -1,6 +1,10 @@
 import { ApiError } from "@/lib/server/errors";
 import { resolveOwnedProjectId as resolveProjectIdForOwner } from "@/lib/server/project-ownership";
 import {
+  filterGenerationParametersToCapabilities,
+  type ImageAdvancedParameterCapabilities,
+} from "@/lib/image-models";
+import {
   GENERATION_PARAMETER_LIMITS,
   normalizeGenerationParameters,
   type GenerationParameters,
@@ -61,6 +65,39 @@ export function parseGenerationParameters(formData: FormData): GenerationParamet
     cfg: parseOptionalNumber(formData, "cfg"),
     negativePrompt,
   });
+}
+
+const ADVANCED_PARAMETER_FIELDS = ["seed", "steps", "cfg", "negativePrompt"] as const;
+
+/**
+ * Reject any advanced field the selected model does not support. Must run
+ * after model resolution and before fingerprint / job creation.
+ */
+export function assertGenerationParametersSupported(
+  parameters: GenerationParameters,
+  capabilities: ImageAdvancedParameterCapabilities,
+): void {
+  const unsupported = ADVANCED_PARAMETER_FIELDS.filter((field) => {
+    if (field === "negativePrompt") {
+      return Boolean(parameters.negativePrompt) && !capabilities.negativePrompt;
+    }
+    return parameters[field] !== undefined && !capabilities[field];
+  });
+  if (unsupported.length === 0) return;
+  throw new ApiError({
+    status: 400,
+    code: "invalid_generation_parameter",
+    message: `Model does not support advanced parameter(s): ${unsupported.join(", ")}.`,
+    retryable: false,
+  });
+}
+
+/** Effective parameters that may enter the fingerprint and provider request. */
+export function effectiveGenerationParameters(
+  parameters: GenerationParameters,
+  capabilities: ImageAdvancedParameterCapabilities,
+): GenerationParameters {
+  return filterGenerationParametersToCapabilities(parameters, capabilities);
 }
 
 /**
