@@ -1,0 +1,6 @@
+{
+  "noStats": true,
+  "defaultBranch": "main",
+  "skipAgentsMd": true,
+  "skipSkills": true
+}
