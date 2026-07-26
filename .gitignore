@@ -83,6 +83,4 @@ my-app/prisma/**/*.sqlite3
 output/
 tmp/
 .history/
-my-app/data/generated/
-my-app/data/uploads/
 .vercel

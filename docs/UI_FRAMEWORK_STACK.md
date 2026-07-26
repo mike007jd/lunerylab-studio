@@ -23,7 +23,6 @@ add requirements, but they should not bypass this stack.
 - Framer Motion as the only animation syntax.
 - Lucide icons through the repo's icon wrappers.
 - Sonner for transient feedback.
-- Zustand only for real cross-component client state.
 - Zod for runtime validation and API boundary parsing.
 
 Do not introduce a second styling system, a second primitive library, or a
@@ -76,7 +75,7 @@ itself.
 
 `my-app/components/design-system/grammar`
 
-- Named token, density, motion, and copy-pattern constants.
+- Named token and motion grammar constants (`tokens.ts`, `motion.ts`).
 - Framework language lives here before it is repeated across surfaces.
 - Import with deep paths such as `@/components/design-system/grammar/tokens`.
 

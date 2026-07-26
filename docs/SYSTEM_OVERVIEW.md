@@ -66,8 +66,8 @@ Prisma models:
   override.
 - Storage paths are limited to `uploads/<file>`, `generated/<file>`, and their
   project-scoped `bucket/<projectId>/<file>` form.
-- `my-app/data/uploads` and `my-app/data/generated` are legacy migration/
-  compatibility artifacts, not source files or new defaults.
+- Do not use repo-local `my-app/data/*`. Leftover copies of those legacy dirs
+  may be deleted; current media lives under the Lunery profile.
 
 ### AI Runtime
 

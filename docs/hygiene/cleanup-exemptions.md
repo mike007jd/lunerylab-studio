@@ -1,6 +1,6 @@
 # Cleanup Exemptions Ledger
 
-Updated: 2026-07-21 (agent runtime rename; dead-code-and-docs-cleanup-loop, round 2).
+Updated: 2026-07-26 (hygiene pass: build artifacts, orphan profile, doc drift).
 
 Knip / filename scans are candidate generators only. Items below were reviewed
 and must not be re-proposed as dead without new evidence.
@@ -49,6 +49,7 @@ SECURITY_KEEPLIST: desktop bridge auth; endpoint validation; file/path containme
 | Model catalog `compatibility` / `legacy` lifecycle | Product policy, not dead shim |
 | DB archive-on-incompatible in desktop-runtime-server | Current local safety valve |
 | `docs/PNPM_OVERRIDES.md` | Linked from OPERATIONS; unique override rationale |
+| `WEB_WORKSPACE_ROUTES` retired paths (`/tools`, `/billing`, …) | Browser deny-list / product boundary, not dead pages |
 
 ## Permanently deleted (round 2, after dual skeptic)
 
@@ -65,6 +66,19 @@ before deleting the TS registry.
 | `.trash/design-system/assistant/index.ts` | Unused; studio/agent-chat is the live boundary |
 | `.trash/design-system/surfaces/index.ts` | Unused TS registry; docs/design/surfaces owns contracts |
 
+## Hygiene pass 2026-07-26
+
+| Action | Notes |
+| --- | --- |
+| `pnpm desktop:clean` | Removed regenerable `.next`, `desktop-server`, `desktop-dist` |
+| Removed `tsconfig.tsbuildinfo` | Ignored incremental cache |
+| Removed `~/.lunerylab/studio-dev-codex.NtA0E2` | Orphan Codex scratch profile (~41MB); kept `studio` / `studio-dev` |
+| Removed empty `.claude/skills` | Local gitignored empty dir |
+| Removed `.DS_Store` under `~/.lunerylab` | OS junk |
+| Doc drift fixes | Profile media path, no Zustand, grammar = tokens+motion only |
+| Dropped legacy gitignore entries | `my-app/data/*`, `.desktop-dev/` |
+| Renamed `phase-c-contracts.test.ts` → `generation-request-contracts.test.ts` | Historical phase name; tests live generation contracts |
+
 ## Refuted / deferred
 
 | Candidate | Disposition | Notes |
@@ -75,3 +89,6 @@ before deleting the TS registry.
 | Former versioned agent directory rename | Done | Renamed to `lib/server/agent/runtime/**`; entry `runAgent`; kept `runtime/` boundary (not flattened into `agent/`) to avoid outer request/runtime type collisions |
 | Former web workspace API escape hatch | Removed | Desktop-local convergence: local FS media only; workspace APIs desktop-gated |
 | Settings "Cost/local-first mode" doc claim | Done | Removed from settings surface contract; Required Structure matches current product |
+| Knip unused exports (presets, shadcn, helpers) | Keep | Same-file consumers or design-system completeness; not zero-reference files |
+| `src-tauri/target/` (~11G) | Keep | Intentional Tauri build cache per OPERATIONS |
+| Unlisted `postcss` (via `@tailwindcss/postcss`) | Deferred | Transitive; not garbage |

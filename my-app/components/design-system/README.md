@@ -2,7 +2,7 @@
 
 This folder is the framework boundary for Lunery Lab UI work.
 
-- `grammar`: named UI language, tokens, density, motion, and interaction rules.
+- `grammar`: named UI language — tokens and motion grammar.
 - `shell`: console content-frame classes and layout rhythm helpers.
 
 Feature code imports these modules by deep path
