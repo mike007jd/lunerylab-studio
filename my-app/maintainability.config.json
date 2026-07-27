@@ -43,14 +43,14 @@
     },
     "components/studio/generation-results-grid.tsx": {
       "category": "react",
-      "ceilingLines": 817,
+      "ceilingLines": 815,
       "targetLines": 400,
       "reason": "Owns list orchestration, running/failed states, asset actions, comparison, download, and modal presentation.",
       "nextBoundary": "Split GenerationEntryCard, RunningCard, FailedCard, AssetTile, and CompareDialog while retaining entry-level status ownership."
     },
     "scripts/check-ui-framework.mjs": {
       "category": "script",
-      "ceilingLines": 529,
+      "ceilingLines": 527,
       "targetLines": 250,
       "reason": "A custom source parser checks exact implementation shapes that belong in ESLint, rendered tests, or visual regression.",
       "nextBoundary": "Keep count-based visual debt checks; migrate JSX behavior rules to ESLint or Testing Library."
