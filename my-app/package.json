@@ -26,9 +26,10 @@
     "test:unit": "vitest run",
     "typecheck": "tsc --noEmit",
     "ui:check": "node scripts/check-ui-framework.mjs",
+    "check:maintainability": "node scripts/check-maintainability.mjs",
     "licenses:check": "node scripts/verify-third-party-licenses.mjs",
     "prisma:generate": "prisma generate",
-    "verify": "pnpm typecheck && pnpm lint && pnpm test:unit && pnpm ui:check && pnpm licenses:check && pnpm ai:freshness"
+    "verify": "pnpm typecheck && pnpm lint && pnpm test:unit && pnpm ui:check && pnpm check:maintainability && pnpm licenses:check && pnpm ai:freshness"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "3.0.81",
