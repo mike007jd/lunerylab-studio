@@ -8,9 +8,7 @@ export type StudioPromptOptimizeValidationKey =
   | "studio.setupHint.refineDisabled"
   | "studio.promptRequired";
 
-export type StudioPromptOptimizeNoticeKey =
-  | "studio.promptRuleFallback"
-  | "studio.promptOptimized";
+export type StudioPromptOptimizeNoticeKey = "studio.promptOptimized";
 
 export type StudioPromptOptimizePayload = PromptOptimizeRequest & {
   generationType: StudioGenerationType;
@@ -74,10 +72,6 @@ export function buildStudioPromptOptimizePayload(input: StudioPromptOptimizeInpu
   };
 }
 
-export function promptOptimizeNoticeKey(provider: PromptOptimizeResponse["provider"]): StudioPromptOptimizeNoticeKey {
-  return provider === "rule-fallback" ? "studio.promptRuleFallback" : "studio.promptOptimized";
-}
-
 export async function optimizeStudioPrompt(input: StudioPromptOptimizeInput): Promise<StudioPromptOptimizeResult> {
   const response = await fetchJson<PromptOptimizeResponse>("/api/prompts/optimize", {
     method: "POST",
@@ -87,7 +81,7 @@ export async function optimizeStudioPrompt(input: StudioPromptOptimizeInput): Pr
 
   return {
     optimizedPrompt: response.optimizedPrompt,
-    noticeKey: promptOptimizeNoticeKey(response.provider),
+    noticeKey: "studio.promptOptimized",
     response,
   };
 }

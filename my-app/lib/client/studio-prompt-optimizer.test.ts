@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   buildStudioPromptOptimizePayload,
-  promptOptimizeNoticeKey,
   resolvePromptOptimizeVideoModelId,
   validateStudioPromptOptimizeInput,
 } from "./studio-prompt-optimizer";
@@ -98,11 +97,5 @@ describe("studio prompt optimizer helpers", () => {
       videoModelId: "byok:fal:seedance",
       videoDuration: 8,
     });
-  });
-
-  it("surfaces rule fallback as a distinct notice key", () => {
-    expect(promptOptimizeNoticeKey("rule-fallback")).toBe("studio.promptRuleFallback");
-    expect(promptOptimizeNoticeKey("local")).toBe("studio.promptOptimized");
-    expect(promptOptimizeNoticeKey("byok")).toBe("studio.promptOptimized");
   });
 });

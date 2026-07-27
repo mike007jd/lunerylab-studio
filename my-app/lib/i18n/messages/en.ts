@@ -253,7 +253,6 @@ const en = {
     "styleSelected": "Style selected: {name}",
     "promptRequired": "Add prompt or style.",
     "promptOptimized": "Prompt optimized",
-    "promptRuleFallback": "Prompt refined with local rules.",
     "optimizeFailed": "Optimize failed",
     "videoPromptRequired": "Enter a video prompt.",
     "videoStarted": "Video started...",

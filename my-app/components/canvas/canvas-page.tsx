@@ -24,6 +24,7 @@ import {
   mergePolledLayers,
 } from "@/components/canvas/drawing-state-lifecycle";
 import { CanvasRouteState } from "@/components/canvas/canvas-route-state";
+import { CanvasStageLoading } from "@/components/canvas/canvas-stage-loading";
 import { CanvasExportPopover } from "@/components/canvas/canvas-export-popover";
 import { COPY } from "@/components/canvas/canvas-copy";
 import {
@@ -82,18 +83,6 @@ function downloadCanvasExports(exports: CanvasExportResponse["exports"]): void {
     anchor.click();
     anchor.remove();
   }
-}
-
-function CanvasStageLoading() {
-  const { locale } = useI18n();
-  const copy = COPY[locale] ?? COPY.en;
-
-  return (
-    <CanvasRouteState
-      title={copy.openingTitle}
-      description={copy.openingDescription}
-    />
-  );
 }
 
 // Konva is browser-only; load it on the client. We pass the imperative

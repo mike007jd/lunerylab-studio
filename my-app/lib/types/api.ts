@@ -1,7 +1,11 @@
 import type { ToolId } from "@/lib/tools/catalog";
 import type { CanvasDrawingState } from "@/lib/canvas/drawing-state";
+import type {
+  AssetDTO as GenerationAssetDTO,
+  GenerationResponse as ParsedGenerationResponse,
+} from "@/lib/schemas/generation";
 
-export type JobStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "PARTIAL" | "FAILED";
+export type JobStatus = ParsedGenerationResponse["job"]["status"];
 export type ToolType = ToolId;
 export const CANVAS_SESSION_STATUSES = ["EDITING", "GENERATING", "DONE", "FAILED"] as const;
 export type CanvasSessionStatus = (typeof CANVAS_SESSION_STATUSES)[number];
@@ -13,37 +17,10 @@ export interface ApiErrorPayload {
   details?: unknown;
 }
 
-export type AssetModality = "IMAGE" | "VIDEO" | "MODEL_3D";
-export type ContentOrigin = "USER" | "TEMPLATE";
+export type AssetModality = GenerationAssetDTO["modality"];
+export type ContentOrigin = GenerationAssetDTO["origin"];
 
-export interface AssetDTO {
-  id: string;
-  jobId: string;
-  projectId: string | null;
-  kind: "REFERENCE" | "GENERATED";
-  origin: ContentOrigin;
-  modality: AssetModality;
-  mimeType: string;
-  byteSize: number;
-  width: number | null;
-  height: number | null;
-  format: string | null;
-  durationSeconds: number | null;
-  tags: string[];
-  isFavorite: boolean;
-  note: string | null;
-  summary: string | null;
-  agentTaskId: string | null;
-  parentAssetId: string | null;
-  deletedAt: string | null;
-  createdAt: string;
-  url: string;
-  generationSeed?: number | null;
-  generationSteps?: number | null;
-  generationCfg?: number | null;
-  negativePrompt?: string | null;
-  generationModel?: string | null;
-}
+export type AssetDTO = GenerationAssetDTO;
 
 export interface ProjectDTO {
   id: string;
@@ -71,19 +48,7 @@ export interface GenerationRequest {
   toolType?: ToolType;
 }
 
-export interface GenerationResponse {
-  job: {
-    id: string;
-    status: JobStatus;
-    requestedCount: number;
-    successCount: number;
-    errorCode?: string;
-    errorMessage?: string;
-    projectId: string | null;
-  };
-  assets: AssetDTO[];
-  warnings: string[];
-}
+export type GenerationResponse = ParsedGenerationResponse;
 
 export interface PromptOptimizeRequest {
   prompt: string;
@@ -96,7 +61,7 @@ export interface PromptOptimizeRequest {
 }
 
 export interface PromptOptimizeResponse {
-  provider: "local" | "byok" | "rule-fallback";
+  provider: "local" | "byok";
   model: string;
   optimizedPrompt: string;
 }

@@ -253,7 +253,6 @@ const zhTW = {
     "styleSelected": "風格已選擇：{name}",
     "promptRequired": "輸入提示詞或選風格。",
     "promptOptimized": "提示詞優化完成",
-    "promptRuleFallback": "已用本地規則改寫提示詞",
     "optimizeFailed": "提示詞優化失敗",
     "videoPromptRequired": "請輸入影片提示詞。",
     "videoStarted": "影片已開始...",

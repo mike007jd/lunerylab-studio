@@ -36,6 +36,8 @@ describe("Studio generation safety", () => {
         status: "SUCCEEDED",
         requestedCount: 1,
         successCount: 0,
+        errorCode: null,
+        errorMessage: null,
         projectId: null,
       },
       assets: [],

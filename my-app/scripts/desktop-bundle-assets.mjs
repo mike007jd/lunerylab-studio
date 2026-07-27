@@ -119,6 +119,36 @@ function assertBundleableNode(nodeBinary) {
   }
 }
 
+function assertSharpRuntime(nodeBinary) {
+  const smoke = spawnSync(
+    nodeBinary,
+    [
+      "-e",
+      `require("sharp")({
+        create: {
+          width: 1,
+          height: 1,
+          channels: 4,
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+        },
+      }).png().toBuffer().then(() => process.stdout.write("sharp-ok")).catch((error) => {
+        console.error(error);
+        process.exit(1);
+      });`,
+    ],
+    {
+      cwd: appOut,
+      encoding: "utf8",
+    },
+  );
+  if (smoke.status !== 0 || smoke.stdout.trim() !== "sharp-ok") {
+    throw new Error(
+      `[desktop:prepare] Bundled sharp runtime failed: ${smoke.stderr?.trim() || smoke.error?.message || "unknown error"}`,
+    );
+  }
+  console.log("[desktop:prepare] sharp runtime smoke OK");
+}
+
 async function repairPnpmFacadePackages(nodeModulesDir) {
   const facadeRoot = path.join(nodeModulesDir, ".pnpm", "node_modules");
   if (!(await exists(facadeRoot))) return;
@@ -168,6 +198,60 @@ async function copyNodePackage(nodeModulesDir, packageName) {
   await mkdir(path.dirname(target), { recursive: true });
   await rm(target, { recursive: true, force: true });
   await cp(realSource, target, { recursive: true, dereference: true });
+}
+
+async function copyNodePackageDependency(nodeModulesDir, ownerName, packageName) {
+  const ownerSource = path.join(root, "node_modules", ...ownerName.split("/"));
+  if (!(await exists(ownerSource))) {
+    throw new Error(`[desktop:prepare] Runtime package owner is missing: ${ownerName}`);
+  }
+
+  const ownerRealSource = await realpath(ownerSource);
+  const source = path.join(
+    path.dirname(ownerRealSource),
+    ...packageName.split("/"),
+  );
+  if (!(await exists(source))) {
+    throw new Error(
+      `[desktop:prepare] Required ${ownerName} runtime dependency is missing: ${packageName}`,
+    );
+  }
+
+  const realSource = await realpath(source);
+  const target = path.join(nodeModulesDir, ...packageName.split("/"));
+  await mkdir(path.dirname(target), { recursive: true });
+  await rm(target, { recursive: true, force: true });
+  await cp(realSource, target, { recursive: true, dereference: true });
+}
+
+async function copySharpRuntime(nodeModulesDir) {
+  const runtimePackages = {
+    "darwin/arm64": [
+      "@img/colour",
+      "@img/sharp-darwin-arm64",
+      "@img/sharp-libvips-darwin-arm64",
+    ],
+    "darwin/x64": [
+      "@img/colour",
+      "@img/sharp-darwin-x64",
+      "@img/sharp-libvips-darwin-x64",
+    ],
+    "win32/x64": [
+      "@img/colour",
+      "@img/sharp-win32-x64",
+    ],
+  }[`${process.platform}/${process.arch}`];
+
+  if (!runtimePackages) {
+    throw new Error(
+      `[desktop:prepare] No sharp runtime package set for ${process.platform}/${process.arch}.`,
+    );
+  }
+
+  await copyNodePackage(nodeModulesDir, "sharp");
+  for (const packageName of runtimePackages) {
+    await copyNodePackageDependency(nodeModulesDir, "sharp", packageName);
+  }
 }
 
 async function copyDesktopDatabaseRuntime(nodeModulesDir) {
@@ -325,6 +409,7 @@ await cp(serverSource, appOut, {
 await repairPnpmFacadePackages(path.join(appOut, "node_modules"));
 await copyGeneratedPrismaClient(path.join(appOut, "node_modules"));
 await copyDesktopDatabaseRuntime(path.join(appOut, "node_modules"));
+await copySharpRuntime(path.join(appOut, "node_modules"));
 
 await cp(path.join(root, ".next", "static"), path.join(appOut, ".next", "static"), { recursive: true });
 if (await exists(path.join(root, "public"))) {
@@ -337,6 +422,7 @@ const nodeTarget = path.join(binOut, process.platform === "win32" ? "node.exe" :
 await cp(nodeSource, nodeTarget);
 await chmod(nodeTarget, 0o755);
 assertBundleableNode(nodeTarget);
+assertSharpRuntime(nodeTarget);
 console.log(`Bundled Node runtime: ${nodeSource}`);
 await writeFile(path.join(distOut, "index.html"), indexHtml, "utf8");
 await writeFile(path.join(distOut, "error.html"), errorHtml, "utf8");

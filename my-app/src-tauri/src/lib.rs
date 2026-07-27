@@ -1,4 +1,5 @@
 mod download;
+mod engine_lifecycle;
 mod engine_llama;
 mod engine_mlx;
 mod engine_paths;
@@ -42,7 +43,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(debug_assertions))]
 use std::process::Stdio;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 #[cfg(not(debug_assertions))]
@@ -257,50 +258,6 @@ pub(crate) struct DesktopBridge {
 
 fn has_env_key(keys: &[&str]) -> bool {
     keys.iter().any(|key| std::env::var_os(key).is_some())
-}
-
-/// Engine-local lifecycle epochs. Llama and MLX monitors must only be
-/// invalidated by a newer lifecycle of the same engine; sharing one counter
-/// caused a stop in either backend to orphan the other's monitor and cleanup.
-static LLAMA_EPOCH: AtomicU64 = AtomicU64::new(0);
-static MLX_EPOCH: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn next_llama_epoch() -> u64 {
-    LLAMA_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
-}
-
-pub(crate) fn current_llama_epoch() -> u64 {
-    LLAMA_EPOCH.load(Ordering::SeqCst)
-}
-
-pub(crate) fn invalidate_llama_epoch_if_current(expected: u64) -> bool {
-    LLAMA_EPOCH
-        .compare_exchange(
-            expected,
-            expected.wrapping_add(1),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_ok()
-}
-
-pub(crate) fn next_mlx_epoch() -> u64 {
-    MLX_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
-}
-
-pub(crate) fn current_mlx_epoch() -> u64 {
-    MLX_EPOCH.load(Ordering::SeqCst)
-}
-
-pub(crate) fn invalidate_mlx_epoch_if_current(expected: u64) -> bool {
-    MLX_EPOCH
-        .compare_exchange(
-            expected,
-            expected.wrapping_add(1),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_ok()
 }
 
 /// Process-wide serialization lock for tests that mutate the shared engine epoch
@@ -1473,26 +1430,6 @@ mod desktop_server_lifecycle_tests {
 
         state.shutdown();
         let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-#[cfg(test)]
-mod engine_epoch_tests {
-    use crate::{
-        current_llama_epoch, current_mlx_epoch, next_llama_epoch, next_mlx_epoch, test_global_lock,
-    };
-
-    #[test]
-    fn engine_epochs_are_monotonic_and_independent() {
-        let _g = test_global_lock();
-        let llama_before = current_llama_epoch();
-        let mlx_before = current_mlx_epoch();
-        let llama = next_llama_epoch();
-        assert!(llama > llama_before);
-        assert_eq!(current_mlx_epoch(), mlx_before);
-        let mlx = next_mlx_epoch();
-        assert!(mlx > mlx_before);
-        assert_eq!(current_llama_epoch(), llama);
     }
 }
 
