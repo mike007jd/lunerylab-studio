@@ -1,11 +1,4 @@
-// Prompt optimizer (was: gemini.ts).
-//
-// Rewrites a user prompt into a high-quality production prompt for image or
-// video generation. Routes through local model first, BYOK second. If both fail
-// (or none is configured),
-// returns a rule-based fallback so the Studio always has *some* usable prompt —
-// the prompt optimizer is a helper, not a generator, and a missing optimizer
-// must never be a 503.
+// Rewrites a user prompt through the configured local model first, then BYOK.
 
 import { ApiError } from "@/lib/server/errors";
 import { generateTextLocal } from "@/lib/server/local-llm";
@@ -32,7 +25,7 @@ interface OptimizePromptInput {
 }
 
 export interface OptimizePromptResult {
-  provider: "local" | "byok" | "rule-fallback";
+  provider: "local" | "byok";
   model: string;
   optimizedPrompt: string;
 }
@@ -57,49 +50,6 @@ function hasChineseKeywordOverlap(source: string, output: string): boolean {
 function needsChineseRetry(source: string, optimizedPrompt: string): boolean {
   if (!containsChinese(optimizedPrompt)) return true;
   return !hasChineseKeywordOverlap(source, optimizedPrompt);
-}
-
-function buildChineseFallbackPrompt(prompt: string, templatePrompt?: string): string {
-  const basePrompt = prompt.trim();
-  const template = String(templatePrompt ?? "").trim();
-  const suffix = "要求：写实高品质画面，主体清晰，材质真实，光线自然，构图稳定；禁止文字、水印、品牌 logo；避免畸形、糊化、噪点和比例错误。";
-  if (basePrompt) return `${basePrompt}\n${suffix}`;
-  if (template) return `${template}\n${suffix}`;
-  return suffix;
-}
-
-function buildChineseVideoFallbackPrompt(prompt: string): string {
-  const basePrompt = prompt.trim();
-  const suffix = "电影感运镜，流畅自然，主体动作清晰；避免闪烁、跳帧、肢体扭曲。";
-  return basePrompt ? `${basePrompt}，${suffix}` : suffix;
-}
-
-function buildEnglishFallbackPrompt(prompt: string, templatePrompt?: string): string {
-  const basePrompt = prompt.trim();
-  const template = String(templatePrompt ?? "").trim();
-  const suffix =
-    "Photorealistic high-quality image, clear subject, real materials, natural lighting, stable composition. No text, no watermarks, no brand logos. Avoid deformation, blur, noise, or proportion errors.";
-  if (basePrompt) return `${basePrompt}\n${suffix}`;
-  if (template) return `${template}\n${suffix}`;
-  return suffix;
-}
-
-function buildEnglishVideoFallbackPrompt(prompt: string): string {
-  const basePrompt = prompt.trim();
-  const suffix =
-    "Cinematic camera movement, smooth and natural motion, clear subject action; avoid flicker, frame drop, limb distortion.";
-  return basePrompt ? `${basePrompt}, ${suffix}` : suffix;
-}
-
-function buildRuleFallback(input: OptimizePromptInput, language: PromptLanguage): string {
-  if (language === "zh-CN") {
-    return input.generationType === "video"
-      ? buildChineseVideoFallbackPrompt(input.prompt)
-      : buildChineseFallbackPrompt(input.prompt, input.templatePrompt);
-  }
-  return input.generationType === "video"
-    ? buildEnglishVideoFallbackPrompt(input.prompt)
-    : buildEnglishFallbackPrompt(input.prompt, input.templatePrompt);
 }
 
 function resolvePromptLanguage({
@@ -317,21 +267,6 @@ export async function optimizePrompt({
   presetGuidance,
   abortSignal,
 }: OptimizePromptInput): Promise<OptimizePromptResult> {
-  const input: OptimizePromptInput = {
-    prompt,
-    mode,
-    templateTitle,
-    templatePrompt,
-    referenceCount,
-    locale,
-    generationType,
-    videoModelId,
-    videoDuration,
-    presetName,
-    presetGuidance,
-    abortSignal,
-  };
-
   const language = resolvePromptLanguage({ locale, prompt, templatePrompt });
   const { instruction, videoSkill } = buildOptimizeInstruction(language, generationType, videoModelId);
   const context = buildOptimizeContext({
@@ -365,10 +300,6 @@ export async function optimizePrompt({
           ? `必须保留这些关键词：${keywords.join("、")}。`
           : "必须与用户原始提示词语义一致。";
         try {
-          // Re-run the SAME backend once with the keyword-enriched context.
-          // Using `runWith` means the corrective hint applies uniformly to
-          // local / BYOK (previously local silently re-ran the original context
-          // and provider paths wasted an extra call).
           const newContext = [
             context,
             "",
@@ -380,13 +311,16 @@ export async function optimizePrompt({
           optimizedPrompt = retryWithKeywordContext.text;
           resolvedModel = retryWithKeywordContext.model;
         } catch {
-          // ignore retry error; keep first output for the fallback decision
+          // The next configured backend still gets a chance below.
         }
 
         if (needsChineseRetry(sourceForValidation, optimizedPrompt)) {
-          optimizedPrompt = generationType === "video"
-            ? buildChineseVideoFallbackPrompt(prompt)
-            : buildChineseFallbackPrompt(prompt, templatePrompt);
+          throw new ApiError({
+            status: 502,
+            code: "prompt_optimizer_invalid_output",
+            message: "Prompt refinement returned an invalid result. Try again or check the text runtime.",
+            retryable: true,
+          });
         }
       }
 
@@ -406,16 +340,14 @@ export async function optimizePrompt({
       };
     } catch (error) {
       lastError = error;
-      // try next backend
     }
   }
 
-  // All backends exhausted (or none configured). Rule-based fallback keeps the
-  // Studio flow alive: an un-optimized but usable prompt is better than 503.
-  void lastError;
-  return {
-    provider: "rule-fallback",
-    model: "none",
-    optimizedPrompt: buildRuleFallback(input, language),
-  };
+  if (lastError instanceof ApiError) throw lastError;
+  throw new ApiError({
+    status: 503,
+    code: "prompt_optimizer_unavailable",
+    message: "Prompt refinement is unavailable. Check the text runtime in Settings.",
+    retryable: true,
+  });
 }

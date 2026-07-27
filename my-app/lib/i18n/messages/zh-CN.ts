@@ -253,7 +253,6 @@ const zhCN = {
     "styleSelected": "风格已选择：{name}",
     "promptRequired": "输入提示词或选风格。",
     "promptOptimized": "提示词优化完成",
-    "promptRuleFallback": "已用本地规则改写提示词",
     "optimizeFailed": "提示词优化失败",
     "videoPromptRequired": "请输入视频提示词。",
     "videoStarted": "视频已开始...",

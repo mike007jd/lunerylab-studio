@@ -30,6 +30,7 @@ function entry(id: string): GenerationEntry {
     referenceAssetIds: [],
     batchVariants: null,
     generationParameters: {},
+    videoDuration: null,
     assets: [],
     warnings: [],
     error: null,

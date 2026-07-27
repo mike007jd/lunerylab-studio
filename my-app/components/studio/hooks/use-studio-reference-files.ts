@@ -56,7 +56,11 @@ function moveFileByKey(files: File[], key: string, direction: -1 | 1): File[] {
   return next;
 }
 
-async function uploadReferenceAsset(file: File, projectId: string): Promise<string> {
+async function uploadReferenceAsset(
+  file: File,
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("projectId", projectId);
@@ -64,6 +68,7 @@ async function uploadReferenceAsset(file: File, projectId: string): Promise<stri
   const payload = await fetchJson<{ asset: { id: string } }>("/api/assets/upload", {
     method: "POST",
     body: formData,
+    signal,
   });
   return payload.asset.id;
 }
@@ -151,12 +156,12 @@ export function useStudioReferenceFiles(maxReferenceFiles: number) {
   );
 
   const uploadReferenceAssets = useCallback(
-    async (projectId: string): Promise<string[]> => {
+    async (projectId: string, signal?: AbortSignal): Promise<string[]> => {
       if (!files.length) {
         return [];
       }
 
-      const uploads = files.map((file) => uploadReferenceAsset(file, projectId));
+      const uploads = files.map((file) => uploadReferenceAsset(file, projectId, signal));
       return Promise.all(uploads);
     },
     [files]

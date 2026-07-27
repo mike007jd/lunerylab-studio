@@ -50,6 +50,7 @@ function entry(overrides: Partial<GenerationEntry> = {}): GenerationEntry {
     referenceAssetIds: [],
     batchVariants: null,
     generationParameters: { seed: 7 },
+    videoDuration: null,
     assets: [],
     warnings: [],
     error: null,
