@@ -35,30 +35,32 @@ These overrides keep the full dependency audit clean for launch while avoiding
 unrelated framework or product-library upgrades:
 
 - `flatted` -> `3.4.2`
-- `@hono/node-server` -> `1.19.14`
-- `fast-uri` -> `3.1.2`
-- `hono` -> `4.12.26`
+- `@hono/node-server` -> `2.0.11`
+- `body-parser` -> `2.3.0`
+- `fast-uri` -> `3.1.4`
+- `hono` -> `4.12.31`
 - `ip-address` -> `10.2.0`
 - `js-yaml` -> `4.3.0`
 - `qs` -> `6.15.2`
 - `path-to-regexp@>=8.0.0 <8.4.2` -> `8.4.2`
 - `picomatch@^2.0.0` -> `2.3.2`
 - `picomatch@^4.0.0` -> `4.0.4`
-- `brace-expansion@^1.0.0` -> `1.1.16`
+- `brace-expansion@^1.0.0` -> `5.0.8`
 - `brace-expansion@^5.0.0` -> `5.0.8`
-
-GHSA-mh99-v99m-4gvg is fixed in 5.0.8. The legacy 1.x line has no patched
-release as of 2026-07-27 and is still required by minimatch 3 in ESLint tooling.
-A cross-major override is not compatible (`minimatch` expects the 1.x
-CommonJS function, while 5.x exposes named exports) and makes `pnpm lint`
-crash. Keep the audit red and visible until the upstream toolchain removes that
-dependency; do not suppress the advisory or substitute the incompatible major.
+- `sharp` -> `0.35.3`
 - `undici` -> `6.27.0`
+
+GHSA-mh99-v99m-4gvg is fixed in 5.0.8. ESLint and its current React/accessibility
+plugins still resolve `minimatch@3.1.5`, whose declared dependency expects the
+legacy `brace-expansion` CommonJS function. The workspace therefore lifts that
+edge to 5.0.8 and applies `patches/minimatch@3.1.5.patch`, which reads the
+current named `.expand` export. A fresh install, representative brace globbing,
+`pnpm lint`, and both full and production audits pass with this pairing.
 
 The vulnerable paths observed on 2026-06-08 were in development tooling:
 `eslint`, `eslint-config-next`, `shadcn`, and their MCP / Express / globbing
-transitives. Production audit was already clean, but launch CI treats the full
-audit as a required gate.
+transitives. Launch CI treats the full audit as a required gate, so the patch
+does not suppress, ignore, or lower the advisory threshold.
 
 ## When to remove
 
@@ -66,3 +68,16 @@ Each override stops being necessary once **every** transitive consumer in the
 lockfile resolves to a version at or above the override floor on its own. Use
 `pnpm why <pkg>` to verify before deleting an entry; if the override is
 removed prematurely, the issue reappears silently.
+
+The minimatch compatibility patch has a stricter atomic removal rule. Only
+remove it after `pnpm why minimatch brace-expansion` shows that every consumer
+has left minimatch 3. Remove all four pieces together:
+
+1. the `brace-expansion@^1.0.0` override;
+2. `patchedDependencies.minimatch@3.1.5`;
+3. `patches/minimatch@3.1.5.patch`;
+4. the corresponding lockfile entries.
+
+Then verify from a fresh install with `pnpm lint`, `pnpm verify`,
+`pnpm audit --audit-level moderate`, and
+`pnpm audit --prod --audit-level moderate`.
