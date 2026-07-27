@@ -25,4 +25,3 @@ icon_locations = {
     'Lunery Lab Studio.app': (180, 170),
     'Applications': (480, 170),
 }
-hide_extensions = ['Lunery Lab Studio.app']

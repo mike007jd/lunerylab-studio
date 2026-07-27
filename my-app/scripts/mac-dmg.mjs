@@ -167,6 +167,17 @@ function assertLocation(actual, expected, label) {
   }
 }
 
+function verifyDeveloperIdSignatureIfPresent(appPath) {
+  const signature = spawnSync(
+    "codesign",
+    ["-dv", "--verbose=4", appPath],
+    { encoding: "utf8", shell: false },
+  );
+  if (signature.status !== 0) return;
+  if (!commandOutput(signature).includes("Authority=Developer ID Application:")) return;
+  run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath]);
+}
+
 function xmlEscape(value) {
   return value
     .replaceAll("&", "&amp;")
@@ -273,6 +284,7 @@ export async function verifyMacDmg({ dmgPath, appIconPath, evidencePath }) {
     const applicationsPath = path.join(mountPath, "Applications");
     const backgroundPath = path.join(mountPath, ".background.tiff");
     if (!existsSync(mountedAppPath)) throw new Error(`Mounted DMG is missing ${APP_BUNDLE_NAME}.`);
+    verifyDeveloperIdSignatureIfPresent(mountedAppPath);
     if (!lstatSync(applicationsPath).isSymbolicLink() || readlinkSync(applicationsPath) !== "/Applications") {
       throw new Error("Mounted DMG Applications entry must be a symlink to /Applications.");
     }
