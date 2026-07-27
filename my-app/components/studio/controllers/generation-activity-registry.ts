@@ -10,6 +10,7 @@ export interface GenerationActivity {
   requestController: AbortController;
   pollController: AbortController;
   cancelRequested: boolean;
+  cancelAcknowledgement: Promise<void> | null;
 }
 
 const EMPTY_SNAPSHOT: ReadonlyMap<string, GenerationActivity> = new Map();
@@ -39,21 +40,50 @@ export class GenerationActivityRegistry {
     return this.snapshot.size > 0;
   }
 
-  begin(activity: Omit<GenerationActivity, "cancelRequested">): boolean {
+  begin(
+    activity: Omit<GenerationActivity, "cancelRequested" | "cancelAcknowledgement">,
+  ): boolean {
     if (this.snapshot.has(activity.entryId)) return false;
     const next = new Map(this.snapshot);
-    next.set(activity.entryId, { ...activity, cancelRequested: false });
+    next.set(activity.entryId, {
+      ...activity,
+      cancelRequested: false,
+      cancelAcknowledgement: null,
+    });
     this.publish(next);
     return true;
   }
 
-  setCancelRequested(entryId: string, runId: string, cancelRequested: boolean): boolean {
+  startCancellation(
+    entryId: string,
+    runId: string,
+    cancelAcknowledgement: Promise<void>,
+  ): boolean {
     const current = this.snapshot.get(entryId);
-    if (!current || current.runId !== runId || current.cancelRequested === cancelRequested) {
+    if (!current || current.runId !== runId || current.cancelRequested) {
       return false;
     }
     const next = new Map(this.snapshot);
-    next.set(entryId, { ...current, cancelRequested });
+    next.set(entryId, {
+      ...current,
+      cancelRequested: true,
+      cancelAcknowledgement,
+    });
+    this.publish(next);
+    return true;
+  }
+
+  resetCancellation(entryId: string, runId: string): boolean {
+    const current = this.snapshot.get(entryId);
+    if (!current || current.runId !== runId || !current.cancelRequested) {
+      return false;
+    }
+    const next = new Map(this.snapshot);
+    next.set(entryId, {
+      ...current,
+      cancelRequested: false,
+      cancelAcknowledgement: null,
+    });
     this.publish(next);
     return true;
   }

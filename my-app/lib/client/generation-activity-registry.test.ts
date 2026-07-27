@@ -26,7 +26,7 @@ describe("generation activity registry", () => {
   it("ignores a stale completion after cancel and retry", () => {
     const registry = new GenerationActivityRegistry();
     registry.begin(activity("A", "run-1"));
-    registry.setCancelRequested("A", "run-1", true);
+    registry.startCancellation("A", "run-1", Promise.resolve());
     registry.finish("A", "run-1");
     registry.begin(activity("A", "run-2"));
 

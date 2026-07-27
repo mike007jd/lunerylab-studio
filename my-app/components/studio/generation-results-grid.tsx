@@ -168,7 +168,11 @@ export const GenerationResultsGrid = memo(function GenerationResultsGrid({
               onRegenerate={() => onRegenerate(entry.id)}
               onSendToCanvas={(asset) => onSendToCanvas(entry.id, asset)}
               onDismiss={() => onDismiss(entry.id)}
-              onCancel={onCancel ? () => onCancel(entry.id) : undefined}
+              onCancel={
+                onCancel && entry.mode === "image" && entry.status === "running"
+                  ? () => onCancel(entry.id)
+                  : undefined
+              }
               onReuseParameters={
                 onReuseParameters ? () => onReuseParameters(entry.id) : undefined
               }

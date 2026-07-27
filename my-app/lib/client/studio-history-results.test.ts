@@ -149,6 +149,49 @@ describe("Studio history efficiency", () => {
     );
   });
 
+  it("passes Cancel only for running image entries when the grid has onCancel", () => {
+    const onCancel = () => {};
+    const imageRunning = { ...entry("image-1"), status: "running" as const };
+    const videoRunning = {
+      ...entry("video-1"),
+      mode: "video" as const,
+      status: "running" as const,
+      videoDuration: 6,
+    };
+
+    const imageOnly = renderInEnglish(
+      createElement(GenerationResultsGrid, {
+        entries: [imageRunning],
+        onRegenerate: () => {},
+        onSendToCanvas: () => {},
+        onDismiss: () => {},
+        onCancel,
+      }),
+    );
+    const videoOnly = renderInEnglish(
+      createElement(GenerationResultsGrid, {
+        entries: [videoRunning],
+        onRegenerate: () => {},
+        onSendToCanvas: () => {},
+        onDismiss: () => {},
+        onCancel,
+      }),
+    );
+    const mixed = renderInEnglish(
+      createElement(GenerationResultsGrid, {
+        entries: [imageRunning, videoRunning],
+        onRegenerate: () => {},
+        onSendToCanvas: () => {},
+        onDismiss: () => {},
+        onCancel,
+      }),
+    );
+
+    expect(imageOnly).toContain(">Cancel<");
+    expect(videoOnly).not.toContain(">Cancel<");
+    expect(mixed.match(/>Cancel</g)).toHaveLength(1);
+  });
+
   it("renders cancellation as a muted retryable state", () => {
     const content = createElement(GenerationResultsGrid, {
       entries: [{ ...entry("canceled-1"), status: "canceled" as const }],

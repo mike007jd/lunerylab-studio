@@ -5,13 +5,16 @@ import type {
   GenerationEntry,
   NewEntryInput,
 } from "@/components/studio/use-studio-generation-history";
+import type { SdProgress } from "@/lib/types/sd-progress";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function entry(id: string): GenerationEntry {
@@ -107,6 +110,20 @@ function fakeHistory(initial: GenerationEntry[]) {
   };
 }
 
+function createProgressStore() {
+  let progressByEntry: Record<string, SdProgress | undefined> = {};
+  return {
+    get: () => progressByEntry,
+    setProgress(
+      updater: (
+        current: Record<string, SdProgress | undefined>,
+      ) => Record<string, SdProgress | undefined>,
+    ) {
+      progressByEntry = updater(progressByEntry);
+    },
+  };
+}
+
 describe("image generation controller concurrency", () => {
   it("does not mark a terminal entry running when the registry rejects a duplicate retry", async () => {
     const history = fakeHistory([entry("A")]);
@@ -170,12 +187,150 @@ describe("image generation controller concurrency", () => {
     await retryB;
     expect(registry.anyActive()).toBe(false);
   });
+});
 
-  it("prevents a stale completion from overwriting cancel and retry", async () => {
+describe("acknowledged image cancellation ownership", () => {
+  it("waits for native acknowledgement and keeps registry/progress active beforehand", async () => {
+    const history = fakeHistory([entry("A")]);
+    const registry = new GenerationActivityRegistry();
+    const progress = createProgressStore();
+    const request = deferred<unknown>();
+    const nativeCancel = deferred<void>();
+    const cancelNative = vi.fn(() => nativeCancel.promise);
+    const controller = createImageGenerationController({
+      registry,
+      history,
+      imageModels: [],
+      t: (key) => key,
+      setProgress: progress.setProgress,
+      request: vi.fn().mockReturnValue(request.promise),
+      pollProgress: vi.fn(async () => undefined),
+      cancelNative,
+      createRunId: () => "run-1",
+    });
+
+    const running = controller.retry("A");
+    expect(registry.get("A")?.runId).toBe("run-1");
+    expect(progress.get()["A"]?.runId).toBe("run-1");
+
+    const cancelPromise = controller.cancel("A");
+    expect(cancelNative).toHaveBeenCalledWith("run-1");
+    expect(registry.get("A")?.cancelRequested).toBe(true);
+    expect(registry.get("A")?.runId).toBe("run-1");
+    expect(progress.get()["A"]?.runId).toBe("run-1");
+    expect(history.find("A")?.status).toBe("running");
+    expect(registry.get("A")?.requestController.signal.aborted).toBe(false);
+
+    request.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+    await Promise.resolve();
+    expect(registry.get("A")?.runId).toBe("run-1");
+    expect(progress.get()["A"]?.runId).toBe("run-1");
+    expect(history.find("A")?.status).toBe("running");
+
+    nativeCancel.resolve();
+    await expect(cancelPromise).resolves.toBe(true);
+    await expect(running).resolves.toMatchObject({
+      started: true,
+      stale: false,
+      error: null,
+    });
+    expect(history.find("A")?.status).toBe("canceled");
+    expect(registry.get("A")).toBeUndefined();
+    expect(progress.get()["A"]).toBeUndefined();
+  });
+
+  it("propagates acknowledgement failure without aborting, finishing, or terminal history", async () => {
+    const history = fakeHistory([entry("A")]);
+    const registry = new GenerationActivityRegistry();
+    const progress = createProgressStore();
+    const request = deferred<unknown>();
+    const cancelNative = vi.fn(async () => {
+      throw new Error("native cancel failed");
+    });
+    const controller = createImageGenerationController({
+      registry,
+      history,
+      imageModels: [],
+      t: (key) => key,
+      setProgress: progress.setProgress,
+      request: vi.fn().mockReturnValue(request.promise),
+      pollProgress: vi.fn(async () => undefined),
+      cancelNative,
+      createRunId: () => "run-1",
+    });
+
+    const running = controller.retry("A");
+    await expect(controller.cancel("A")).rejects.toThrow("native cancel failed");
+
+    expect(registry.get("A")?.runId).toBe("run-1");
+    expect(registry.get("A")?.cancelRequested).toBe(false);
+    expect(registry.get("A")?.requestController.signal.aborted).toBe(false);
+    expect(history.find("A")?.status).toBe("running");
+    expect(progress.get()["A"]?.runId).toBe("run-1");
+
+    request.resolve(response("still-running"));
+    await expect(running).resolves.toMatchObject({ stale: false });
+    expect(history.find("A")?.status).toBe("succeeded");
+    expect(history.find("A")?.assets[0]?.id).toBe("still-running");
+  });
+
+  it("rejects retry during cancel teardown and allows retry after teardown", async () => {
+    const history = fakeHistory([entry("A")]);
+    const registry = new GenerationActivityRegistry();
+    const progress = createProgressStore();
+    const oldRequest = deferred<unknown>();
+    const newRequest = deferred<unknown>();
+    const nativeCancel = deferred<void>();
+    const request = vi.fn()
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(newRequest.promise);
+    const controller = createImageGenerationController({
+      registry,
+      history,
+      imageModels: [],
+      t: (key) => key,
+      setProgress: progress.setProgress,
+      request,
+      pollProgress: vi.fn(async () => undefined),
+      cancelNative: vi.fn(() => nativeCancel.promise),
+      createRunId: (() => {
+        let id = 0;
+        return () => `run-${++id}`;
+      })(),
+    });
+
+    const oldRetry = controller.retry("A");
+    const cancelPromise = controller.cancel("A");
+
+    await expect(controller.retry("A")).resolves.toEqual({ started: false });
+    expect(registry.get("A")?.runId).toBe("run-1");
+    expect(history.find("A")?.status).toBe("running");
+
+    nativeCancel.resolve();
+    await expect(cancelPromise).resolves.toBe(true);
+    await expect(controller.retry("A")).resolves.toEqual({ started: false });
+
+    oldRequest.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+    await expect(oldRetry).resolves.toMatchObject({ stale: false });
+    expect(history.find("A")?.status).toBe("canceled");
+    expect(registry.get("A")).toBeUndefined();
+    expect(progress.get()["A"]).toBeUndefined();
+
+    const newRetry = controller.retry("A");
+    expect(registry.get("A")).toBeDefined();
+    expect(registry.get("A")?.runId).not.toBe("run-1");
+    newRequest.resolve(response("new"));
+    await expect(newRetry).resolves.toMatchObject({ stale: false });
+    expect(history.find("A")?.status).toBe("succeeded");
+    expect(history.find("A")?.assets[0]?.id).toBe("new");
+  });
+
+  it("prevents a non-cooperative old completion from overwriting cancel or a later retry", async () => {
     const history = fakeHistory([entry("A")]);
     const registry = new GenerationActivityRegistry();
     const oldRequest = deferred<unknown>();
     const newRequest = deferred<unknown>();
+    const nativeCancel = deferred<void>();
     const controller = createImageGenerationController({
       registry,
       history,
@@ -186,7 +341,7 @@ describe("image generation controller concurrency", () => {
         .mockReturnValueOnce(oldRequest.promise)
         .mockReturnValueOnce(newRequest.promise),
       pollProgress: vi.fn(async () => undefined),
-      cancelNative: vi.fn(async () => undefined),
+      cancelNative: vi.fn(() => nativeCancel.promise),
       createRunId: (() => {
         let id = 0;
         return () => `run-${++id}`;
@@ -194,17 +349,29 @@ describe("image generation controller concurrency", () => {
     });
 
     const oldRetry = controller.retry("A");
-    await controller.cancel("A");
+    const cancelPromise = controller.cancel("A");
+    oldRequest.resolve(response("old"));
+    await Promise.resolve();
+    expect(registry.get("A")?.runId).toBe("run-1");
+    expect(history.find("A")?.status).toBe("running");
+
+    nativeCancel.resolve();
+    await expect(cancelPromise).resolves.toBe(true);
+    await expect(oldRetry).resolves.toMatchObject({
+      started: true,
+      outcome: null,
+      stale: false,
+    });
+    expect(history.find("A")?.status).toBe("canceled");
+    expect(history.find("A")?.assets).toEqual([]);
+    expect(registry.get("A")).toBeUndefined();
+
     const newRetry = controller.retry("A");
     expect(registry.get("A")?.runId).toBe("run-2");
-
-    oldRequest.resolve(response("old"));
-    await expect(oldRetry).resolves.toMatchObject({ stale: true });
-    expect(history.find("A")?.assets).toEqual([]);
-
     newRequest.resolve(response("new"));
     await expect(newRetry).resolves.toMatchObject({ stale: false });
     expect(history.find("A")?.assets[0]?.id).toBe("new");
     expect(history.find("A")?.status).toBe("succeeded");
   });
+
 });

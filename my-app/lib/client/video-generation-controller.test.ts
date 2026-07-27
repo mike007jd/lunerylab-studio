@@ -111,7 +111,7 @@ describe("entry-aware video generation controller", () => {
     registry.abortAll();
   });
 
-  it("serializes polls and ignores a stale poll after cancel/retry", async () => {
+  it("serializes polls and ignores a poll after registry ownership is replaced", async () => {
     const history = fakeHistory();
     const registry = new GenerationActivityRegistry();
     const oldStatus = deferred<unknown>();
@@ -149,7 +149,7 @@ describe("entry-aware video generation controller", () => {
     await Promise.resolve();
     expect(statusCount).toBe(1);
 
-    expect(controller.cancel("video-A")).toBe(true);
+    expect(registry.finish("video-A", "video-run-1")).toBe(true);
     await controller.retry("video-A");
     expect(registry.get("video-A")?.runId).toBe("video-run-2");
 

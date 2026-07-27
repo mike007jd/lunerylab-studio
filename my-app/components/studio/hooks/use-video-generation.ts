@@ -304,18 +304,7 @@ export function createVideoGenerationController({
     );
   };
 
-  const cancel = (entryId: string): boolean => {
-    const activity = registry.get(entryId);
-    if (!activity || activity.mode !== "video" || activity.cancelRequested) return false;
-    registry.setCancelRequested(entryId, activity.runId, true);
-    activity.requestController.abort();
-    activity.pollController.abort();
-    history.update(entryId, { status: "canceled", error: null });
-    registry.finish(entryId, activity.runId);
-    return true;
-  };
-
-  return { submit, retry, cancel };
+  return { submit, retry };
 }
 
 export function useVideoGenerationController({

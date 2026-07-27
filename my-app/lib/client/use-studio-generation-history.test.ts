@@ -60,8 +60,9 @@ function entry(overrides: Partial<GenerationEntry> = {}): GenerationEntry {
 }
 
 describe("Studio history current Lunery schema", () => {
-  it("uses the current storage key", () => {
-    expect(STUDIO_HISTORY_STORAGE_KEY).toBe("lunerylab:studio-history");
+  it("uses the exact v2 storage key for an explicit prelaunch reset", () => {
+    expect(STUDIO_HISTORY_STORAGE_KEY).toBe("lunerylab:studio-history:v2");
+    expect(STUDIO_HISTORY_STORAGE_KEY).not.toBe("lunerylab:studio-history");
     expect(STUDIO_HISTORY_STORAGE_KEY).not.toContain("luna:studio-history");
   });
 

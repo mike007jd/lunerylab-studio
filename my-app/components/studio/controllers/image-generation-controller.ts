@@ -140,6 +140,27 @@ export function createImageGenerationController({
     );
   };
 
+  const awaitCancellationDecision = async (
+    entryId: string,
+    runId: string,
+  ): Promise<"none" | "confirmed" | "failed"> => {
+    const activity = registry.get(entryId);
+    if (
+      !activity ||
+      activity.runId !== runId ||
+      !activity.cancelRequested ||
+      !activity.cancelAcknowledgement
+    ) {
+      return "none";
+    }
+    try {
+      await activity.cancelAcknowledgement;
+      return registry.isCurrent(entryId, runId) ? "confirmed" : "none";
+    } catch {
+      return "failed";
+    }
+  };
+
   const execute = async (
     input: ImageRunInput,
     runId: string,
@@ -169,6 +190,18 @@ export function createImageGenerationController({
       if (!registry.isCurrent(input.entryId, runId)) {
         return { started: true, entryId: input.entryId, outcome: null, error: null, stale: true };
       }
+      const cancellation = await awaitCancellationDecision(input.entryId, runId);
+      if (!registry.isCurrent(input.entryId, runId)) {
+        return { started: true, entryId: input.entryId, outcome: null, error: null, stale: true };
+      }
+      // Some request implementations can still resolve after abort. Route that
+      // completion through the same abort catch so cancellation has one
+      // terminal-state owner.
+      if (cancellation === "confirmed") {
+        const abortError = new Error("Image generation was canceled.");
+        abortError.name = "AbortError";
+        throw abortError;
+      }
       const outcome = resolveImageGenerationOutcome(
         generationResponseSchema.parse(payload),
         t("studio.generationFailed"),
@@ -191,10 +224,19 @@ export function createImageGenerationController({
       if (!registry.isCurrent(input.entryId, runId)) {
         return { started: true, entryId: input.entryId, outcome: null, error: null, stale: true };
       }
-      const aborted = isRequestAbortedError(error);
+      const cancellation = await awaitCancellationDecision(input.entryId, runId);
+      if (!registry.isCurrent(input.entryId, runId)) {
+        return { started: true, entryId: input.entryId, outcome: null, error: null, stale: true };
+      }
+      const requestAborted = isRequestAbortedError(error);
+      const aborted =
+        cancellation === "confirmed" ||
+        (cancellation === "none" && requestAborted);
       const message = aborted
         ? null
-        : toActionableGenerationError(error, t("studio.generationFailed"), t);
+        : cancellation === "failed" && requestAborted
+          ? t("studio.cancelFailed")
+          : toActionableGenerationError(error, t("studio.generationFailed"), t);
       history.update(input.entryId, {
         status: aborted ? "canceled" : "failed",
         error: message,
@@ -334,25 +376,26 @@ export function createImageGenerationController({
     );
   };
 
-  const cancel = (entryId: string): boolean => {
+  const cancel = async (entryId: string): Promise<boolean> => {
     const activity = registry.get(entryId);
     if (!activity || activity.mode !== "image" || activity.cancelRequested) return false;
-    registry.setCancelRequested(entryId, activity.runId, true);
-    activity.requestController.abort();
-    activity.pollController.abort();
-    history.update(entryId, { status: "canceled", error: null });
-    setProgress((current) => {
-      const progress = current[entryId];
-      if (!progress || progress.runId !== activity.runId) return current;
-      return {
-        ...current,
-        [entryId]: { ...progress, phase: "canceled", updatedAtMs: Date.now() },
-      };
-    });
-    registry.finish(entryId, activity.runId);
-    // Native SD cancellation is advisory; the request abort and registry
-    // transition above are the client-side authority.
-    void cancelNative(activity.runId).catch(() => undefined);
+    const { runId, requestController, pollController } = activity;
+    const acknowledgement = cancelNative(runId);
+    if (!registry.startCancellation(entryId, runId, acknowledgement)) {
+      void acknowledgement.catch(() => undefined);
+      return false;
+    }
+    try {
+      await acknowledgement;
+    } catch (error) {
+      if (registry.isCurrent(entryId, runId)) {
+        registry.resetCancellation(entryId, runId);
+      }
+      throw error;
+    }
+    if (!registry.isCurrent(entryId, runId)) return false;
+    requestController.abort();
+    pollController.abort();
     return true;
   };
 

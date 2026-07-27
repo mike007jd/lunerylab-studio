@@ -260,14 +260,16 @@ export function useStudioGenerationActions({
     async (entryId: string) => {
       setError("");
       const entry = history.find(entryId);
-      if (!entry) return;
-      if (entry.mode === "image") {
+      // Image cancellation is the only UI-exposed cancel path. Video cards never
+      // receive Cancel, and this action must not invoke the video client cancel.
+      if (!entry || entry.mode !== "image") return;
+      try {
         await imageGeneration.cancel(entryId);
-      } else {
-        videoGeneration.cancel(entryId);
+      } catch {
+        setError(t("studio.cancelFailed"));
       }
     },
-    [history, imageGeneration, setError, videoGeneration],
+    [history, imageGeneration, setError, t],
   );
 
   const onPromptKeyDown = useCallback(

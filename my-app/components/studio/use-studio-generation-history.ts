@@ -40,7 +40,7 @@ function nextId(): string {
   return crypto.randomUUID();
 }
 
-export const STUDIO_HISTORY_STORAGE_KEY = "lunerylab:studio-history";
+export const STUDIO_HISTORY_STORAGE_KEY = "lunerylab:studio-history:v2";
 const STORAGE_KEY = STUDIO_HISTORY_STORAGE_KEY;
 export const STUDIO_HISTORY_LIMIT = 60;
 
