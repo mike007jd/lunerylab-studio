@@ -156,6 +156,8 @@ Reduce:
 - prevents `studio-page.tsx`, `generation-results-grid.tsx`, and the custom UI scanner from growing;
 - allows every reduction without baseline edits;
 - rejects a newly introduced oversized module unless it receives an explicit reviewed temporary ceiling;
+- rejects growth in an existing oversized legacy module while allowing it to stay flat or shrink;
+- compares against `HEAD^`, while named hotspots also have fixed reviewed ceilings;
 - prints the next intended ownership boundary in CI.
 
 ## Completion criteria
