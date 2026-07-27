@@ -1,0 +1,59 @@
+{
+  "$schemaVersion": 1,
+  "roots": [
+    "app",
+    "components",
+    "hooks",
+    "lib",
+    "scripts",
+    "src-tauri/src"
+  ],
+  "extensions": [
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".rs",
+    ".ts",
+    ".tsx"
+  ],
+  "ignore": [
+    "**/*.d.ts",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "components/ui/**"
+  ],
+  "limits": {
+    "route": 400,
+    "hook": 450,
+    "react": 700,
+    "rust": 800,
+    "script": 800,
+    "source": 650,
+    "test": 900
+  },
+  "hotspots": {
+    "components/studio/studio-page.tsx": {
+      "category": "react",
+      "ceilingLines": 1259,
+      "targetLines": 450,
+      "reason": "Owns image/video composition, projects, references, request lifecycle, progress polling, cancellation, retry, history, and the complete UI.",
+      "nextBoundary": "Extract image/video generation controllers and a keyed activity registry before splitting the presentation component."
+    },
+    "components/studio/generation-results-grid.tsx": {
+      "category": "react",
+      "ceilingLines": 817,
+      "targetLines": 400,
+      "reason": "Owns list orchestration, running/failed states, asset actions, comparison, download, and modal presentation.",
+      "nextBoundary": "Split GenerationEntryCard, RunningCard, FailedCard, AssetTile, and CompareDialog while retaining entry-level status ownership."
+    },
+    "scripts/check-ui-framework.mjs": {
+      "category": "script",
+      "ceilingLines": 529,
+      "targetLines": 250,
+      "reason": "A custom source parser checks exact implementation shapes that belong in ESLint, rendered tests, or visual regression.",
+      "nextBoundary": "Keep count-based visual debt checks; migrate JSX behavior rules to ESLint or Testing Library."
+    }
+  }
+}
