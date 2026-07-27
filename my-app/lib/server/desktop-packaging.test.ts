@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 
 function source(path: string): string {
@@ -7,6 +8,34 @@ function source(path: string): string {
 }
 
 describe("desktop installer packaging", () => {
+  it("keeps the desktop icon transparent outside its rounded silhouette", async () => {
+    for (const path of [
+      "src-tauri/icons/icon-source.png",
+      "src-tauri/icons/icon.png",
+      "src-tauri/icons/128x128@2x.png",
+      "src-tauri/icons/128x128.png",
+      "src-tauri/icons/32x32.png",
+    ]) {
+      const { data, info } = await sharp(join(process.cwd(), path))
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const alphaAt = (x: number, y: number) => data[(y * info.width + x) * 4 + 3];
+
+      expect(alphaAt(0, 0), `${path} top-left corner`).toBe(0);
+      expect(alphaAt(info.width - 1, 0), `${path} top-right corner`).toBe(0);
+      expect(alphaAt(0, info.height - 1), `${path} bottom-left corner`).toBe(0);
+      expect(
+        alphaAt(info.width - 1, info.height - 1),
+        `${path} bottom-right corner`,
+      ).toBe(0);
+      expect(
+        alphaAt(Math.floor(info.width / 2), Math.floor(info.height / 2)),
+        `${path} center`,
+      ).toBe(255);
+    }
+  });
+
   it("routes each platform through one controlled packaging entrypoint", () => {
     const packageJson = JSON.parse(source("package.json"));
     const tauri = JSON.parse(source("src-tauri/tauri.conf.json"));
@@ -36,10 +65,12 @@ describe("desktop installer packaging", () => {
     expect(dmg).toContain('["attach", "-readonly", "-nobrowse", "-noautoopen", "-plist", dmgPath]');
     expect(dmg).toContain('readlinkSync(applicationsPath) !== "/Applications"');
     expect(dmg).toContain('run("hdiutil", ["verify", dmgPath])');
+    expect(dmg).toContain('["--verify", "--deep", "--strict", "--verbose=2", appPath]');
     expect(settings).toContain("background = 'builtin-arrow'");
     expect(settings).toContain("window_rect = ((200, 120), (660, 400))");
     expect(settings).toContain("'Lunery Lab Studio.app': (180, 170)");
     expect(settings).toContain("'Applications': (480, 170)");
+    expect(settings).not.toContain("hide_extensions");
   });
 
   it("keeps release signing and notarization in the required artifact order", () => {
