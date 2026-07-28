@@ -715,9 +715,6 @@ fn desktop_server_env_candidates(
     // Immediate, already-resolved dirs only.
     let mut candidates = Vec::new();
     push_env_dir_candidates(&mut candidates, &dirs.config);
-    if let Ok(data_dir) = app.path().app_data_dir() {
-        push_env_dir_candidates(&mut candidates, &data_dir);
-    }
     if let Some(local_app_root) = server_root.parent() {
         push_env_dir_candidates(&mut candidates, local_app_root);
     }

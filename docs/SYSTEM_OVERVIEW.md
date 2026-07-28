@@ -1,7 +1,5 @@
 # System Overview
 
-Checked on 2026-06-18 against the current repository.
-
 This document is the operating map for the whole codebase. Project rules remain
 under `/spec`; this file explains how the current system is assembled.
 
@@ -97,11 +95,7 @@ Prisma models:
 
 Run from `my-app/`:
 
-- `pnpm typecheck`
-- `pnpm lint`
-- `pnpm test:unit`
+- `pnpm verify`
 - `pnpm build`
-- `pnpm ui:check`
-- `pnpm ai:freshness`
 - `pnpm desktop:check` when desktop/Tauri/runtime files change
 - `cargo test` under `my-app/src-tauri` when Rust files change

@@ -12,13 +12,11 @@
 
 ## Checklist
 
-- [ ] Code follows project style guidelines
-- [ ] Self-review completed
-- [ ] Code is commented (if complex logic)
+- [ ] Change follows the relevant `/spec` contract
+- [ ] Self-review and `git diff --check` completed
+- [ ] `cd my-app && pnpm verify && pnpm build` passes
+- [ ] Conditional desktop/Rust gates from `docs/DEV_SETUP.md` pass
 - [ ] Relevant flow verified in the live product surface
-- [ ] Build passes (`pnpm run build`)
-- [ ] Lint passes (`pnpm run lint`)
-- [ ] Typecheck passes (`pnpm exec tsc --noEmit`)
 
 ## Screenshots (if applicable)
 

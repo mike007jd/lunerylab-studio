@@ -1,7 +1,5 @@
 # SDK Integration Governance
 
-Checked on 2026-06-18.
-
 ## Source Hierarchy
 
 Use this order when changing AI or SDK integrations:

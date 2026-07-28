@@ -24,9 +24,11 @@
 
 ### Environment
 
-- OS: [e.g., macOS 14.0, Ubuntu 22.04]
-- Node.js version: [e.g., 20.10.0]
-- Package manager: [e.g., pnpm 8.x]
+- App version:
+- OS: [macOS or Windows, including version]
+- Hardware: [chip/CPU, memory, GPU if relevant]
+- Runtime or model source:
+- Development only: [Node.js and pnpm versions]
 
 ### Additional Context
 

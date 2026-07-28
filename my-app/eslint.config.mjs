@@ -16,7 +16,7 @@ const eslintConfig = defineConfig([
     "src-tauri/target/**",
     "next-env.d.ts",
   ]),
-  // No-default-model guardrail. The product policy (CLAUDE.md / AGENTS.md) is
+  // No-default-model guardrail. The product policy (spec/AI_RUNTIME.md) is
   // that we never silently substitute a vendor model id for the user. The
   // only legitimate places to mention concrete model ids by literal are:
   //   - lib/byok-providers.ts                          (catalog + UI hints)
@@ -47,13 +47,13 @@ const eslintConfig = defineConfig([
           selector:
             "Literal[value=/^(dall-e|gpt-image|flux|veo|qwen|kling|wan|meshy|tripo)[-/:]/i]",
           message:
-            "Hardcoded model id is forbidden outside the BYOK provider catalog + server dispatch. See CLAUDE.md → “NO DEFAULT MODEL”. The user must pick or connect a model; empty stays empty.",
+            "Hardcoded model id is forbidden outside the BYOK provider catalog + server dispatch. See spec/AI_RUNTIME.md, “NO DEFAULT MODEL”. The user must pick or connect a model; empty stays empty.",
         },
         {
           selector:
             "TemplateElement[value.cooked=/^(dall-e|gpt-image|flux|veo|qwen|kling|wan|meshy|tripo)[-/:]/i]",
           message:
-            "Hardcoded model id (template literal) is forbidden outside the BYOK provider catalog + server dispatch. See CLAUDE.md → “NO DEFAULT MODEL”.",
+            "Hardcoded model id (template literal) is forbidden outside the BYOK provider catalog + server dispatch. See spec/AI_RUNTIME.md, “NO DEFAULT MODEL”.",
         },
       ],
     },

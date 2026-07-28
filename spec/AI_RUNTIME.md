@@ -25,8 +25,8 @@ Model supply has two explicit layers:
 - Catalog/pickers may pre-select the first *actually-available* model — never
   an invented constant.
 - Rationale: this is a local-first / BYOK / account-less product, and every
-  hardcoded model string eventually goes stale or dead (DALL·E shut down
-  2026-05-12) and silently fails the user.
+  hardcoded model string eventually becomes stale or deprecated and silently
+  fails the user.
 - **Enforcement**: wired into ESLint as `no-restricted-syntax` in
   `my-app/eslint.config.mjs`. Violations are caught at lint time, not in
   review. Adding a model-id literal outside the BYOK catalog or server
@@ -81,10 +81,9 @@ Model supply has two explicit layers:
   `LUNERY_DATA_DIR` / `LUNERY_PGLITE_DIR` / `LUNERY_MEDIA_DIR` /
   `LUNERY_MODELS_DIR` / `LUNERY_LOG_DIR` / `LUNERY_RUNTIME_DIR` as resolved by
   `my-app/lib/server/lunery-profile.ts` and `my-app/src-tauri/src/profile.rs`.
-  Legacy locations (`~/Library/Application Support/com.lunerylab.studio`,
+  Retired locations (`~/Library/Application Support/com.lunerylab.studio`,
   `~/Library/Logs/com.lunerylab.studio`, `my-app/.desktop-dev`, `my-app/data`,
-  and `~/.cache/lunerylab/models`) are migration/compatibility sources only;
-  do not add new default writes there.
+  and `~/.cache/lunerylab/models`) must not be read, migrated, or written.
 
 ## Product positioning (informs all AI decisions)
 

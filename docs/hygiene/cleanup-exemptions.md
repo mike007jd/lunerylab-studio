@@ -1,94 +1,39 @@
-# Cleanup Exemptions Ledger
+# Cleanup Exemptions
 
-Updated: 2026-07-26 (hygiene pass: build artifacts, orphan profile, doc drift).
+Reviewed 2026-07-28. Static unused-code tools and filename scans generate
+candidates; they do not prove that a file is dead.
 
-Knip / filename scans are candidate generators only. Items below were reviewed
-and must not be re-proposed as dead without new evidence.
+## Always Preserve
 
-## CONFIG snapshot
-
-```yaml
-APP_ROOT:        my-app
-DEFAULT_BRANCH:  main
-ENTRYPOINTS:     app/** (pages+api), src-tauri/**, scripts/**, vitest, package.json scripts
-PUBLIC_API:      none  # private app; not a published library
-DOWNSTREAM:      ""    # no known external consumers
-BUILD_CMD:       pnpm build
-TEST_CMD:        pnpm test:unit
-TYPECHECK_CMD:   pnpm typecheck
-LINT_CMD:        pnpm lint
-DOCS_BUILD_CMD:  ""
-FULL_GATE_CMD:   pnpm verify
-DEAD_CODE_TOOL:  pnpm dlx knip@5
-IMPACT_TOOL:     grep+callgraph (GitNexus MCP unavailable this session)
-DOCS_ROOT:       docs/, /spec, README*, NOTICE/LICENSE, docs/adr, docs/hygiene
-QUARANTINE_DIR:  .trash/
-ARCH_SWAPS:      former versioned agent directory→runtime/ (done); ToolLoopAgent→streamText (policy); legacy profile paths→~/.lunerylab; capability-router→runtime-supply
-PRE_LAUNCH:      true
-SECURITY_KEEPLIST: desktop bridge auth; endpoint validation; file/path containment; destructive-action confirmation; no-default-model; PGlite baseline init
-```
-
-## Hard keep (project appendix)
-
-- `my-app/engine/licenses/**`, NOTICE, THIRD_PARTY_NOTICES, LICENSE
+- `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, and `my-app/engine/licenses`
 - Tauri sidecar fetch/bundle scripts and `desktop-runtime-server.mjs`
-- `@electric-sql/pglite`, `@electric-sql/pglite-socket` (spawned Node runtime + packaging copy)
-- Live design-system modules: `grammar/*`, `shell/` (content-frame)
-- Surface ownership docs under `docs/design/surfaces/*`
-- ADR `docs/adr/0001-no-auto-update.md`
-- `docs/PNPM_OVERRIDES.md` (unique override decision notes; yaml is pin source)
+- desktop bridge auth, endpoint validation, path containment, destructive-action
+  confirmation, explicit model selection, and PGlite baseline initialization
+- `docs/adr`, `docs/design/surfaces`, and `docs/PNPM_OVERRIDES.md`
 
-## Exemptions (alive / false positive)
+## Refuted Candidates
 
-| Candidate | Why KEEP |
+| Candidate | Survival evidence |
 | --- | --- |
-| `scripts/desktop-runtime-server.mjs` | Spawned by Tauri + desktop-next-dev; bundled by desktop-bundle-assets; packaging tests |
-| `@electric-sql/pglite` / `@electric-sql/pglite-socket` | Imported only by desktop-runtime-server; copied into appOut |
-| `components/design-system/shell/index.ts` | Imported by app-shell + console loading for content-frame classes |
-| shadcn unused sub-exports (DialogTrigger, etc.) | Design-system completeness / future composition; not proven theater |
-| Model catalog `compatibility` / `legacy` lifecycle | Product policy, not dead shim |
-| DB archive-on-incompatible in desktop-runtime-server | Current local safety valve |
-| `docs/PNPM_OVERRIDES.md` | Linked from OPERATIONS; unique override rationale |
-| `WEB_WORKSPACE_ROUTES` retired paths (`/tools`, `/billing`, …) | Browser deny-list / product boundary, not dead pages |
+| `@electric-sql/pglite` and `@electric-sql/pglite-socket` | Desktop runtime imports and packages them. |
+| `components/design-system/grammar` and `shell` | Live token, motion, and layout imports. |
+| Unused shadcn sub-exports | Local primitive composition surface; no zero-reference file proved dead. |
+| Model lifecycle values `compatibility` and `legacy` | Current catalog policy, not state migration. |
+| Database archive on incompatible baseline | Current local-data recovery boundary. |
+| `WEB_WORKSPACE_ROUTES` retired route names | Browser deny-list, not live pages. |
+| `docs/PNPM_OVERRIDES.md` | Unique security rationale and atomic patch exit criteria. |
+| `src-tauri/target`, `node_modules`, `.env.local`, `engine` | Intentional local build, dependency, secret, and runtime state. |
 
-## Permanently deleted (round 2, after dual skeptic)
+## Completed Convergence
 
-Recoverable via git history (`e8be661`, `0028e6a`, then this round's delete commit).
-`lunaSurfaces` owner/route/role rows were copied into `docs/design/surfaces/*`
-before deleting the TS registry.
+Recoverable from Git history:
 
-| Former path | Why deleted |
-| --- | --- |
-| `.trash/ui/avatar.tsx` | Zero product consumers; not ui:check-pinned |
-| `.trash/design-system/surface-shell.tsx` | Zero consumers; content-frame covers layout |
-| `.trash/design-system/index.ts` | Unused root barrel; deep imports used instead |
-| `.trash/design-system/primitives/index.ts` | Unused re-export facade |
-| `.trash/design-system/assistant/index.ts` | Unused; studio/agent-chat is the live boundary |
-| `.trash/design-system/surfaces/index.ts` | Unused TS registry; docs/design/surfaces owns contracts |
+- Removed unused design-system barrels and the TypeScript surface registry after
+  preserving live owner/route/state contracts in `docs/design/surfaces`.
+- Merged the hidden Luna DNA brief and duplicate UI framework guide into
+  `spec/DESIGN_RULES.md` and `spec/UX_RULES.md`.
+- Retired repo-local and opaque OS profile paths; the visible Lunery profile is
+  the only runtime contract.
 
-## Hygiene pass 2026-07-26
-
-| Action | Notes |
-| --- | --- |
-| `pnpm desktop:clean` | Removed regenerable `.next`, `desktop-server`, `desktop-dist` |
-| Removed `tsconfig.tsbuildinfo` | Ignored incremental cache |
-| Removed `~/.lunerylab/studio-dev-codex.NtA0E2` | Orphan Codex scratch profile (~41MB); kept `studio` / `studio-dev` |
-| Removed empty `.claude/skills` | Local gitignored empty dir |
-| Removed `.DS_Store` under `~/.lunerylab` | OS junk |
-| Doc drift fixes | Profile media path, no Zustand, grammar = tokens+motion only |
-| Dropped legacy gitignore entries | `my-app/data/*`, `.desktop-dev/` |
-| Renamed `phase-c-contracts.test.ts` → `generation-request-contracts.test.ts` | Historical phase name; tests live generation contracts |
-
-## Refuted / deferred
-
-| Candidate | Disposition | Notes |
-| --- | --- | --- |
-| Showcase surface claim in UI_FRAMEWORK_STACK | Doc fixed | Removed from production surface list |
-| `.ai/loops/design-invariants.md` references | Doc/gate renamed | Ledger gone; invariants live in UI_FRAMEWORK_STACK + ui:check |
-| Legacy storage env prefix rename | Done | Renamed to `LUNERY_MEDIA_DIR` / `LUNERY_MAX_UPLOAD_BYTES_PER_FILE`; removed fixed per-user storage quota |
-| Former versioned agent directory rename | Done | Renamed to `lib/server/agent/runtime/**`; entry `runAgent`; kept `runtime/` boundary (not flattened into `agent/`) to avoid outer request/runtime type collisions |
-| Former web workspace API escape hatch | Removed | Desktop-local convergence: local FS media only; workspace APIs desktop-gated |
-| Settings "Cost/local-first mode" doc claim | Done | Removed from settings surface contract; Required Structure matches current product |
-| Knip unused exports (presets, shadcn, helpers) | Keep | Same-file consumers or design-system completeness; not zero-reference files |
-| `src-tauri/target/` (~11G) | Keep | Intentional Tauri build cache per OPERATIONS |
-| Unlisted `postcss` (via `@tailwindcss/postcss`) | Deferred | Transitive; not garbage |
+Reopen an exemption only when new call-graph, build, runtime, or product evidence
+shows its status changed.

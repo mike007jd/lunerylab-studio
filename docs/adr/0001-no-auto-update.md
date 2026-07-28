@@ -13,9 +13,8 @@ marketing website. The product is:
 
 - Free, Apache-2.0 open-source, no monetization layer.
 - Single-user, **account-less** — no backend identity, no entitlement service.
-- Distributed via GitHub Releases (macOS `.dmg` + `.app` and Windows NSIS
-  `.exe` artifacts built by `.github/workflows/desktop-release.yml`; no Linux
-  build).
+- Distributed via GitHub Releases (macOS DMG and Windows NSIS installer built
+  by `.github/workflows/desktop-release.yml`; no Linux build).
 
 The code-review identified that the Tauri config does not wire
 `tauri-plugin-updater`, so the desktop installs do not check for or fetch new
@@ -63,10 +62,8 @@ Rationale:
    attack vector than asking the user to revisit the Releases page.
 3. **The release cadence is already low.** The desktop binary is rebuilt on
    each git tag; users who want the latest will check GitHub.
-4. **Reversible.** If the project later acquires funding for an update host,
-   we can wire `tauri-plugin-updater` without disrupting any user data on
-   disk — the keychain entries, downloaded models, project DB all stay in
-   `${app_data_dir}`.
+4. **Reversible.** Adding an updater later does not change the visible
+   `~/.lunerylab/studio` profile or its keychain, model, and database data.
 
 ## Consequences
 

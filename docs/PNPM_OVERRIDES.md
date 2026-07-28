@@ -78,6 +78,10 @@ has left minimatch 3. Remove all four pieces together:
 3. `patches/minimatch@3.1.5.patch`;
 4. the corresponding lockfile entries.
 
-Then verify from a fresh install with `pnpm lint`, `pnpm verify`,
-`pnpm audit --audit-level moderate`, and
-`pnpm audit --prod --audit-level moderate`.
+Then verify from a fresh install with `pnpm lint`, `pnpm verify`, and the exact
+audit commands in `.github/workflows/validate.yml`:
+
+```bash
+corepack pnpm@11.13.1 --pm-on-fail=ignore audit --audit-level moderate
+corepack pnpm@11.13.1 --pm-on-fail=ignore audit --prod --audit-level moderate
+```

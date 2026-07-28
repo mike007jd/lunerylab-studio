@@ -1,7 +1,7 @@
 {
   "requiredFiles": [
-    "../docs/UI_FRAMEWORK_STACK.md",
-    "../docs/design/.luna-dna-brief.md",
+    "../spec/DESIGN_RULES.md",
+    "../spec/UX_RULES.md",
     "../docs/design/surfaces/studio.md",
     "../docs/design/surfaces/settings.md",
     "../docs/design/surfaces/canvas.md",

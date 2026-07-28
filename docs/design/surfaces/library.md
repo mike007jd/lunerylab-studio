@@ -1,35 +1,13 @@
-# Library Surface Contract
+# Library And Projects Surface Contract
 
-Library is the browsing and retrieval surface for generated assets.
+| Owner | Routes | Job |
+| --- | --- | --- |
+| `my-app/components/library` | `/library`, `/projects`, `/projects/[id]` | Find, group, preview, and reopen work. |
 
-## Ownership
+Required states: loading, empty, no search results, asset preview, project
+workspace, and unavailable or deleted asset.
 
-- Owner: `my-app/components/library`
-- Route: `/library`
-- Role: generated asset browsing surface
-
-## Role
-
-Library should make past work easy to scan, search, preview, and reopen.
-
-## Required Structure
-
-- Asset grid/list.
-- Search or filters when data volume requires it.
-- Preview affordance.
-- Open in Studio/Canvas handoff.
-
-## Required States
-
-- Empty library.
-- Loading assets.
-- Search with no results.
-- Asset preview.
-- Asset unavailable or deleted.
-
-## Framework Rules
-
-- Asset thumbnails own the visual emphasis.
-- Metadata stays compact.
-- Avoid dashboard-style analytics unless explicitly requested.
-
+- Keep thumbnails dominant and metadata compact.
+- Add filters only when data volume needs them.
+- Make Studio and Canvas handoff direct.
+- Do not turn this surface into an analytics dashboard.

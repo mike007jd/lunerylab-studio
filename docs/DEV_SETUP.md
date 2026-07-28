@@ -75,22 +75,21 @@ shipped application.
 From `my-app/`:
 
 ```bash
-pnpm typecheck
-pnpm lint
-pnpm test:unit
-pnpm ui:check
+pnpm verify
+pnpm build
 ```
 
-Add when relevant:
+`verify` runs typecheck, lint, unit tests, UI and documentation checks, license
+checks, and AI source freshness. Add when relevant:
 
 ```bash
 pnpm desktop:check          # desktop scripts / Tauri / bridge
-pnpm ai:freshness           # model catalog freshness
 cargo test                  # from my-app/src-tauri when Rust changes
-pnpm build                  # full Next standalone build (heavier)
 ```
 
-Convenience: `pnpm verify` runs typecheck + lint + unit + ui:check + ai:freshness.
+For UI or behavior changes, run the current Tauri build and verify the affected
+flow at `1180 × 760` and `1440 × 980`. Do not use a browser or stale installed
+app as product evidence.
 
 For a local macOS installer, run `pnpm desktop:build:local`. It produces a fresh
 unsigned `.app`, a verified headless DMG, and a layout evidence PNG under
@@ -121,6 +120,7 @@ enforces the full signed and notarized artifact chain.
 | --- | --- |
 | Architecture map | [SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md) |
 | Feature inventory | [features/README.md](features/README.md) |
+| Documentation map | [README.md](README.md) |
 | Product / runtime rules | [`../spec`](../spec) |
 | Release / signing (maintainers) | [OPERATIONS.md](OPERATIONS.md) |
 | Contribute checklist | [../.github/CONTRIBUTING.md](../.github/CONTRIBUTING.md) |

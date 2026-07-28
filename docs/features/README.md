@@ -1,8 +1,5 @@
 # Feature Reference
 
-Checked on 2026-06-19 against current routes, components, server modules, and
-Prisma schema.
-
 This is the feature map for launch and maintenance. It describes what exists,
 where it lives, and which backend contracts support it.
 

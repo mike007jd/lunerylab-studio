@@ -25,13 +25,7 @@ pnpm desktop:dev
 
 ## Project Rules
 
-Read the source-of-truth specs before broad product or architecture changes:
-
-- `spec/AI_RUNTIME.md`
-- `spec/PROJECT_CONSTITUTION.md`
-- `spec/ENGINEERING_RULES.md`
-- `spec/DESIGN_RULES.md`
-- `spec/UX_RULES.md`
+Read [`spec`](../spec) before broad product or architecture changes.
 
 Keep the product account-less, local-first, BYOK-capable, and free/open-source.
 Do not add billing, credits, license gates, team plans, or online Studio
@@ -43,16 +37,10 @@ Before submitting a change:
 
 ```bash
 cd my-app
-pnpm run lint
-pnpm run typecheck
-pnpm run build
+pnpm verify
+pnpm build
 ```
 
-For UI work, also run:
-
-```bash
-pnpm run ui:check
-```
-
-Verify the affected flow directly in the live product surface when behavior or
-UI changed.
+Add the conditional desktop/Rust gates from
+[Developer Setup](../docs/DEV_SETUP.md). Verify behavior and UI in the current
+Tauri build, not a browser or stale installed app.
