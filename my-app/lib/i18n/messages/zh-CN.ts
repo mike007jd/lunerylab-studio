@@ -30,6 +30,7 @@ const zhCN = {
     "toggleNavigation": "显示或隐藏导航",
     "goToStudio": "前往 Studio",
     "switchLanguageTo": "切换语言为{language}",
+    "localeSaveError": "语言未能保存，请重试。",
     "languageEnglish": "英语",
     "languageSimplifiedChinese": "简体中文",
     "languageTraditionalChinese": "繁体中文"
@@ -80,7 +81,8 @@ const zhCN = {
       "selectTextModel": "选文字模型",
       "selectVideoModel": "选视频模型",
       "selectDefault": "选模型",
-      "changeDefault": "更换"
+      "changeDefault": "更换",
+      "openImageSettings": "打开图像设置"
     },
     "runtime": {
       "readyTitle": "已连接",
@@ -417,7 +419,9 @@ const zhCN = {
     "configureImageAi": "配置图片 AI",
     "videoAiRequiredTitle": "需要视频 AI",
     "videoAiRequiredDetail": "添加视频模型后即可执行这个视频步骤，当前任务会保留。",
-    "configureVideoAi": "配置视频 AI"
+    "configureVideoAi": "配置视频 AI",
+    "openTextSettings": "打开文本设置",
+    "textDraftHint": "草稿会保留，设置文本模型后即可发送。"
   },
   "library": {
     "title": "创作历史",
@@ -431,6 +435,11 @@ const zhCN = {
     "useTemplate": "使用模板",
     "renameProject": "重命名项目",
     "renameProjectFailed": "重命名项目失败",
+    "projectActions": "项目操作",
+    "deleteProject": "删除项目",
+    "deleteProjectConfirm": "删除此项目？已生成的素材仍保留在素材库中；项目本身将被移除。",
+    "deleteProjectFailed": "删除项目失败",
+    "deletingProject": "正在删除…",
     "projectNameDescription": "选择一个容易辨认的名称。",
     "jobs": "任务",
     "canvasAndJobs": "画布与任务",
@@ -635,7 +644,10 @@ const zhCN = {
       "hideLayer": "隐藏图层",
       "lockLayer": "锁定图层",
       "unlockLayer": "解锁图层",
-      "hint": "选择图层排序。"
+      "hint": "选择图层排序。",
+      "keyboardHint": "Tab 键逐个切换图层 · 回车选择 · 方向键移动选中的图层 · Shift+方向键调整大小 · Delete 删除",
+      "layerLocked": "已锁定",
+      "lockedSelected": "选中的图层已锁定，无法移动、调整大小或删除。"
     },
     "transferExpired": "链接已失效，请返回 Studio 重新生成。",
     "defaults": {

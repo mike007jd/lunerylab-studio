@@ -1,8 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  generationEntrySchema,
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
+import {
   type GenerationBatchVariant,
   type GenerationEntry,
   type GenerationEntryStatus,
@@ -24,7 +31,10 @@ export interface NewEntryInput
 
 export interface UseStudioGenerationHistoryResult {
   entries: GenerationEntry[];
-  /** True after browser-local history has been read and the final layout is known. */
+  /**
+   * Always true for session-only history — there is no async storage hydrate.
+   * Kept so Studio surfaces can keep a stable readiness gate.
+   */
   hydrated: boolean;
   /** Adds a new "running" entry to the front of the list and returns its id. */
   add: (input: NewEntryInput) => string;
@@ -40,8 +50,6 @@ function nextId(): string {
   return crypto.randomUUID();
 }
 
-export const STUDIO_HISTORY_STORAGE_KEY = "lunerylab:studio-history:v2";
-const STORAGE_KEY = STUDIO_HISTORY_STORAGE_KEY;
 export const STUDIO_HISTORY_LIMIT = 60;
 
 export function prependStudioHistoryEntry(
@@ -51,67 +59,16 @@ export function prependStudioHistoryEntry(
   return [entry, ...entries].slice(0, STUDIO_HISTORY_LIMIT);
 }
 
-export function loadStudioHistoryEntries(raw: string | null): GenerationEntry[] {
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    const entries: GenerationEntry[] = [];
-    for (const item of parsed) {
-      const result = generationEntrySchema.safeParse(item);
-      if (!result.success) continue;
-      entries.push({
-        ...result.data,
-        status: result.data.status === "running" ? "interrupted" : result.data.status,
-      });
-      if (entries.length >= STUDIO_HISTORY_LIMIT) break;
-    }
-    return entries;
-  } catch {
-    return [];
-  }
-}
+const StudioGenerationHistoryContext =
+  createContext<UseStudioGenerationHistoryResult | null>(null);
 
-function loadInitialEntries(): GenerationEntry[] {
-  if (typeof window === "undefined") return [];
-  return loadStudioHistoryEntries(window.localStorage.getItem(STORAGE_KEY));
-}
-
-function persistEntries(entries: GenerationEntry[]) {
-  if (typeof window === "undefined") return;
-  try {
-    // A page exit cannot prove the backend stopped, so restored work is
-    // explicitly interrupted rather than shown as a live spinner.
-    const trimmed = entries
-      .map((e) => (e.status === "running" ? { ...e, status: "interrupted" as const } : e))
-      .slice(0, STUDIO_HISTORY_LIMIT);
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
-  } catch {
-    // localStorage may be unavailable (Safari private mode, quota); silently
-    // degrade to session-only history rather than crash the page.
-  }
-}
-
-export function useStudioGenerationHistory(): UseStudioGenerationHistoryResult {
+/**
+ * Console-shell owner for session-only Studio history. Survives Studio route
+ * unmount/remount for the lifetime of the WebView session, without durable
+ * WebView storage or profile backup.
+ */
+export function StudioGenerationHistoryProvider({ children }: { children: ReactNode }) {
   const [entries, setEntries] = useState<GenerationEntry[]>([]);
-  const [hydrated, setHydrated] = useState(false);
-  const hydratedRef = useRef(false);
-
-  useEffect(() => {
-    if (hydratedRef.current) return;
-    hydratedRef.current = true;
-    const initial = loadInitialEntries();
-    if (initial.length > 0) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setEntries(initial);
-    }
-    setHydrated(true);
-  }, []);
-
-  useEffect(() => {
-    if (!hydratedRef.current) return;
-    persistEntries(entries);
-  }, [entries]);
 
   const add = useCallback((input: NewEntryInput) => {
     const id = nextId();
@@ -151,8 +108,23 @@ export function useStudioGenerationHistory(): UseStudioGenerationHistoryResult {
     [entries],
   );
 
-  return useMemo(
-    () => ({ entries, hydrated, add, update, remove, find }),
-    [entries, hydrated, add, update, remove, find],
+  const value = useMemo(
+    () => ({ entries, hydrated: true as const, add, update, remove, find }),
+    [entries, add, update, remove, find],
   );
+
+  return createElement(StudioGenerationHistoryContext.Provider, { value }, children);
+}
+
+/**
+ * Session-only Studio generation history owned by the console shell provider.
+ * Durable assets belong in Library / profile-backed storage — this list resets
+ * when the WebView session ends.
+ */
+export function useStudioGenerationHistory(): UseStudioGenerationHistoryResult {
+  const value = useContext(StudioGenerationHistoryContext);
+  if (!value) {
+    throw new Error("useStudioGenerationHistory must be used within StudioGenerationHistoryProvider.");
+  }
+  return value;
 }

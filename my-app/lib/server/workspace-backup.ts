@@ -3,6 +3,7 @@ import "server-only";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { APP_VERSION } from "@/lib/app-version";
 import { prisma } from "@/lib/server/prisma";
 import {
   listStoredRelativePaths,
@@ -31,7 +32,6 @@ export const BACKUP_FORMAT = "lunery-workspace-backup";
 export const BACKUP_VERSION = 2;
 /** Bump alongside any prisma/migrations change so a stale backup can't restore. */
 export const CURRENT_SCHEMA_VERSION = "20260601000000_initial";
-const APP_VERSION = "1.0.0";
 
 // Prisma model delegates, listed so a parent is always created before its
 // children on restore. Circular / self nullable FKs are stripped on first insert

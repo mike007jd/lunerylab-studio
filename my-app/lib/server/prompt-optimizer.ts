@@ -3,7 +3,7 @@
 import { ApiError } from "@/lib/server/errors";
 import { generateTextLocal } from "@/lib/server/local-llm";
 import { generateTextByok } from "@/lib/server/byok-llm";
-import { resolveRuntimeByokCandidates, resolveTextRuntimeSupply } from "@/lib/server/runtime-supply";
+import { resolveTextRuntimeSupply } from "@/lib/server/runtime-supply";
 import { getVideoPromptSkill } from "@/lib/video-models";
 import type { VideoPromptSkill } from "@/lib/video-models";
 import type { CreativeMode } from "@/lib/prompts/creative-workflows";
@@ -18,6 +18,8 @@ interface OptimizePromptInput {
   generationType?: "image" | "video";
   /** Video model internal ID, used only for prompt-shaping context. */
   videoModelId?: string;
+  /** Explicit bootstrap default text model (`local:…` or `byok:provider:model`). */
+  textModelId?: string;
   videoDuration?: number;
   presetName?: string;
   presetGuidance?: string;
@@ -183,13 +185,15 @@ interface TextBackendAttempt {
 async function planAttempts(
   instruction: string,
   context: string,
+  textModelId: string | undefined,
   abortSignal?: AbortSignal,
 ): Promise<TextBackendAttempt[]> {
   const attempts: TextBackendAttempt[] = [];
-  const supply = await resolveTextRuntimeSupply().catch(() => null);
+  // Exact selection only — never enumerate an unrelated first BYOK candidate.
+  const supply = await resolveTextRuntimeSupply(textModelId).catch(() => null);
 
   // Local-first: only enqueue when the supply layer found a reachable
-  // endpoint and a loaded model.
+  // endpoint and a loaded model for the explicit default.
   if (supply?.backend === "local" && supply.endpoint && supply.modelId) {
     const endpoint = supply.endpoint;
     const modelId = supply.modelId;
@@ -217,15 +221,9 @@ async function planAttempts(
     });
   }
 
-  const byokCandidates =
-    supply?.backend === "byok" && supply.providerId
-      ? [{ providerId: supply.providerId, modelId: supply.modelId }]
-      : await resolveRuntimeByokCandidates("text").catch(() => []);
-
-  const seenProviders = new Set<string>();
-  for (const { providerId, modelId } of byokCandidates) {
-    if (seenProviders.has(providerId)) continue;
-    seenProviders.add(providerId);
+  if (supply?.backend === "byok" && supply.providerId) {
+    const providerId = supply.providerId;
+    const modelId = supply.modelId;
     attempts.push({
       backend: "byok",
       model: modelId ?? providerId,
@@ -262,6 +260,7 @@ export async function optimizePrompt({
   locale,
   generationType,
   videoModelId,
+  textModelId,
   videoDuration,
   presetName,
   presetGuidance,
@@ -283,7 +282,7 @@ export async function optimizePrompt({
   });
   const sourceForValidation = [prompt, templatePrompt].filter(Boolean).join("\n");
 
-  const attempts = await planAttempts(instruction, context, abortSignal);
+  const attempts = await planAttempts(instruction, context, textModelId, abortSignal);
 
   // Tier walk: try each backend in order. On any error, advance to the next.
   let lastError: unknown;

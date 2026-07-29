@@ -3,6 +3,8 @@ import {
   firstDiscoveredExternalTextModel,
   isLocalModelSummaryChecking,
   isTextCapabilityReady,
+  resolveCurrentTextModelId,
+  resolveEmbeddedTextModelLabel,
 } from "@/hooks/use-local-model-summary";
 
 describe("external local text model readiness", () => {
@@ -42,6 +44,40 @@ describe("local model summary loading truth", () => {
 });
 
 describe("text capability readiness", () => {
+  it("uses the embedded llama alias as the exact active model id", () => {
+    expect(
+      resolveCurrentTextModelId({
+        llamaRunning: true,
+        llamaModelId: " imported:llama-cpp:qwen-3 ",
+        externalTextModel: "unrelated-ollama-model",
+      }),
+    ).toBe("imported:llama-cpp:qwen-3");
+    expect(
+      resolveCurrentTextModelId({
+        llamaRunning: false,
+        llamaModelId: "stale-embedded-id",
+        externalTextModel: "ollama-model",
+      }),
+    ).toBe("ollama-model");
+  });
+
+  it("falls back to the running exact alias when inventory cannot match a canonical path", () => {
+    expect(
+      resolveEmbeddedTextModelLabel({
+        inventoryLabel: null,
+        llamaRunning: true,
+        llamaModelId: "imported-llama-cpp-symlinked-model",
+      }),
+    ).toBe("imported-llama-cpp-symlinked-model");
+    expect(
+      resolveEmbeddedTextModelLabel({
+        inventoryLabel: null,
+        llamaRunning: false,
+        llamaModelId: "stale-alias",
+      }),
+    ).toBeNull();
+  });
+
   it("does not call an installed model ready while its embedded engine is stopped", () => {
     expect(isTextCapabilityReady({
       llamaModel: "Local text model",

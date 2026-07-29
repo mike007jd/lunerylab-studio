@@ -45,9 +45,12 @@ import {
   type ResolvedByokConfig,
 } from "@/lib/server/byok-image-adapters";
 
+const providerFetch = vi.fn<typeof fetch>();
+
 const config: ResolvedByokConfig = {
   apiKey: "test-key",
   endpoint: "https://api.example.test/v1",
+  fetch: providerFetch,
   modelId: "gpt-image-2",
 };
 
@@ -76,6 +79,7 @@ describe("BYOK OpenAI image adapters", () => {
     expect(mocks.createOpenAI).toHaveBeenCalledWith({
       apiKey: "test-key",
       baseURL: "https://api.example.test/v1",
+      fetch: providerFetch,
     });
     expect(mocks.openAiImageModel).toHaveBeenCalledWith("gpt-image-2");
     expect(mocks.generateImage).toHaveBeenCalledWith(
@@ -142,6 +146,7 @@ describe("BYOK OpenAI image adapters", () => {
       name: "openai-compatible",
       baseURL: "https://api.example.test/v1",
       apiKey: "test-key",
+      fetch: providerFetch,
     });
     expect(mocks.compatibleImageModel).toHaveBeenCalledWith("custom/image-model");
     expect(mocks.generateImage).toHaveBeenCalledWith(

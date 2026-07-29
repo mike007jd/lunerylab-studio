@@ -27,6 +27,21 @@ export type ByokVideoApiMode = "fal" | "replicate" | "minimax" | "none";
 
 export type ByokModel3dApiMode = "fal" | "meshy" | "tripo" | "replicate" | "none";
 
+export type ByokModelRole = "text" | "imageGenerate" | "imageEdit" | "video" | "model3d";
+
+interface ByokSourceEvidence {
+  label: string;
+  url: string;
+  lastVerifiedAt: string;
+}
+
+interface ByokModelGuidance {
+  placeholderModelId?: string;
+  placeholderModelNote?: string;
+  sourceEvidence?: ByokSourceEvidence;
+  modelIdFromEndpoint?: true;
+}
+
 export interface ByokProviderMeta {
   id: string;
   label: string;
@@ -42,11 +57,14 @@ export interface ByokProviderMeta {
    */
   placeholderModelId?: string;
   placeholderModelNote?: string;
-  sourceEvidence: {
-    label: string;
-    url: string;
-    lastVerifiedAt: string;
-  };
+  /**
+   * Capability-specific examples for providers with more than one model slot.
+   * Settings must not reuse an image model/link in a text field (or vice
+   * versa). Missing guidance intentionally renders a generic copy-from-catalog
+   * hint instead of guessing.
+   */
+  modelGuidance?: Partial<Record<ByokModelRole, ByokModelGuidance>>;
+  sourceEvidence: ByokSourceEvidence;
   freshnessExpiresAt: string;
   /**
    * For providers whose "model" is a single fixed operation mode rather than a
@@ -98,12 +116,32 @@ export const BYOK_PROVIDERS: ByokProviderMeta[] = [
     // no longer the recommendation.
     placeholderModelId: "gpt-image-2",
     placeholderModelNote: "Current OpenAI image model (GPT Image 2); text models still require the user's explicit choice.",
+    modelGuidance: {
+      text: {
+        placeholderModelId: "gpt-5.6-sol",
+        placeholderModelNote: "Current OpenAI frontier text model; this is an example, never a runtime fallback.",
+        sourceEvidence: {
+          label: "OpenAI GPT-5.6 Sol model docs",
+          url: "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      imageGenerate: {
+        placeholderModelId: "gpt-image-2",
+        placeholderModelNote: "Current OpenAI image generation model; this is an example, never a runtime fallback.",
+        sourceEvidence: {
+          label: "OpenAI GPT Image 2 model docs",
+          url: "https://developers.openai.com/api/docs/models/gpt-image-2",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+    },
     sourceEvidence: {
       label: "OpenAI GPT Image 2 model docs",
       url: "https://developers.openai.com/api/docs/models/gpt-image-2",
-      lastVerifiedAt: "2026-07-03",
+      lastVerifiedAt: "2026-07-29",
     },
-    freshnessExpiresAt: "2026-08-02",
+    freshnessExpiresAt: "2026-08-28",
     imageApiMode: "openai-rest",
   },
   {
@@ -166,6 +204,25 @@ export const BYOK_PROVIDERS: ByokProviderMeta[] = [
     requiresModelId: true,
     placeholderModelId: "MiniMax-Hailuo-2.3",
     placeholderModelNote: "Current standard MiniMax video model from the official API docs; text model IDs should be copied from MiniMax's own docs/account.",
+    modelGuidance: {
+      text: {
+        placeholderModelId: "MiniMax-M3",
+        placeholderModelNote: "Current MiniMax text model from the official model overview; this is an example, never a runtime fallback.",
+        sourceEvidence: {
+          label: "MiniMax OpenAI-compatible text API",
+          url: "https://platform.minimax.io/docs/api-reference/text-openai-api",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      video: {
+        placeholderModelId: "MiniMax-Hailuo-2.3",
+        sourceEvidence: {
+          label: "MiniMax video generation API reference",
+          url: "https://platform.minimax.io/docs/api-reference/video-generation-t2v",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+    },
     sourceEvidence: {
       label: "MiniMax video generation API reference",
       url: "https://platform.minimax.io/docs/api-reference/video-generation-t2v",
@@ -184,6 +241,30 @@ export const BYOK_PROVIDERS: ByokProviderMeta[] = [
     requiresModelId: true,
     placeholderModelId: "black-forest-labs/flux-2-pro",
     placeholderModelNote: "FLUX.1 schnell is now compatibility; Replicate's FLUX collection lists FLUX.2 models as current featured options.",
+    modelGuidance: {
+      imageGenerate: {
+        placeholderModelId: "black-forest-labs/flux-2-pro",
+        sourceEvidence: {
+          label: "Replicate image model collection",
+          url: "https://replicate.com/collections/text-to-image",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      video: {
+        sourceEvidence: {
+          label: "Replicate video model collection",
+          url: "https://replicate.com/collections/text-to-video",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      model3d: {
+        sourceEvidence: {
+          label: "Replicate 3D model collection",
+          url: "https://replicate.com/collections/3d-models",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+    },
     sourceEvidence: {
       label: "Replicate FLUX.2 Pro model page",
       url: "https://replicate.com/black-forest-labs/flux-2-pro",
@@ -203,6 +284,30 @@ export const BYOK_PROVIDERS: ByokProviderMeta[] = [
     requiresModelId: true,
     placeholderModelId: "fal-ai/flux-pro/v1.1",
     placeholderModelNote: "Current fal text-to-image example. Edit/background endpoints are separate explicit model IDs below.",
+    modelGuidance: {
+      imageGenerate: {
+        placeholderModelId: "fal-ai/flux-pro/v1.1",
+        sourceEvidence: {
+          label: "fal image model API",
+          url: "https://fal.ai/models/fal-ai/flux-pro/v1.1/api",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      video: {
+        sourceEvidence: {
+          label: "fal video model APIs",
+          url: "https://fal.ai/explore/text-to-video-apis",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      model3d: {
+        sourceEvidence: {
+          label: "fal 3D model APIs",
+          url: "https://fal.ai/docs/model-api-reference/3d-api/overview",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+    },
     sourceEvidence: {
       label: "fal FLUX 1.1 Pro API docs",
       url: "https://fal.ai/models/fal-ai/flux-pro/v1.1/api",
@@ -226,6 +331,23 @@ export const BYOK_PROVIDERS: ByokProviderMeta[] = [
     requiresModelId: true,
     placeholderModelId: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     placeholderModelNote: "Together model availability is account/catalog specific; this is a compatibility placeholder only.",
+    modelGuidance: {
+      text: {
+        placeholderModelId: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        sourceEvidence: {
+          label: "Together serverless text model catalog",
+          url: "https://docs.together.ai/docs/serverless/models",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      imageGenerate: {
+        sourceEvidence: {
+          label: "Together serverless image model catalog",
+          url: "https://docs.together.ai/docs/serverless/models",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+    },
     sourceEvidence: {
       label: "Together Llama 3.3 70B model page",
       url: "https://www.together.ai/models/llama-3-3-70b",
@@ -243,6 +365,23 @@ export const BYOK_PROVIDERS: ByokProviderMeta[] = [
     requiresModelId: true,
     placeholderModelId: "accounts/fireworks/models/llama-v3p3-70b-instruct",
     placeholderModelNote: "Older llama-v3p1 examples are compatibility-only; user must copy an available Fireworks model ID.",
+    modelGuidance: {
+      text: {
+        placeholderModelId: "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        sourceEvidence: {
+          label: "Fireworks model library",
+          url: "https://fireworks.ai/models?featured=true",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+      imageGenerate: {
+        sourceEvidence: {
+          label: "Fireworks model library",
+          url: "https://fireworks.ai/models?featured=true",
+          lastVerifiedAt: "2026-07-29",
+        },
+      },
+    },
     sourceEvidence: {
       label: "Fireworks Llama v3.3 70B model page",
       url: "https://fireworks.ai/models/fireworks/llama-v3p3-70b-instruct",
@@ -314,6 +453,16 @@ export const BYOK_PROVIDERS: ByokProviderMeta[] = [
     requiresModelId: true,
     placeholderModelId: "local-model-id",
     placeholderModelNote: "Use the exact model ID returned by the compatible endpoint's /models API.",
+    modelGuidance: {
+      text: {
+        placeholderModelId: "local-model-id",
+        modelIdFromEndpoint: true,
+      },
+      imageGenerate: {
+        placeholderModelId: "local-model-id",
+        modelIdFromEndpoint: true,
+      },
+    },
     sourceEvidence: {
       label: "AI SDK OpenAI Compatible Providers",
       url: "https://ai-sdk.dev/providers/openai-compatible-providers",
@@ -336,8 +485,6 @@ export function findByokProvider(id: string): ByokProviderMeta | undefined {
  * generate model (OpenAI) or fixed catalog paths (fal), so the UI never asks
  * for it directly.
  */
-export type ByokModelRole = "text" | "imageGenerate" | "imageEdit" | "video" | "model3d";
-
 export interface ByokConnectionModels {
   text?: string;
   imageGenerate?: string;
@@ -372,6 +519,32 @@ export function byokModelInputRoles(meta: ByokProviderMeta): ByokModelRole[] {
     roles.push("model3d");
   }
   return roles;
+}
+
+export function resolveByokModelGuidance(
+  meta: ByokProviderMeta,
+  visibleRoles: readonly ByokModelRole[],
+): ByokModelGuidance | undefined {
+  if (visibleRoles.length !== 1) return undefined;
+  const [role] = visibleRoles;
+  if (!role) return undefined;
+  const roleGuidance = meta.modelGuidance?.[role];
+  if (roleGuidance) return roleGuidance;
+
+  const providerRoles = byokModelInputRoles(meta);
+  if (
+    providerRoles.length === 1 &&
+    providerRoles[0] === role &&
+    meta.placeholderModelId
+  ) {
+    return {
+      placeholderModelId: meta.placeholderModelId,
+      placeholderModelNote: meta.placeholderModelNote,
+      sourceEvidence: meta.sourceEvidence,
+    };
+  }
+
+  return undefined;
 }
 
 /** Drop unknown keys / non-string / blank values from a raw models object. */

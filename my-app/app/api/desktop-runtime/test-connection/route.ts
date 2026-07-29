@@ -30,7 +30,11 @@ import { parseJsonBody } from "@/lib/server/http-validation";
 import { ApiError, jsonError } from "@/lib/server/errors";
 import { findByokProvider } from "@/lib/byok-providers";
 import { getByokConnectionMeta } from "@/lib/server/byok-connection-store";
-import { tryReadByokKey, validateProviderEndpoint } from "@/lib/server/byok-shared";
+import {
+  createPinnedProviderFetch,
+  tryReadByokKey,
+  validateProviderEndpoint,
+} from "@/lib/server/byok-shared";
 
 export const dynamic = "force-dynamic";
 
@@ -87,10 +91,11 @@ function probeUrl(endpoint: string, path: string): string {
 async function probe(
   url: string,
   headers: Record<string, string>,
+  providerFetch: typeof fetch,
   okStatuses: readonly number[] = [200],
 ): Promise<ProbeResult> {
   try {
-    const response = await fetch(url, {
+    const response = await providerFetch(url, {
       method: "GET",
       cache: "no-store",
       headers,
@@ -125,7 +130,12 @@ async function runProbe(
   const endpoint = endpointCheck.url.replace(/\/+$/, "");
 
   const spec = PROVIDER_PROBES[providerId] ?? DEFAULT_PROBE;
-  return probe(probeUrl(endpoint, spec.path), spec.headers(apiKey), spec.okStatuses);
+  return probe(
+    probeUrl(endpoint, spec.path),
+    spec.headers(apiKey),
+    createPinnedProviderFetch(endpointCheck),
+    spec.okStatuses,
+  );
 }
 
 export async function POST(request: NextRequest) {

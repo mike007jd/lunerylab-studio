@@ -37,3 +37,11 @@ export async function renameProject(
   );
   return project;
 }
+
+export async function deleteProject(projectId: string): Promise<ProjectSummary> {
+  const { deleted } = await fetchJson<{ deleted: ProjectSummary }>(
+    `/api/projects/${encodeURIComponent(projectId)}`,
+    { method: "DELETE" },
+  );
+  return deleted;
+}

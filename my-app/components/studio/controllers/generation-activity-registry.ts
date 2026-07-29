@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import type { GenerationMode } from "@/lib/schemas/studio-history";
 
 export interface GenerationActivity {
@@ -14,6 +23,8 @@ export interface GenerationActivity {
 }
 
 const EMPTY_SNAPSHOT: ReadonlyMap<string, GenerationActivity> = new Map();
+const GenerationActivityRegistryContext =
+  createContext<GenerationActivityRegistry | null>(null);
 
 export class GenerationActivityRegistry {
   private snapshot: ReadonlyMap<string, GenerationActivity> = EMPTY_SNAPSHOT;
@@ -111,15 +122,38 @@ export class GenerationActivityRegistry {
   }
 }
 
-export function useGenerationActivityRegistry() {
+/**
+ * Console-shell owner for in-flight generation. It shares the same lifetime as
+ * Studio history so route navigation cannot detach a running entry from the
+ * request or poll that will eventually terminalize it.
+ */
+export function GenerationActivityRegistryProvider({
+  children,
+}: {
+  children: ReactNode;
+}) {
   const [registry] = useState(() => new GenerationActivityRegistry());
+  useEffect(() => () => registry.abortAll(), [registry]);
+  return createElement(
+    GenerationActivityRegistryContext.Provider,
+    { value: registry },
+    children,
+  );
+}
+
+export function useGenerationActivityRegistry() {
+  const registry = useContext(GenerationActivityRegistryContext);
+  if (!registry) {
+    throw new Error(
+      "useGenerationActivityRegistry must be used within GenerationActivityRegistryProvider.",
+    );
+  }
   const activities = useSyncExternalStore(
     registry.subscribe,
     registry.getSnapshot,
     registry.getServerSnapshot,
   );
 
-  useEffect(() => () => registry.abortAll(), [registry]);
   const isEntryGenerating = useCallback(
     (entryId: string) => activities.has(entryId),
     [activities],

@@ -36,6 +36,7 @@ import {
 export interface ResolvedByokConfig {
   apiKey: string;
   endpoint: string;
+  fetch: typeof fetch;
   modelId: string;
 }
 
@@ -287,6 +288,7 @@ export async function generateImagesOpenAiRest(
   const provider = createOpenAI({
     apiKey: config.apiKey,
     baseURL: config.endpoint,
+    fetch: config.fetch,
   });
   return generateImagesWithAiSdk({
     label: "OpenAI",
@@ -314,6 +316,7 @@ export async function generateImagesOpenAiEdit(
   const provider = createOpenAI({
     apiKey: config.apiKey,
     baseURL: config.endpoint,
+    fetch: config.fetch,
   });
   return generateImagesWithAiSdk({
     label: "OpenAI",
@@ -349,6 +352,7 @@ export async function generateImagesReplicate(
   const prediction = await runReplicatePrediction({
     apiKey: config.apiKey,
     apiBase,
+    fetch: config.fetch,
     modelId: config.modelId,
     input: {
       prompt: input.prompt,
@@ -433,6 +437,7 @@ export async function generateImagesFal(
   const payload = await falQueueResult<FalImagesPayload>({
     apiKey: config.apiKey,
     apiBase,
+    fetch: config.fetch,
     modelPath: config.modelId,
     body,
     deadlineMs: 4.5 * 60_000,
@@ -489,6 +494,7 @@ export async function generateImagesOpenAiCompatible(
     name: "openai-compatible",
     baseURL: apiBase,
     apiKey: config.apiKey,
+    fetch: config.fetch,
   });
   return generateImagesWithAiSdk({
     label: "Image provider",

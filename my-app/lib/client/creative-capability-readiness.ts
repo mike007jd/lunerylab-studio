@@ -46,6 +46,7 @@ export interface CreativeCapabilityReadiness {
 export interface CreativeReadinessLocalSummary {
   desktop: boolean | null;
   currentTextModel: string | null;
+  currentTextModelId?: string | null;
   currentImageModel: string | null;
   hasReadyText: boolean;
   hasReadyImage: boolean;
@@ -67,6 +68,8 @@ export interface CreativeCapabilityReadinessInput {
   videoModels: VideoModelEntry[];
   catalogLoading: boolean;
   bootstrapDefaultImageModel?: string | null;
+  bootstrapDefaultTextModel?: string | null;
+  bootstrapDefaultVideoModel?: string | null;
   providers: Record<string, ProviderSnapshot>;
   providerConnections: Record<string, CreativeReadinessProviderConnection>;
   localSummary: CreativeReadinessLocalSummary;
@@ -74,6 +77,69 @@ export interface CreativeCapabilityReadinessInput {
   isDesktopShell?: boolean;
   preferZh?: boolean;
   t: TFunction;
+}
+
+const BYOK_TEXT_SELECTION = /^byok:([^:]+):(.+)$/;
+
+function normalizeLocalTextModelId(value: string): string {
+  return value.trim().toLowerCase().replace(/:latest$/, "");
+}
+
+function parseExplicitByokTextSelection(
+  value: string,
+): { providerId: string; modelId: string } | null {
+  const match = BYOK_TEXT_SELECTION.exec(value.trim());
+  if (!match) return null;
+  const providerId = match[1]?.trim() ?? "";
+  const modelId = match[2]?.trim() ?? "";
+  if (!providerId || !modelId) return null;
+  return { providerId, modelId };
+}
+
+function resolveExplicitTextReadiness({
+  bootstrapDefaultTextModel,
+  providers,
+  providerConnections,
+  localSummary,
+}: {
+  bootstrapDefaultTextModel?: string | null;
+  providers: Record<string, ProviderSnapshot>;
+  providerConnections: Record<string, CreativeReadinessProviderConnection>;
+  localSummary: CreativeReadinessLocalSummary;
+}): { ready: boolean; activeLabel?: string } {
+  const selected = bootstrapDefaultTextModel?.trim() ?? "";
+  if (!selected) return { ready: false };
+
+  if (selected.startsWith("local:")) {
+    const modelId = selected.slice("local:".length).trim();
+    if (!modelId || !localSummary.hasReadyText) return { ready: false };
+    const currentModelId = localSummary.currentTextModelId?.trim() ?? "";
+    // Exact normalized id only. The visible label is not an authority and
+    // suffix matching could make a different model look selected.
+    if (
+      !currentModelId ||
+      normalizeLocalTextModelId(currentModelId) !== normalizeLocalTextModelId(modelId)
+    ) {
+      return { ready: false };
+    }
+    return {
+      ready: true,
+      activeLabel: localSummary.currentTextModel?.trim() || currentModelId,
+    };
+  }
+
+  const byok = parseExplicitByokTextSelection(selected);
+  if (!byok) return { ready: false };
+  if (!providerConfigured(providers, providerConnections, byok.providerId)) {
+    return { ready: false };
+  }
+  const slot = providerConnections[byok.providerId]?.models?.text?.trim();
+  if (slot !== byok.modelId) return { ready: false };
+  const provider = BYOK_PROVIDERS.find((entry) => entry.id === byok.providerId);
+  return {
+    ready: true,
+    activeLabel: provider ? `${provider.label} · ${byok.modelId}` : byok.modelId,
+  };
 }
 
 const ISSUE_ORDER: CreativeCapabilityId[] = [
@@ -102,17 +168,6 @@ function providerConfigured(
   providerId: string,
 ): boolean {
   return providers[providerId]?.configured === true || connections[providerId]?.hasSecret === true;
-}
-
-function providerWithModelRole(
-  role: keyof ByokConnectionModels,
-  providers: Record<string, ProviderSnapshot>,
-  connections: Record<string, CreativeReadinessProviderConnection>,
-) {
-  return BYOK_PROVIDERS.find((provider) => {
-    const modelId = connections[provider.id]?.models?.[role]?.trim();
-    return Boolean(modelId && providerConfigured(providers, connections, provider.id));
-  });
 }
 
 function hasConfiguredProviderForCapability(
@@ -147,6 +202,8 @@ export function deriveCreativeCapabilityReadiness({
   videoModels,
   catalogLoading,
   bootstrapDefaultImageModel,
+  bootstrapDefaultTextModel,
+  bootstrapDefaultVideoModel,
   providers,
   providerConnections,
   localSummary,
@@ -156,25 +213,49 @@ export function deriveCreativeCapabilityReadiness({
   t,
 }: CreativeCapabilityReadinessInput): CreativeCapabilityReadiness {
   const runtimePreparing = Boolean(localRuntimes?.some(isRuntimePreparing));
-  const textProvider = providerWithModelRole("text", providers, providerConnections);
   const videoProviderHasSecret = hasConfiguredProviderForCapability("video", providers, providerConnections);
   const imageProviderHasSecret = hasConfiguredProviderForCapability("image", providers, providerConnections);
   const textProviderHasSecret = hasConfiguredProviderForCapability("text", providers, providerConnections);
-  const firstImageModel = imageModels[0];
-  const firstVideoModel = videoModels[0];
-  const activeImageLabel = localSummary.currentImageModel ?? imageModelLabel(firstImageModel, preferZh);
-  const activeTextLabel =
-    localSummary.currentTextModel ??
-    (textProvider
-      ? `${textProvider.label} · ${providerConnections[textProvider.id]?.models?.text}`
-      : undefined);
-  const activeVideoLabel = videoModelLabel(firstVideoModel, preferZh);
+  const explicitText = resolveExplicitTextReadiness({
+    bootstrapDefaultTextModel,
+    providers,
+    providerConnections,
+    localSummary,
+  });
+  const activeTextLabel = explicitText.activeLabel;
+  // Explicit video default only — a non-empty catalog with an empty/invalid
+  // default is partial and must not label the first catalog entry as active.
+  const selectedVideoModel = videoModels.find(
+    (model) =>
+      model.id === bootstrapDefaultVideoModel ||
+      model.providerModelId === bootstrapDefaultVideoModel,
+  );
+  const activeVideoLabel = videoModelLabel(selectedVideoModel, preferZh);
+  // Explicit selection only: a ready local image model without a saved default
+  // is NOT a usable default. Nothing may silently substitute a model the user
+  // never picked, so there is no single-model implicit default here.
   const selectedDefault = imageModels.find(
     (model) =>
       model.id === bootstrapDefaultImageModel ||
       model.providerModelId === bootstrapDefaultImageModel,
   );
-  const effectiveDefault = selectedDefault ?? (imageModels.length === 1 ? firstImageModel : undefined);
+  const effectiveDefault = selectedDefault;
+  const defaultImageLabel =
+    imageModelLabel(effectiveDefault, preferZh) ?? effectiveDefault?.id;
+  // Prefer the resolved explicit default label. Keep a currently-running local
+  // model label only when it corresponds to that same resolved default.
+  const runningMatchesDefault = Boolean(
+    effectiveDefault &&
+      localSummary.currentImageModel &&
+      (localSummary.currentImageModel === defaultImageLabel ||
+        localSummary.currentImageModel === effectiveDefault.id ||
+        localSummary.currentImageModel === effectiveDefault.providerModelId ||
+        localSummary.currentImageModel === effectiveDefault.label ||
+        localSummary.currentImageModel === effectiveDefault.labelZh),
+  );
+  const activeImageLabel = runningMatchesDefault
+    ? localSummary.currentImageModel!
+    : defaultImageLabel;
 
   const runtime: CreativeCapabilityItem = (
     localSummary.desktop === null
@@ -231,7 +312,7 @@ export function deriveCreativeCapabilityReadiness({
           detail: t("capabilityReadiness.image.checkingDetail"),
           shortLabel: t("capabilityReadiness.sidebar.checking"),
         }
-      : imageModels.length > 0
+      : imageModels.length > 0 && effectiveDefault
         ? {
             id: "imageGeneration",
             status: "ready",
@@ -241,10 +322,24 @@ export function deriveCreativeCapabilityReadiness({
               : t("capabilityReadiness.image.readyDetail"),
             shortLabel: t("capabilityReadiness.sidebar.ready"),
             activeLabel: activeImageLabel,
-            href: "/settings?panel=local-models",
+            href: "/settings?panel=image",
             actionLabel: t("capabilityReadiness.actions.manageModels"),
           }
-        : runtimePreparing
+        : imageModels.length > 0
+          ? {
+              // Models exist but none was explicitly chosen as the default.
+              // Not ready: generation must never silently dispatch to an
+              // unchosen model, so the visible banner routes to Image settings.
+              id: "imageGeneration",
+              status: "partial",
+              title: t("capabilityReadiness.defaults.missingTitle"),
+              detail: t("capabilityReadiness.defaults.missingDetail"),
+              shortLabel: t("capabilityReadiness.sidebar.defaultMissing"),
+              reason: t("capabilityReadiness.defaults.missingReason"),
+              href: "/settings?panel=image",
+              actionLabel: t("capabilityReadiness.actions.openImageSettings"),
+            }
+          : runtimePreparing
           ? {
               id: "imageGeneration",
               status: "preparing",
@@ -269,7 +364,7 @@ export function deriveCreativeCapabilityReadiness({
               reason: imageProviderHasSecret
                 ? t("capabilityReadiness.image.modelMissingReason")
                 : t("capabilityReadiness.image.missingReason"),
-              href: imageProviderHasSecret ? "/settings?panel=provider-connections" : "/settings?panel=local-models",
+              href: imageProviderHasSecret ? "/settings?panel=image" : "/settings?panel=local-models",
               actionLabel: imageProviderHasSecret
                 ? t("capabilityReadiness.actions.selectProviderModel")
                 : t("capabilityReadiness.actions.installImageModel"),
@@ -277,7 +372,7 @@ export function deriveCreativeCapabilityReadiness({
   );
 
   const promptRefinement: CreativeCapabilityItem = (
-    localSummary.hasReadyText || textProvider
+    explicitText.ready
       ? {
           id: "promptRefinement",
           status: "ready",
@@ -287,33 +382,35 @@ export function deriveCreativeCapabilityReadiness({
             : t("capabilityReadiness.prompt.readyDetail"),
           shortLabel: t("capabilityReadiness.sidebar.ready"),
           activeLabel: activeTextLabel,
-          href: "/settings?panel=local-models",
+          href: "/settings?panel=text",
           actionLabel: t("capabilityReadiness.actions.manageModels"),
         }
       : {
           id: "promptRefinement",
           status: "partial",
-          title: textProviderHasSecret
+          title: textProviderHasSecret || localSummary.hasReadyText
             ? t("capabilityReadiness.prompt.modelMissingTitle")
             : t("capabilityReadiness.prompt.missingTitle"),
-          detail: textProviderHasSecret
+          detail: textProviderHasSecret || localSummary.hasReadyText
             ? t("capabilityReadiness.prompt.modelMissingDetail")
             : t("capabilityReadiness.prompt.missingDetail"),
-          shortLabel: textProviderHasSecret
+          shortLabel: textProviderHasSecret || localSummary.hasReadyText
             ? t("capabilityReadiness.sidebar.textModelMissing")
             : t("capabilityReadiness.sidebar.textMissing"),
-          reason: textProviderHasSecret
+          reason: textProviderHasSecret || localSummary.hasReadyText
             ? t("capabilityReadiness.prompt.modelMissingReason")
             : t("capabilityReadiness.prompt.missingReason"),
-          href: textProviderHasSecret ? "/settings?panel=provider-connections" : "/settings?panel=local-models",
-          actionLabel: textProviderHasSecret
+          // Text capability fixes always land on the Text settings tab — the
+          // default text model picker and local text models live there.
+          href: "/settings?panel=text",
+          actionLabel: textProviderHasSecret || localSummary.hasReadyText
             ? t("capabilityReadiness.actions.selectTextModel")
             : t("capabilityReadiness.actions.installTextModel"),
         }
   );
 
   const videoGeneration: CreativeCapabilityItem = (
-    videoModels.length > 0
+    selectedVideoModel
       ? {
           id: "videoGeneration",
           status: "ready",
@@ -323,9 +420,20 @@ export function deriveCreativeCapabilityReadiness({
             : t("capabilityReadiness.video.readyDetail"),
           shortLabel: t("capabilityReadiness.sidebar.ready"),
           activeLabel: activeVideoLabel,
-          href: "/settings?panel=provider-connections",
+          href: "/settings?panel=video",
           actionLabel: t("capabilityReadiness.actions.manageProviders"),
         }
+      : videoModels.length > 0
+        ? {
+            id: "videoGeneration",
+            status: "partial",
+            title: t("capabilityReadiness.video.modelMissingTitle"),
+            detail: t("capabilityReadiness.video.modelMissingDetail"),
+            shortLabel: t("capabilityReadiness.sidebar.videoModelMissing"),
+            reason: t("capabilityReadiness.video.modelMissingReason"),
+            href: "/settings?panel=video",
+            actionLabel: t("capabilityReadiness.actions.selectVideoModel"),
+          }
       : {
           id: "videoGeneration",
           status: "partial",
@@ -341,7 +449,7 @@ export function deriveCreativeCapabilityReadiness({
           reason: videoProviderHasSecret
             ? t("capabilityReadiness.video.modelMissingReason")
             : t("capabilityReadiness.video.missingReason"),
-          href: "/settings?panel=provider-connections",
+          href: "/settings?panel=video",
           actionLabel: videoProviderHasSecret
             ? t("capabilityReadiness.actions.selectVideoModel")
             : t("capabilityReadiness.actions.connectVideoProvider"),
@@ -359,7 +467,7 @@ export function deriveCreativeCapabilityReadiness({
           }),
           shortLabel: t("capabilityReadiness.sidebar.ready"),
           activeLabel: imageModelLabel(effectiveDefault, preferZh) ?? effectiveDefault.id,
-          href: "/settings?panel=general",
+          href: "/settings?panel=image",
           actionLabel: t("capabilityReadiness.actions.changeDefault"),
         }
       : imageModels.length > 0
@@ -370,7 +478,7 @@ export function deriveCreativeCapabilityReadiness({
             detail: t("capabilityReadiness.defaults.missingDetail"),
             shortLabel: t("capabilityReadiness.sidebar.defaultMissing"),
             reason: t("capabilityReadiness.defaults.missingReason"),
-            href: "/settings?panel=general",
+            href: "/settings?panel=image",
             actionLabel: t("capabilityReadiness.actions.selectDefault"),
           }
         : {
@@ -380,7 +488,7 @@ export function deriveCreativeCapabilityReadiness({
             detail: t("capabilityReadiness.defaults.noModelDetail"),
             shortLabel: t("capabilityReadiness.sidebar.defaultMissing"),
             reason: t("capabilityReadiness.defaults.noModelReason"),
-            href: "/settings?panel=local-models",
+            href: "/settings?panel=image",
             actionLabel: t("capabilityReadiness.actions.installImageModel"),
           }
   );

@@ -22,6 +22,7 @@ import {
   fetchBootstrapSnapshot,
   type BootstrapSnapshot,
 } from "@/lib/client/use-bootstrap-snapshot";
+import { persistProfileLocale } from "@/lib/client/persist-locale";
 import { DesktopRuntimeCard } from "./desktop-runtime-card";
 import { LocalModelsPanel } from "./local-models-panel";
 import { RuntimeHealthPanel } from "./runtime-health-panel";
@@ -255,10 +256,14 @@ export function SettingsPage({
 
   async function handleLocaleChange(nextLocale: Locale) {
     setLocaleError("");
-    setLocale(nextLocale);
-    setBootstrap((current) => ({ ...current, app: { ...current.app, defaultLocale: nextLocale } }));
     try {
-      await patchSettings({ defaultLocale: nextLocale });
+      // Profile PATCH first; only then mirror into in-memory i18n + local bootstrap.
+      const saved = await persistProfileLocale(nextLocale);
+      setLocale(saved);
+      setBootstrap((current) => ({
+        ...current,
+        app: { ...current.app, defaultLocale: saved },
+      }));
     } catch {
       // Surface the failure on the Language card itself, not the Model card.
       setLocaleError(t("settings.saveError"));

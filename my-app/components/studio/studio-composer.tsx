@@ -116,6 +116,7 @@ export function StudioComposer({
             onChange={(event) => onPromptChange(event.target.value)}
             onKeyDown={onPromptKeyDown}
             placeholder={placeholder}
+            aria-label={t("studio.promptLabel")}
             rows={3}
             className={cn(
               "relative min-h-28 w-full resize-none border-0 bg-transparent px-4 pb-4 text-sm leading-relaxed text-foreground shadow-none outline-none ring-0 transition-colors placeholder:text-muted-foreground/50 focus:border-0 focus:placeholder:text-muted-foreground/40 focus:outline-none focus:ring-0 focus-visible:border-0 focus-visible:outline-none focus-visible:outline-offset-0 focus-visible:ring-0 md:min-h-24 md:pt-5",

@@ -77,6 +77,52 @@ describe("canvas lifecycle safety", () => {
     ]);
   });
 
+  it("keeps dirty geometry but accepts authoritative lock and hidden from the server", () => {
+    const current = [
+      {
+        id: "dirty",
+        x: 9,
+        y: 4,
+        width: 100,
+        height: 80,
+        rotation: 15,
+        locked: false,
+        hidden: false,
+        zIndex: 1,
+        assetId: "local-asset",
+      },
+    ];
+    const incoming = [
+      {
+        id: "dirty",
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        rotation: 0,
+        locked: true,
+        hidden: true,
+        zIndex: 7,
+        assetId: "server-asset",
+      },
+    ];
+
+    expect(mergePolledLayers(current, incoming, new Set(["dirty"]))).toEqual([
+      {
+        id: "dirty",
+        x: 9,
+        y: 4,
+        width: 100,
+        height: 80,
+        rotation: 15,
+        locked: true,
+        hidden: true,
+        zIndex: 7,
+        assetId: "server-asset",
+      },
+    ]);
+  });
+
   it("keeps a pending local delete hidden from a stale poll", () => {
     const current = [{ id: "keep", x: 1 }];
     const incoming = [

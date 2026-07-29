@@ -10,14 +10,18 @@ import {
   PencilLine,
   Plus,
   Sparkles,
+  Trash2,
 } from "@/components/ui/icons";
 import { Button } from "@/components/ui/button";
+import { ConfirmActionDialog } from "@/components/ui/confirm-action-dialog";
 import { SurfaceCard } from "@/components/ui/page-primitives";
 import { TransitionLink } from "@/components/motion/transition-link";
 import { useT } from "@/lib/i18n/useT";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
+import { useActiveProject } from "@/lib/client/active-project-provider";
 import {
   announceProjectCreated,
+  announceProjectDeleted,
   announceProjectUpdated,
 } from "@/lib/client/project-created-event";
 import { AssetImage } from "@/components/ui/asset-image";
@@ -31,11 +35,12 @@ import { ProjectNameDialog } from "@/components/projects/project-name-dialog";
 import { useI18n } from "@/lib/i18n/provider";
 import { buildDefaultProjectName, resolveTemplateProjectName } from "@/lib/project-name";
 import { formatRelativeTime } from "@/lib/relative-time";
-import { createProject, renameProject } from "@/lib/client/projects";
+import { createProject, deleteProject, renameProject } from "@/lib/client/projects";
 import { formatProjectTemplateContents } from "@/lib/project-template-content";
 import {
   mergeKeyedCursorPage,
   PROJECTS_PAGE_SIZE,
+  removeItemFromKeyedCursorPage,
   type KeyedCursorPage,
 } from "@/lib/project-pagination";
 
@@ -81,6 +86,7 @@ export function ProjectsIndex({
   const { locale } = useI18n();
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { activeProjectId, setActiveProject } = useActiveProject();
   const [projectPage, setProjectPage] = useState<KeyedCursorPage<ProjectsIndexItem>>({
     key: PROJECTS_SCOPE_KEY,
     items: initialPage.projects,
@@ -95,6 +101,9 @@ export function ProjectsIndex({
   const [projectName, setProjectName] = useState("");
   const [nameDialogError, setNameDialogError] = useState("");
   const [savingRename, setSavingRename] = useState(false);
+  const [pendingDeleteProject, setPendingDeleteProject] = useState<ProjectsIndexItem | null>(null);
+  const [deletingProject, setDeletingProject] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
   const loadControllerRef = useRef<AbortController | null>(null);
   const projects = projectPage.items;
   const templateName = useCallback(
@@ -176,6 +185,32 @@ export function ProjectsIndex({
       setNameDialogError(toErrorMessage(requestError, t("library.renameProjectFailed")));
     } finally {
       setSavingRename(false);
+    }
+  };
+
+  const handleConfirmDeleteProject = async () => {
+    if (!pendingDeleteProject || deletingProject) return;
+    const target = pendingDeleteProject;
+    // A page captured before the DELETE can otherwise resolve afterward and
+    // append the deleted row again. Cancel it before crossing the mutation
+    // boundary; the user can retry Load More if deletion itself fails.
+    loadControllerRef.current?.abort();
+    loadControllerRef.current = null;
+    setLoadingMore(false);
+    setDeletingProject(true);
+    setDeleteError("");
+    try {
+      const deleted = await deleteProject(target.id);
+      setProjectPage((current) => removeItemFromKeyedCursorPage(current, deleted.id));
+      if (activeProjectId === deleted.id) {
+        setActiveProject(null);
+      }
+      announceProjectDeleted(deleted);
+      setPendingDeleteProject(null);
+    } catch (requestError) {
+      setDeleteError(toErrorMessage(requestError, t("library.deleteProjectFailed")));
+    } finally {
+      setDeletingProject(false);
     }
   };
 
@@ -352,7 +387,7 @@ export function ProjectsIndex({
                             type="button"
                             variant="ghostMuted"
                             size="icon-sm"
-                            aria-label={t("library.renameProject")}
+                            aria-label={t("library.projectActions")}
                           >
                             <MoreHorizontal className="h-4 w-4" />
                           </Button>
@@ -367,6 +402,16 @@ export function ProjectsIndex({
                           >
                             <PencilLine className="h-4 w-4" />
                             {t("library.renameProject")}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onSelect={() => {
+                              setDeleteError("");
+                              setPendingDeleteProject(project);
+                            }}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                            {t("library.deleteProject")}
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
@@ -443,6 +488,23 @@ export function ProjectsIndex({
           }
         }}
         onSubmit={handleProjectNameSubmit}
+      />
+      <ConfirmActionDialog
+        open={Boolean(pendingDeleteProject)}
+        onOpenChange={(open) => {
+          if (!open && !deletingProject) {
+            setPendingDeleteProject(null);
+            setDeleteError("");
+          }
+        }}
+        title={t("library.deleteProject")}
+        description={t("library.deleteProjectConfirm")}
+        cancelLabel={t("common.cancel")}
+        confirmLabel={deletingProject ? t("library.deletingProject") : t("common.delete")}
+        pending={deletingProject}
+        error={deleteError}
+        tone="destructive"
+        onConfirm={handleConfirmDeleteProject}
       />
     </section>
   );

@@ -100,6 +100,7 @@ function toReplicatePrediction(prediction: ReplicateSdkPrediction): ReplicatePre
 export async function runReplicatePrediction(params: {
   apiKey: string;
   apiBase: string;
+  fetch: typeof fetch;
   modelId: string;
   input: Record<string, unknown>;
   label: string;
@@ -114,6 +115,7 @@ export async function runReplicatePrediction(params: {
   const replicate = new Replicate({
     auth: params.apiKey,
     baseUrl: apiBase,
+    fetch: params.fetch,
     useFileOutput: false,
   });
 
@@ -184,6 +186,7 @@ export async function runReplicatePrediction(params: {
 interface FalQueueParams {
   apiKey: string;
   apiBase: string;
+  fetch: typeof fetch;
   modelPath: string;
   body: Record<string, unknown>;
   deadlineMs: number;
@@ -247,6 +250,7 @@ export async function falQueueResult<TResult = unknown>(params: FalQueueParams):
   const apiBase = params.apiBase.replace(/\/+$/, "");
   const client = createFalClient({
     credentials: params.apiKey,
+    fetch: params.fetch,
     requestMiddleware: async (request) => ({
       ...request,
       url: rewriteFalTargetUrl(request.url, apiBase),

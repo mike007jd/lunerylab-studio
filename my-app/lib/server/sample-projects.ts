@@ -6,7 +6,7 @@ import {
   restoreStoredFile,
   writeGeneratedImage,
 } from "@/lib/server/storage";
-import { resolveLocale } from "@/lib/i18n/server";
+import { normalizeLocale } from "@/lib/i18n/locale";
 import { getPlainT } from "@/lib/i18n/plain";
 import {
   SAMPLE_PROJECTS,
@@ -205,15 +205,14 @@ async function seedOneSample(userId: string, def: SampleProjectDef, t: SampleTra
  */
 export async function ensureBuiltInProjectTemplates(userId: string): Promise<void> {
   try {
-    // Localize sample copy from the message catalog. resolveLocale reads the
-    // request cookie/headers; outside a request scope (defensive) it would
-    // throw, so fall back to English.
-    let t: SampleTranslator;
-    try {
-      t = getPlainT(await resolveLocale());
-    } catch {
-      t = getPlainT("en");
-    }
+    // Read the profile locale directly. Calling resolveLocale() here would
+    // recurse through ensureLocalWorkspaceOwner() while its first-boot promise
+    // is still pending and deadlock the desktop shell before the first render.
+    const preferences = await prisma.userSettings.findUnique({
+      where: { userId },
+      select: { defaultLocale: true },
+    });
+    const t = getPlainT(normalizeLocale(preferences?.defaultLocale) ?? "en");
 
     const existingTemplateKeys = new Set(
       (await prisma.project.findMany({

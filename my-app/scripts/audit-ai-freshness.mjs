@@ -102,6 +102,11 @@ const currentCatalogRequiredPatterns = [
 // actively track the recommended leaf model.
 const exactSourceChecks = [
   {
+    id: "gpt-5.6-sol",
+    url: "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    strategy: "source-text",
+  },
+  {
     id: "gpt-image-2",
     url: "https://developers.openai.com/api/docs/models/gpt-image-2",
     strategy: "source-text",
@@ -128,6 +133,11 @@ const exactSourceChecks = [
     strategy: "source-text",
   },
   {
+    id: "MiniMax-M3",
+    url: "https://platform.minimax.io/docs/api-reference/text-openai-api",
+    strategy: "source-text",
+  },
+  {
     id: "black-forest-labs/flux-2-pro",
     url: "https://replicate.com/black-forest-labs/flux-2-pro",
     strategy: "source-text",
@@ -135,17 +145,27 @@ const exactSourceChecks = [
   {
     id: "fal-ai/flux-pro/v1.1",
     url: "https://fal.ai/models/fal-ai/flux-pro/v1.1/api",
-    strategy: "source-text",
+    strategy: "fal-models",
   },
   {
     id: "fal-ai/flux-pro/v1/fill",
     url: "https://fal.ai/models/fal-ai/flux-pro/v1/fill/api",
-    strategy: "source-text",
+    strategy: "fal-models",
   },
   {
     id: "fal-ai/birefnet",
     url: "https://fal.ai/models/fal-ai/birefnet/api",
-    strategy: "source-text",
+    strategy: "fal-models",
+  },
+  {
+    id: "fal-ai/flux-pulid",
+    url: "https://fal.ai/models/fal-ai/flux-pulid/api",
+    strategy: "fal-models",
+  },
+  {
+    id: "bytedance/seedance-2.0/text-to-video",
+    url: "https://fal.ai/models/bytedance/seedance-2.0/text-to-video/api",
+    strategy: "fal-models",
   },
   {
     id: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
@@ -170,6 +190,17 @@ const exactSourceChecks = [
   },
 ];
 
+const falRateLimitedSourceFallbacks = new Map([
+  [
+    "https://fal.ai/explore/text-to-video-apis",
+    { category: "text-to-video" },
+  ],
+  [
+    "https://fal.ai/docs/model-api-reference/3d-api/overview",
+    { category: "image-to-3d" },
+  ],
+]);
+
 // Recommended-current audit: for the first-party providers we actively track,
 // the BYOK placeholder must be the CURRENT recommended leaf model — not merely
 // an available one (gpt-image-1.5 stays available but is no longer current).
@@ -177,9 +208,24 @@ const exactSourceChecks = [
 const recommendedCurrentModels = [
   {
     providerId: "openai",
+    role: "text",
+    expected: "gpt-5.6-sol",
+    checkedAt: "2026-07-29",
+    source: "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+  },
+  {
+    providerId: "openai",
+    role: "imageGenerate",
     expected: "gpt-image-2",
-    checkedAt: "2026-06-22",
+    checkedAt: "2026-07-29",
     source: "https://developers.openai.com/api/docs/models/gpt-image-2",
+  },
+  {
+    providerId: "minimax",
+    role: "text",
+    expected: "MiniMax-M3",
+    checkedAt: "2026-07-29",
+    source: "https://platform.minimax.io/docs/api-reference/text-openai-api",
   },
 ];
 
@@ -189,6 +235,14 @@ function extractProviderBlock(text, providerId) {
   if (start < 0) return "";
   const next = text.indexOf('\n    id: "', start + startMarker.length);
   return text.slice(start, next < 0 ? text.length : next);
+}
+
+function extractModelGuidanceRoleBlock(providerBlock, role) {
+  const marker = `\n      ${role}: {`;
+  const start = providerBlock.indexOf(marker);
+  if (start < 0) return "";
+  const end = providerBlock.indexOf("\n      },", start + marker.length);
+  return providerBlock.slice(start, end < 0 ? providerBlock.length : end + 9);
 }
 
 const today = process.env.AI_FRESHNESS_TODAY ?? new Date().toISOString().slice(0, 10);
@@ -238,6 +292,28 @@ function shouldRetryStatus(status) {
   return status === 408 || status === 429 || status >= 500;
 }
 
+async function fetchJsonWithRetry(url) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt += 1) {
+    let response = null;
+    try {
+      response = await fetchWithTimeout(url, { redirect: "follow" });
+    } catch (error) {
+      lastError = error;
+    }
+    if (response) {
+      if (response.ok) return await response.json();
+      lastError = new Error(`HTTP ${response.status}`);
+      await cancelBody(response);
+      if (!shouldRetryStatus(response.status)) throw lastError;
+    }
+    if (attempt < PROBE_ATTEMPTS) {
+      await sleep(500 * attempt);
+    }
+  }
+  throw lastError ?? new Error("JSON request failed");
+}
+
 function probeDetail(response, phase) {
   return `${phase} HTTP ${response.status}`;
 }
@@ -248,7 +324,7 @@ async function probeUrlOnce(url) {
     method: "HEAD",
     redirect: "follow",
   });
-  if (head.ok || head.status === 405 || head.status === 403) {
+  if (head.ok || head.status === 403 || head.status === 405) {
     await cancelBody(head);
     return { ok: true };
   }
@@ -261,8 +337,9 @@ async function probeUrlOnce(url) {
   });
   const ok = get.ok || get.status === 403;
   const detail = probeDetail(get, "GET");
+  const status = get.status;
   await cancelBody(get);
-  return { ok, detail };
+  return { ok, detail, status };
 }
 
 async function probeUrlWithCurl(url) {
@@ -286,18 +363,46 @@ async function probeUrlWithCurl(url) {
   return {
     ok,
     detail: Number.isFinite(status) && status > 0 ? `curl HEAD HTTP ${status}` : "curl HEAD failed",
+    status,
   };
+}
+
+async function probeFalRateLimitedSource(sourceUrl) {
+  const fallback = falRateLimitedSourceFallbacks.get(sourceUrl);
+  if (!fallback) return { ok: false };
+
+  const url = new URL("https://api.fal.ai/v1/models");
+  url.searchParams.set("category", fallback.category);
+  url.searchParams.set("status", "active");
+  url.searchParams.set("limit", "1");
+  try {
+    const payload = await fetchJsonWithRetry(url);
+    const proved = (payload.models ?? []).some(
+      (model) =>
+        model.metadata?.status === "active" && model.metadata?.category === fallback.category,
+    );
+    return proved
+      ? { ok: true }
+      : { ok: false, detail: `fal live catalog has no active ${fallback.category} model` };
+  } catch (error) {
+    return {
+      ok: false,
+      detail: `fal live catalog fallback failed: ${error.message}`,
+    };
+  }
 }
 
 async function probeUrlResult(url) {
   if (!url || !/^https?:\/\//.test(url)) return { ok: true };
   let lastDetail = "not attempted";
+  let rateLimitedAttempts = 0;
   for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt += 1) {
     try {
       const result = await probeUrlOnce(url);
       if (result.ok) return { ok: true };
       lastDetail = result.detail ?? "unreachable";
-      if (!shouldRetryStatus(Number(lastDetail.match(/\d+$/)?.[0] ?? 0))) break;
+      if (result.status === 429) rateLimitedAttempts += 1;
+      if (!shouldRetryStatus(result.status ?? 0)) break;
     } catch (error) {
       lastDetail = error instanceof Error ? error.message : String(error);
     }
@@ -305,12 +410,19 @@ async function probeUrlResult(url) {
       await sleep(500 * attempt);
     }
   }
+  let curlRateLimited = false;
   try {
     const result = await probeUrlWithCurl(url);
     if (result.ok) return { ok: true };
     lastDetail = result.detail ?? lastDetail;
+    curlRateLimited = result.status === 429;
   } catch (error) {
     lastDetail = error instanceof Error ? error.message : String(error);
+  }
+  if (rateLimitedAttempts === PROBE_ATTEMPTS && curlRateLimited) {
+    const fallback = await probeFalRateLimitedSource(url);
+    if (fallback.ok) return fallback;
+    if (fallback.detail) lastDetail = `${lastDetail}; ${fallback.detail}`;
   }
   return { ok: false, detail: lastDetail };
 }
@@ -407,6 +519,35 @@ async function assertSourceTextContains({ id, aliases = [], url }) {
     }
   } catch (error) {
     failures.push(`exact model check failed: ${id} source unreadable ${url}: ${error.message}`);
+  }
+}
+
+async function assertFalModels(checks) {
+  const url = new URL("https://api.fal.ai/v1/models");
+  for (const check of checks) {
+    const canonicalSourceUrl = `https://fal.ai/models/${check.id}/api`;
+    if (check.url !== canonicalSourceUrl) {
+      failures.push(
+        `fal exact model source mismatch for ${check.id}: ${check.url}; expected ${canonicalSourceUrl}`,
+      );
+    }
+    url.searchParams.append("endpoint_id", check.id);
+  }
+  try {
+    const payload = await fetchJsonWithRetry(url);
+    const models = new Map((payload.models ?? []).map((model) => [model.endpoint_id, model]));
+    for (const { id } of checks) {
+      const model = models.get(id);
+      if (!model) {
+        failures.push(`fal model id missing from live catalog: ${id}`);
+      } else if (model.metadata?.status !== "active") {
+        failures.push(
+          `fal model id is not active in live catalog: ${id} (${model.metadata?.status ?? "unknown"})`,
+        );
+      }
+    }
+  } catch (error) {
+    failures.push(`fal exact model batch check failed: ${error.message}`);
   }
 }
 
@@ -566,6 +707,18 @@ function extractProviderExactIds(text) {
   ].filter((id) => id !== "local-model-id");
 }
 
+const falModelChecks = exactSourceChecks.filter((check) => check.strategy === "fal-models");
+await assertFalModels(falModelChecks);
+
+for (const check of exactSourceChecks) {
+  if (isProbeableSourceUrl(check.url) && !seenUrls.has(check.url)) seenUrls.add(check.url);
+  if (check.strategy === "openrouter-models") {
+    await assertOpenRouterModel(check.id, check.url);
+  } else if (check.strategy !== "fal-models") {
+    await assertSourceTextContains(check);
+  }
+}
+
 for (const file of metadataFiles) {
   const absolute = path.join(root, file);
   const text = await readFile(absolute, "utf8");
@@ -625,24 +778,23 @@ for (const file of metadataFiles) {
   for (const id of extractProviderExactIds(text)) {
     if (!exactCheckIds.has(id)) failures.push(`BYOK exact model id has no audit check: ${id}`);
   }
-  // Recommended-current: placeholder must equal the tracked current leaf model.
+  // Recommended-current: each capability-specific placeholder must keep its
+  // exact leaf id, official source and checked date aligned.
   for (const rec of recommendedCurrentModels) {
-    const block = extractProviderBlock(text, rec.providerId);
-    const actual = block.match(/placeholderModelId:\s*"([^"]+)"/)?.[1];
-    if (actual !== rec.expected) {
+    const providerBlock = extractProviderBlock(text, rec.providerId);
+    const roleBlock = extractModelGuidanceRoleBlock(providerBlock, rec.role);
+    const actual = roleBlock.match(/placeholderModelId:\s*"([^"]+)"/)?.[1];
+    const source = roleBlock.match(/url:\s*"([^"]+)"/)?.[1];
+    const checkedAt = roleBlock.match(/lastVerifiedAt:\s*"(\d{4}-\d{2}-\d{2})"/)?.[1];
+    if (
+      actual !== rec.expected ||
+      source !== rec.source ||
+      checkedAt !== rec.checkedAt
+    ) {
       failures.push(
-        `recommended-current check: ${rec.providerId} placeholder is "${actual ?? "(none)"}", expected current "${rec.expected}" (verified ${rec.checkedAt}, ${rec.source})`,
+        `recommended-current check: ${rec.providerId}:${rec.role} is id="${actual ?? "(none)"}" source="${source ?? "(none)"}" checkedAt="${checkedAt ?? "(none)"}"; expected "${rec.expected}", "${rec.source}", "${rec.checkedAt}"`,
       );
     }
-  }
-}
-
-for (const check of exactSourceChecks) {
-  if (isProbeableSourceUrl(check.url) && !seenUrls.has(check.url)) seenUrls.add(check.url);
-  if (check.strategy === "openrouter-models") {
-    await assertOpenRouterModel(check.id, check.url);
-  } else {
-    await assertSourceTextContains(check);
   }
 }
 

@@ -4,7 +4,6 @@ const mocks = vi.hoisted(() => ({
   generateTextLocal: vi.fn(),
   generateTextByok: vi.fn(),
   resolveTextRuntimeSupply: vi.fn(),
-  resolveRuntimeByokCandidates: vi.fn(),
 }));
 
 vi.mock("@/lib/server/local-llm", () => ({
@@ -17,7 +16,6 @@ vi.mock("@/lib/server/byok-llm", () => ({
 
 vi.mock("@/lib/server/runtime-supply", () => ({
   resolveTextRuntimeSupply: mocks.resolveTextRuntimeSupply,
-  resolveRuntimeByokCandidates: mocks.resolveRuntimeByokCandidates,
 }));
 
 import { optimizePrompt } from "@/lib/server/prompt-optimizer";
@@ -29,7 +27,6 @@ beforeEach(() => {
     endpoint: "http://localhost:11434",
     modelId: "llama",
   });
-  mocks.resolveRuntimeByokCandidates.mockResolvedValue([]);
   mocks.generateTextLocal.mockResolvedValue({
     text: "Photorealistic studio portrait.",
     model: "llama",
@@ -39,12 +36,12 @@ beforeEach(() => {
 describe("optimizePrompt", () => {
   it("fails explicitly when no text runtime is configured", async () => {
     mocks.resolveTextRuntimeSupply.mockResolvedValue(null);
-    mocks.resolveRuntimeByokCandidates.mockResolvedValue([]);
 
     await expect(
       optimizePrompt({
         prompt: "portrait",
         mode: "photo",
+        textModelId: "local:llama",
       }),
     ).rejects.toMatchObject({
       status: 503,
@@ -53,6 +50,17 @@ describe("optimizePrompt", () => {
     });
     expect(mocks.generateTextLocal).not.toHaveBeenCalled();
     expect(mocks.generateTextByok).not.toHaveBeenCalled();
+  });
+
+  it("passes the explicit text model into resolveTextRuntimeSupply", async () => {
+    await optimizePrompt({
+      prompt: "portrait",
+      mode: "photo",
+      textModelId: "local:wanted-model",
+    });
+
+    expect(mocks.resolveTextRuntimeSupply).toHaveBeenCalledWith("local:wanted-model");
+    expect(mocks.generateTextLocal).toHaveBeenCalled();
   });
 
   it("does not disguise an invalid Chinese result as a rule-based success", async () => {
@@ -66,6 +74,7 @@ describe("optimizePrompt", () => {
         prompt: "月光下的天文台",
         mode: "concept",
         locale: "zh-CN",
+        textModelId: "local:llama",
       }),
     ).rejects.toMatchObject({
       status: 502,
@@ -82,6 +91,7 @@ describe("optimizePrompt", () => {
       optimizePrompt({
         prompt: "portrait",
         mode: "photo",
+        textModelId: "local:llama",
         abortSignal,
       }),
     ).resolves.toEqual({

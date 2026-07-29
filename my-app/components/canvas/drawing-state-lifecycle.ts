@@ -45,6 +45,24 @@ export function findServerDeletedDirtyLayerIds<T extends { id: string }>(
   );
 }
 
+/** Geometry fields owned by the local debounced writer while a layer is dirty. */
+const DIRTY_GEOMETRY_KEYS = ["x", "y", "width", "height", "rotation"] as const;
+
+function takeLocalDirtyGeometry<T extends { id: string }>(local: T): Partial<T> {
+  const patch: Partial<T> = {};
+  for (const key of DIRTY_GEOMETRY_KEYS) {
+    if (key in local) {
+      patch[key as keyof T] = local[key as keyof T];
+    }
+  }
+  return patch;
+}
+
+/**
+ * Merge a polled server snapshot with locally dirty layers. Dirty ids keep only
+ * their in-flight geometry; lock, hidden, z-index, asset identity, and every
+ * other server field stay authoritative so a poll cannot conceal a lock.
+ */
 export function mergePolledLayers<T extends { id: string }>(
   current: readonly T[],
   incoming: readonly T[],
@@ -60,9 +78,12 @@ export function mergePolledLayers<T extends { id: string }>(
   if (dirtyIds.size === 0 && preserveMissingIds.size === 0) return visibleIncoming;
   const currentById = new Map(current.map((layer) => [layer.id, layer]));
   const incomingIds = new Set(visibleIncoming.map((layer) => layer.id));
-  const merged = visibleIncoming.map((layer) =>
-    dirtyIds.has(layer.id) ? (currentById.get(layer.id) ?? layer) : layer,
-  );
+  const merged = visibleIncoming.map((layer) => {
+    if (!dirtyIds.has(layer.id)) return layer;
+    const local = currentById.get(layer.id);
+    if (!local) return layer;
+    return { ...layer, ...takeLocalDirtyGeometry(local) };
+  });
   for (const layer of current) {
     if (
       !deletedIds.has(layer.id) &&

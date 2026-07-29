@@ -3,7 +3,11 @@ import "server-only";
 import { findByokProvider, type ByokProviderMeta } from "@/lib/byok-providers";
 import { getByokConnectionMeta, type ByokConnectionMeta } from "@/lib/server/byok-connection-store";
 import { ApiError } from "@/lib/server/errors";
-import { readByokKey, requireValidatedProviderEndpoint } from "@/lib/server/byok-shared";
+import {
+  createPinnedProviderFetch,
+  readByokKey,
+  requireValidatedProviderEndpoint,
+} from "@/lib/server/byok-shared";
 
 export interface ResolvedByokProviderConfig {
   providerId: string;
@@ -11,6 +15,7 @@ export interface ResolvedByokProviderConfig {
   connection: ByokConnectionMeta | undefined;
   apiKey: string;
   endpoint: string;
+  fetch: typeof fetch;
   modelId: string;
 }
 
@@ -63,12 +68,14 @@ export async function resolveByokProviderConfig({
     });
   }
 
+  const validatedEndpoint = await requireValidatedProviderEndpoint(rawEndpoint);
   return {
     providerId,
     providerMeta: meta,
     connection,
     apiKey: await readByokKey(providerId),
-    endpoint: await requireValidatedProviderEndpoint(rawEndpoint),
+    endpoint: validatedEndpoint.url,
+    fetch: createPinnedProviderFetch(validatedEndpoint),
     modelId,
   };
 }

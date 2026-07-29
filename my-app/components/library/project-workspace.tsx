@@ -38,8 +38,9 @@ import { useT } from "@/lib/i18n/useT";
 import { type TFunction } from "@/lib/i18n/provider";
 import { TransitionLink } from "@/components/motion/transition-link";
 import { ProjectNameDialog } from "@/components/projects/project-name-dialog";
-import { announceProjectUpdated } from "@/lib/client/project-created-event";
-import { renameProject } from "@/lib/client/projects";
+import { announceProjectDeleted, announceProjectUpdated } from "@/lib/client/project-created-event";
+import { buildProjectDocumentTitle } from "@/lib/client/project-document-title";
+import { deleteProject, renameProject } from "@/lib/client/projects";
 import { addCanvasEntrySource } from "@/lib/client/creation-flow";
 import {
   EMPTY_LIBRARY_SEARCH_COUNTS,
@@ -222,10 +223,19 @@ export function ProjectWorkspace({
 
   const [detail, setDetail] = useState<ProjectDetail | null>(initialDetail);
   const [projectName, setProjectName] = useState(heading);
+
+  // Project detail owns its document title from the real project name — TopHeader
+  // deliberately skips the generic Projects label on this route.
+  useEffect(() => {
+    document.title = buildProjectDocumentTitle(projectName);
+  }, [projectName]);
   const [projectNameDialogOpen, setProjectNameDialogOpen] = useState(false);
   const [projectNameDraft, setProjectNameDraft] = useState(heading);
   const [projectNameError, setProjectNameError] = useState("");
   const [savingProjectName, setSavingProjectName] = useState(false);
+  const [pendingDeleteProject, setPendingDeleteProject] = useState(false);
+  const [deletingProject, setDeletingProject] = useState(false);
+  const [deleteProjectError, setDeleteProjectError] = useState("");
   // Hydrated from the server on first mount: no detail skeleton on initial visit.
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
@@ -734,6 +744,23 @@ export function ProjectWorkspace({
     }
   };
 
+  const handleConfirmDeleteProject = async () => {
+    if (deletingProject) return;
+    setDeletingProject(true);
+    setDeleteProjectError("");
+    try {
+      const deleted = await deleteProject(projectId);
+      setActiveProject(null);
+      announceProjectDeleted(deleted);
+      setPendingDeleteProject(false);
+      router.push("/projects");
+    } catch (requestError) {
+      setDeleteProjectError(toErrorMessage(requestError, t("library.deleteProjectFailed")));
+    } finally {
+      setDeletingProject(false);
+    }
+  };
+
   const handleConfirmDeleteSession = async () => {
     if (!pendingDeleteSession) return;
     const sessionId = pendingDeleteSession.id;
@@ -933,6 +960,30 @@ export function ProjectWorkspace({
               >
                 <PencilLine className="h-3.5 w-3.5" />
               </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghostMuted"
+                    size="icon-xs"
+                    aria-label={t("library.projectActions")}
+                  >
+                    <MoreHorizontal className="h-3.5 w-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuItem
+                    variant="destructive"
+                    onSelect={() => {
+                      setDeleteProjectError("");
+                      setPendingDeleteProject(true);
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    {t("library.deleteProject")}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -1235,6 +1286,23 @@ export function ProjectWorkspace({
         pending={deletingSession}
         tone="destructive"
         onConfirm={handleConfirmDeleteSession}
+      />
+      <ConfirmActionDialog
+        open={pendingDeleteProject}
+        onOpenChange={(open) => {
+          if (!open && !deletingProject) {
+            setPendingDeleteProject(false);
+            setDeleteProjectError("");
+          }
+        }}
+        title={t("library.deleteProject")}
+        description={t("library.deleteProjectConfirm")}
+        cancelLabel={t("common.cancel")}
+        confirmLabel={deletingProject ? t("library.deletingProject") : t("common.delete")}
+        pending={deletingProject}
+        error={deleteProjectError}
+        tone="destructive"
+        onConfirm={handleConfirmDeleteProject}
       />
     </>
   );

@@ -24,6 +24,7 @@ interface ConfirmActionDialogProps {
   onConfirm: () => void | Promise<void>;
   tone?: ConfirmActionDialogTone;
   pending?: boolean;
+  error?: string;
 }
 
 export function ConfirmActionDialog({
@@ -36,6 +37,7 @@ export function ConfirmActionDialog({
   onConfirm,
   tone = "destructive",
   pending = false,
+  error,
 }: ConfirmActionDialogProps) {
   return (
     <AlertDialog
@@ -52,6 +54,11 @@ export function ConfirmActionDialog({
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription className="text-(--text-secondary)">{description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {error ? (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        ) : null}
         <AlertDialogFooter>
           <AlertDialogCancel
             type="button"

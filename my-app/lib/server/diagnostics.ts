@@ -1,5 +1,6 @@
 import "server-only";
 
+import { APP_VERSION } from "@/lib/app-version";
 import { prisma } from "@/lib/server/prisma";
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { fetchDesktopStatusSnapshot } from "@/lib/server/byok-shared";
@@ -48,7 +49,6 @@ export interface DiagnosticsBundle {
   excluded: string[];
 }
 
-const APP_VERSION = "1.0.0";
 const RECENT_LIMIT = 20;
 
 function redactHomePath(value: string): string {

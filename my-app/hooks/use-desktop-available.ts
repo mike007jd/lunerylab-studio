@@ -29,6 +29,7 @@ interface LlamaStatus {
   running: boolean;
   endpoint?: string | null;
   modelPath: string | null;
+  modelId?: string | null;
 }
 
 export interface DesktopStatus {

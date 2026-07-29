@@ -111,7 +111,10 @@ export async function POST(request: NextRequest) {
 
   return proxyToBridge(bridge, "/llama-start", {
     method: "POST",
-    body: JSON.stringify({ modelPath }),
+    // llama.cpp reports the file path as /v1/models[].id unless --alias is
+    // supplied. Thread the validated catalog/import id into the bridge so
+    // runtime readiness and execution target the same explicit selection.
+    body: JSON.stringify({ modelPath, modelId }),
     timeoutMs: 45000,
   });
 }

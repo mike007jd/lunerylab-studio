@@ -1,6 +1,7 @@
 "use client";
 
 import type { FC } from "react";
+import Link from "next/link";
 import {
   AuiIf,
   ComposerPrimitive,
@@ -14,6 +15,7 @@ import { LunaLogo } from "@/components/ui/luna-logo";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useT } from "@/lib/i18n/useT";
+import { useCreativeCapabilityReadiness } from "@/hooks/use-creative-capability-readiness";
 import { ASPECT_RATIOS, COUNT_OPTIONS, type AspectRatioValue, type CountValue } from "@/lib/constants/generation";
 import { formatGenerationOptionsSummary } from "@/lib/client/generation-presentation";
 import {
@@ -181,28 +183,58 @@ function GenerationOptionsBar() {
 const Composer: FC = () => {
   const t = useT();
   const { showGenerationOptions } = useAgentChatUI();
+  // Shared text capability readiness gates the assistant: with no selected
+  // text model the draft stays editable, Send is disabled, Enter cannot
+  // submit, and visible setup guidance with a Settings Text action shows
+  // before any generation boundary.
+  const readiness = useCreativeCapabilityReadiness();
+  const textCapability = readiness.byId.promptRefinement;
+  const textReady = textCapability.status === "ready";
   return (
     <ComposerPrimitive.Root className="flex-none border-t border-border bg-popover px-3 py-3">
       {showGenerationOptions ? <GenerationOptionsBar /> : null}
+      {!textReady ? (
+        <div className="mb-2 flex items-center gap-2 rounded-lg border border-(--warning-soft) bg-(--warning-soft) px-3 py-2">
+          <p className="min-w-0 flex-1 text-xs leading-relaxed text-(--text-secondary)">
+            {t("agent.textAiRequiredDetail")}
+          </p>
+          <Button asChild type="button" size="xs" variant="outline" className="shrink-0">
+            <Link href="/settings?panel=text">{t("agent.openTextSettings")}</Link>
+          </Button>
+        </div>
+      ) : null}
       <div className="flex items-end gap-2 rounded-2xl border border-border bg-card px-3 py-2">
         <ComposerPrimitive.Input
           rows={1}
           autoFocus
           placeholder={t("agent.continuePlaceholder")}
+          submitOnEnter={textReady}
           className="max-h-[120px] min-h-6 flex-1 resize-none overflow-y-auto bg-transparent p-0 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/70"
         />
         <div className="flex flex-none items-center">
           <AuiIf condition={(s) => !s.thread.isRunning}>
-            <ComposerPrimitive.Send asChild>
+            {textReady ? (
+              <ComposerPrimitive.Send asChild>
+                <Button
+                  type="button"
+                  aria-label={t("agent.sendMessage")}
+                  variant="accent"
+                  size="icon-chat"
+                >
+                  <Send className="h-3.5 w-3.5" />
+                </Button>
+              </ComposerPrimitive.Send>
+            ) : (
               <Button
                 type="button"
+                disabled
                 aria-label={t("agent.sendMessage")}
                 variant="accent"
                 size="icon-chat"
               >
                 <Send className="h-3.5 w-3.5" />
               </Button>
-            </ComposerPrimitive.Send>
+            )}
           </AuiIf>
           <AuiIf condition={(s) => s.thread.isRunning}>
             <ComposerPrimitive.Cancel asChild>
@@ -219,7 +251,7 @@ const Composer: FC = () => {
         </div>
       </div>
       <p className="mt-1.5 text-center text-xs text-muted-foreground">
-        {t("agent.sendHint")}
+        {textReady ? t("agent.sendHint") : t("agent.textDraftHint")}
       </p>
     </ComposerPrimitive.Root>
   );

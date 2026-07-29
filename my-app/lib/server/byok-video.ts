@@ -46,6 +46,7 @@ interface ResolvedByokVideoConfig {
   providerId: string;
   apiKey: string;
   endpoint: string;
+  fetch: typeof fetch;
   modelId: string;
 }
 
@@ -88,6 +89,7 @@ async function generateVideoFal(
   const url = await falQueueSubmit<FalVideoPayload>({
     apiKey: config.apiKey,
     apiBase: config.endpoint,
+    fetch: config.fetch,
     modelPath: config.modelId,
     body,
     extractUrl: (p) => p.video?.url ?? p.videos?.[0]?.url,
@@ -110,6 +112,7 @@ async function generateVideoReplicate(
   const prediction = await runReplicatePrediction({
     apiKey: config.apiKey,
     apiBase,
+    fetch: config.fetch,
     modelId: config.modelId,
     label: "Replicate video",
     deadlineMs: 10 * 60_000,
@@ -161,7 +164,7 @@ async function generateVideoMiniMax(
   }
   let createResp: Response;
   try {
-    createResp = await fetch(`${apiBase}/video_generation`, {
+    createResp = await config.fetch(`${apiBase}/video_generation`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
@@ -200,7 +203,7 @@ async function generateVideoMiniMax(
     fetcher: async () => {
       let statusResp: Response;
       try {
-        statusResp = await fetch(
+        statusResp = await config.fetch(
           `${apiBase}/query/video_generation?task_id=${encodeURIComponent(created.task_id!)}`,
           {
             headers: { Authorization: `Bearer ${config.apiKey}` },
@@ -259,7 +262,7 @@ async function generateVideoMiniMax(
 
   let fileResp: Response;
   try {
-    fileResp = await fetch(
+    fileResp = await config.fetch(
       `${apiBase}/files/retrieve?file_id=${encodeURIComponent(status.file_id)}`,
       {
         headers: { Authorization: `Bearer ${config.apiKey}` },
@@ -342,6 +345,7 @@ export async function generateVideoByok(
     providerId,
     apiKey: resolved.apiKey,
     endpoint: resolved.endpoint,
+    fetch: resolved.fetch,
     modelId: resolved.modelId,
   };
 

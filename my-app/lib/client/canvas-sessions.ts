@@ -40,14 +40,53 @@ function canvasLayerUrl(sessionId: string, layerId?: string): string {
   return layerId ? `${base}/${encodeURIComponent(layerId)}` : base;
 }
 
-async function fetchOk(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const response = await fetch(input, init);
-  if (!response.ok) throw new Error(`status ${response.status}`);
-  return response;
+export class CanvasLayerLockedError extends Error {
+  readonly status = 409;
+  readonly code = "canvas_layer_locked" as const;
+
+  constructor(message = "Unlock this layer before changing or deleting it.") {
+    super(message);
+    this.name = "CanvasLayerLockedError";
+  }
 }
 
-export function fetchCanvasSession(sessionId: string): Promise<CanvasSessionResponse> {
-  return fetchJson<CanvasSessionResponse>(canvasSessionUrl(sessionId), { cache: "no-store" });
+export function isCanvasLayerLockedError(error: unknown): error is CanvasLayerLockedError {
+  return error instanceof CanvasLayerLockedError;
+}
+
+function payloadCode(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const code = (payload as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+async function fetchOk(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const response = await fetch(input, init);
+  if (response.ok) return response;
+
+  let payload: unknown;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    payload = await response.json().catch(() => undefined);
+  }
+  if (response.status === 409 && payloadCode(payload) === "canvas_layer_locked") {
+    throw new CanvasLayerLockedError(
+      typeof (payload as { message?: unknown } | undefined)?.message === "string"
+        ? ((payload as { message: string }).message)
+        : undefined,
+    );
+  }
+  throw new Error(`status ${response.status}`);
+}
+
+export function fetchCanvasSession(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<CanvasSessionResponse> {
+  return fetchJson<CanvasSessionResponse>(canvasSessionUrl(sessionId), {
+    cache: "no-store",
+    signal,
+  });
 }
 
 export async function patchCanvasLayer(
@@ -70,6 +109,24 @@ export async function patchCanvasLayer(
 
 export async function deleteCanvasLayer(sessionId: string, layerId: string): Promise<Response> {
   return fetch(canvasLayerUrl(sessionId, layerId), { method: "DELETE" });
+}
+
+/**
+ * Explicit lock/unlock write. Goes through the same PATCH contract as geometry
+ * but carries only the lock flag; the server returns the full layer payload.
+ */
+export async function setCanvasLayerLocked(
+  sessionId: string,
+  layerId: string,
+  locked: boolean,
+  signal?: AbortSignal,
+): Promise<void> {
+  await fetchOk(canvasLayerUrl(sessionId, layerId), {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ locked }),
+    signal,
+  });
 }
 
 export interface SendAssetToCanvasOptions {

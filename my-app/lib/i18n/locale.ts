@@ -1,4 +1,4 @@
-export const LOCALE_STORAGE_KEY = "lunery-locale";
+/** SSR mirror cookie only — profile `defaultLocale` is the durable authority. */
 export const LOCALE_COOKIE_KEY = "lunery-locale";
 
 export const SUPPORTED_LOCALES = ["en", "zh-CN", "zh-TW"] as const;

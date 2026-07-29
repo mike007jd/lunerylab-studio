@@ -82,6 +82,8 @@ import {
   runReplicatePrediction,
 } from "@/lib/server/byok-provider-clients";
 
+const providerFetch = vi.fn<typeof fetch>();
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.state.falConfig = undefined;
@@ -103,6 +105,7 @@ describe("BYOK provider clients", () => {
     const prediction = await runReplicatePrediction({
       apiKey: "rep-token",
       apiBase: "https://api.replicate.com/v1",
+      fetch: providerFetch,
       modelId: "owner/model",
       input: { prompt: "product shot" },
       label: "Replicate image",
@@ -112,6 +115,7 @@ describe("BYOK provider clients", () => {
     expect(mocks.Replicate).toHaveBeenCalledWith({
       auth: "rep-token",
       baseUrl: "https://api.replicate.com/v1",
+      fetch: providerFetch,
       useFileOutput: false,
     });
     expect(mocks.predictionsCreate).toHaveBeenCalledWith(
@@ -128,6 +132,7 @@ describe("BYOK provider clients", () => {
     const payload = await falQueueResult<{ images: Array<{ url: string }> }>({
       apiKey: "fal-key",
       apiBase: "https://fal-proxy.example.test/base",
+      fetch: providerFetch,
       modelPath: "fal-ai/flux-pro/v1.1",
       body: { prompt: "packshot" },
       deadlineMs: 45_000,
@@ -137,6 +142,7 @@ describe("BYOK provider clients", () => {
     expect(mocks.createFalClient).toHaveBeenCalledWith(
       expect.objectContaining({
         credentials: "fal-key",
+        fetch: providerFetch,
       }),
     );
     expect(mocks.falSubscribe).toHaveBeenCalledWith(
@@ -182,6 +188,7 @@ describe("BYOK provider clients", () => {
       falQueueResult({
         apiKey: "fal-key",
         apiBase: "https://queue.fal.run",
+        fetch: providerFetch,
         modelPath: "fal-ai/flux-pro/v1.1",
         body: { prompt: "packshot" },
         deadlineMs: 45_000,

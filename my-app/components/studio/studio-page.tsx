@@ -10,7 +10,6 @@ import {
   type PresetCategory,
 } from "@/lib/presets/style-presets";
 import {
-  resolveSelectableImageModelId,
   resolveSelectableVideoModelId,
   useModelCatalog,
 } from "@/lib/client/use-model-catalog";
@@ -56,7 +55,7 @@ export function StudioPage({
   const router = useRouter();
   const searchParams = useSearchParams();
   const bootstrapSnapshot = useSharedBootstrapSnapshot() ?? initialBootstrap;
-  const { imageModels, videoModels, defaultImageModelId } = useModelCatalog();
+  const { imageModels, videoModels } = useModelCatalog();
   const readiness = useCreativeCapabilityReadiness();
   const hasImageModels = imageModels.length > 0;
   const hasVideoModels = videoModels.length > 0;
@@ -79,16 +78,19 @@ export function StudioPage({
   );
   const [generationParameters, setGenerationParameters] = useState<GenerationParameters>({});
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  // Local-first default: prefer the user's pick, then the snapshot, then the
-  // catalog's local→BYOK→cloud effective default. There is NO hardcoded
-  // fallback — when nothing is configured this resolves to "" and the UI blocks
-  // generation with a "pick or connect a model" hint instead of silently
-  // routing to a model the user never chose.
-  const activeImageModelId = resolveSelectableImageModelId(
-    imageModels,
-    selectedModel ?? bootstrapSnapshot?.app.defaultImageModel ?? defaultImageModelId,
-    defaultImageModelId,
-  );
+  // Local-first default: only an explicit choice resolves — the user's
+  // in-session pick or the saved defaultImageModel. There is NO catalog or
+  // single-model fallback: a ready local model without a selected default is
+  // not ready, never silently dispatches, and the UI blocks generation with
+  // visible setup guidance plus a Settings Image action instead.
+  const requestedImageModelId = selectedModel ?? bootstrapSnapshot?.app.defaultImageModel ?? "";
+  const activeImageModelId = imageModels.some(
+    (model) =>
+      model.id === requestedImageModelId ||
+      model.providerModelId === requestedImageModelId,
+  )
+    ? requestedImageModelId
+    : "";
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const projectTarget = useStudioProjectTarget({

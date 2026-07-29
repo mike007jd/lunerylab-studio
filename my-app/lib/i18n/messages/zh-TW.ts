@@ -30,6 +30,7 @@ const zhTW = {
     "toggleNavigation": "顯示或隱藏導航",
     "goToStudio": "前往 Studio",
     "switchLanguageTo": "將語言切換為{language}",
+    "localeSaveError": "語言未能儲存，請再試一次。",
     "languageEnglish": "英文",
     "languageSimplifiedChinese": "簡體中文",
     "languageTraditionalChinese": "繁體中文"
@@ -80,7 +81,8 @@ const zhTW = {
       "selectTextModel": "選文字模型",
       "selectVideoModel": "選影片模型",
       "selectDefault": "選模型",
-      "changeDefault": "更換"
+      "changeDefault": "更換",
+      "openImageSettings": "打開圖像設定"
     },
     "runtime": {
       "readyTitle": "已連接",
@@ -417,7 +419,9 @@ const zhTW = {
     "configureImageAi": "設定圖片 AI",
     "videoAiRequiredTitle": "需要影片 AI",
     "videoAiRequiredDetail": "加入影片模型後即可執行這個影片步驟，目前任務會保留。",
-    "configureVideoAi": "設定影片 AI"
+    "configureVideoAi": "設定影片 AI",
+    "openTextSettings": "打開文字設定",
+    "textDraftHint": "草稿會保留，設定文字模型後即可傳送。"
   },
   "library": {
     "title": "創作歷史",
@@ -431,6 +435,11 @@ const zhTW = {
     "useTemplate": "使用範本",
     "renameProject": "重新命名專案",
     "renameProjectFailed": "重新命名專案失敗",
+    "projectActions": "專案操作",
+    "deleteProject": "刪除專案",
+    "deleteProjectConfirm": "刪除此專案？已產生的素材仍保留在素材庫中；專案本身將被移除。",
+    "deleteProjectFailed": "刪除專案失敗",
+    "deletingProject": "正在刪除…",
     "projectNameDescription": "選擇一個容易辨認的名稱。",
     "jobs": "任務",
     "canvasAndJobs": "畫布與任務",
@@ -635,7 +644,10 @@ const zhTW = {
       "hideLayer": "隱藏圖層",
       "lockLayer": "鎖定圖層",
       "unlockLayer": "解鎖圖層",
-      "hint": "選擇圖層排序。"
+      "hint": "選擇圖層排序。",
+      "keyboardHint": "Tab 鍵逐一切換圖層 · Enter 選擇 · 方向鍵移動選取的圖層 · Shift+方向鍵調整大小 · Delete 刪除",
+      "layerLocked": "已鎖定",
+      "lockedSelected": "選取的圖層已鎖定，無法移動、調整大小或刪除。"
     },
     "transferExpired": "連結已失效，請返回 Studio 重新生成。",
     "defaults": {

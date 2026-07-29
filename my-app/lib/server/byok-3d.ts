@@ -57,6 +57,7 @@ interface ResolvedConfig {
   providerMeta: ByokProviderMeta;
   apiKey: string;
   endpoint: string;
+  fetch: typeof fetch;
   modelId: string;
 }
 
@@ -114,7 +115,7 @@ async function generateModel3dMeshy(
   input: GenerateModel3dByokInput,
 ): Promise<{ bytes: Buffer; mimeType: string; format: "glb" | "obj" | "fbx" }> {
   const apiBase = config.endpoint.replace(/\/+$/, "");
-  const createResp = await fetch(`${apiBase}/v1/image-to-3d`, {
+  const createResp = await config.fetch(`${apiBase}/v1/image-to-3d`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${config.apiKey}`,
@@ -149,7 +150,7 @@ async function generateModel3dMeshy(
 
   const status = await pollUntil<MeshyTaskStatus>({
     fetcher: async () => {
-      const statusResp = await fetch(`${apiBase}/v1/image-to-3d/${encodeURIComponent(taskId)}`, {
+      const statusResp = await config.fetch(`${apiBase}/v1/image-to-3d/${encodeURIComponent(taskId)}`, {
         headers: { Authorization: `Bearer ${config.apiKey}` },
         cache: "no-store",
         signal: withTimeoutSignal(input.abortSignal, 15_000),
@@ -215,7 +216,7 @@ async function generateModel3dTripo(
   input: GenerateModel3dByokInput,
 ): Promise<{ bytes: Buffer; mimeType: string; format: "glb" | "obj" | "fbx" }> {
   const apiBase = config.endpoint.replace(/\/+$/, "");
-  const createResp = await fetch(`${apiBase}/task`, {
+  const createResp = await config.fetch(`${apiBase}/task`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${config.apiKey}`,
@@ -250,7 +251,7 @@ async function generateModel3dTripo(
 
   const status = await pollUntil<TripoStatus>({
     fetcher: async () => {
-      const statusResp = await fetch(`${apiBase}/task/${encodeURIComponent(taskId)}`, {
+      const statusResp = await config.fetch(`${apiBase}/task/${encodeURIComponent(taskId)}`, {
         headers: { Authorization: `Bearer ${config.apiKey}` },
         cache: "no-store",
         signal: withTimeoutSignal(input.abortSignal, 15_000),
@@ -315,6 +316,7 @@ async function generateModel3dFal(
   const url = await falQueueSubmit<Fal3dPayload>({
     apiKey: config.apiKey,
     apiBase: config.endpoint,
+    fetch: config.fetch,
     modelPath: config.modelId,
     body,
     extractUrl: (p) => p.model_mesh?.url ?? p.model?.url,
@@ -337,6 +339,7 @@ async function generateModel3dReplicate(
   const prediction = await runReplicatePrediction({
     apiKey: config.apiKey,
     apiBase,
+    fetch: config.fetch,
     modelId: config.modelId,
     label: "Replicate 3D",
     deadlineMs: 10 * 60_000,
@@ -406,6 +409,7 @@ export async function generateModel3dByok(
     providerMeta: meta,
     apiKey: resolved.apiKey,
     endpoint: resolved.endpoint,
+    fetch: resolved.fetch,
     modelId: resolved.modelId,
   };
 

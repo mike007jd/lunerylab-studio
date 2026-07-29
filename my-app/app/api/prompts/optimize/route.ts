@@ -4,7 +4,10 @@ import { buildWorkflowPrompt, findWorkflowTemplateById, type CreativeMode } from
 import { ApiError, jsonError } from "@/lib/server/errors";
 import { parseJsonBody } from "@/lib/server/http-validation";
 import { optimizePrompt } from "@/lib/server/prompt-optimizer";
-import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
+import {
+  getLocalWorkspacePreferences,
+  requireLocalWorkspaceOwner,
+} from "@/lib/server/local-workspace-owner";
 
 const optimizePromptSchema = z.object({
   prompt: z.string().optional(),
@@ -33,9 +36,10 @@ function normalizeOptimizeMode(raw: unknown): CreativeMode {
 
 export async function POST(request: NextRequest) {
   try {
-    await requireLocalWorkspaceOwner();
+    const user = await requireLocalWorkspaceOwner();
 
     const body = await parseJsonBody(request, optimizePromptSchema);
+    const settings = await getLocalWorkspacePreferences(user.id);
 
     const prompt = String(body.prompt ?? "").trim();
     const locale = String(body.locale ?? "").trim() || undefined;
@@ -53,6 +57,7 @@ export async function POST(request: NextRequest) {
       ? (body.generationType as "image" | "video")
       : undefined;
     const videoModelId = String(body.videoModelId ?? "").trim() || undefined;
+    const textModelId = settings.defaultTextModel.trim() || undefined;
     const videoDuration = Number.isFinite(body.videoDuration) ? Math.max(0, Number(body.videoDuration)) : undefined;
     const presetName = String(body.presetName ?? "").trim() || undefined;
     const presetGuidance = String(body.presetGuidance ?? "").trim() || undefined;
@@ -75,6 +80,7 @@ export async function POST(request: NextRequest) {
       locale,
       generationType,
       videoModelId,
+      textModelId,
       videoDuration,
       presetName,
       presetGuidance,
