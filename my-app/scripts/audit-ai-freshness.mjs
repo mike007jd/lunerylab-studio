@@ -292,7 +292,7 @@ function shouldRetryStatus(status) {
   return status === 408 || status === 429 || status >= 500;
 }
 
-async function fetchJsonWithRetry(url) {
+async function fetchResponseWithRetry(url) {
   let lastError = null;
   for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt += 1) {
     let response = null;
@@ -302,7 +302,7 @@ async function fetchJsonWithRetry(url) {
       lastError = error;
     }
     if (response) {
-      if (response.ok) return await response.json();
+      if (response.ok) return response;
       lastError = new Error(`HTTP ${response.status}`);
       await cancelBody(response);
       if (!shouldRetryStatus(response.status)) throw lastError;
@@ -311,7 +311,12 @@ async function fetchJsonWithRetry(url) {
       await sleep(500 * attempt);
     }
   }
-  throw lastError ?? new Error("JSON request failed");
+  throw lastError ?? new Error("request failed");
+}
+
+async function fetchJsonWithRetry(url) {
+  const response = await fetchResponseWithRetry(url);
+  return await response.json();
 }
 
 function probeDetail(response, phase) {
@@ -494,8 +499,7 @@ function normalizeForSearch(value) {
 async function fetchText(url) {
   const cached = textCache.get(url);
   if (cached !== undefined) return cached;
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const response = await fetchResponseWithRetry(url);
   const text = await response.text();
   textCache.set(url, text);
   return text;
