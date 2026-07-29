@@ -1,11 +1,9 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
 import {
   LOCALE_COOKIE_KEY,
-  LOCALE_STORAGE_KEY,
   type Locale,
-  normalizeLocale,
 } from "@/lib/i18n/locale";
 import { interpolateMessage, lookupMessage, warnMissingKey, type Messages } from "@/lib/i18n/plain";
 import enMessages from "@/lib/i18n/messages/en";
@@ -22,12 +20,12 @@ interface I18nContextValue {
 
 const I18nContext = createContext<I18nContextValue | null>(null);
 
-function persistLocale(locale: Locale) {
+/** Cookie is an SSR mirror only — profile `defaultLocale` is canonical. */
+function writeLocaleCookieMirror(locale: Locale) {
   if (typeof window === "undefined") {
     return;
   }
 
-  window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
   const secureFlag = window.location.protocol === "https:" ? "; Secure" : "";
   document.cookie = `${LOCALE_COOKIE_KEY}=${locale}; path=/; max-age=31536000; SameSite=Lax${secureFlag}`;
 }
@@ -55,27 +53,8 @@ export function I18nProvider({ initialLocale, initialMessages, children }: I18nP
   const [messages, setMessages] = useState<Messages>(initialMessages);
   const loadSeqRef = useRef(0);
 
-  useEffect(() => {
-    const storedLocale = normalizeLocale(window.localStorage.getItem(LOCALE_STORAGE_KEY));
-    const preferredLocale = storedLocale ?? initialLocale;
-
-    const timer = window.setTimeout(() => {
-      if (preferredLocale === initialLocale) return;
-      const seq = ++loadSeqRef.current;
-      void loadMessages(preferredLocale).then((nextMessages) => {
-        if (seq !== loadSeqRef.current) return;
-        setMessages(nextMessages);
-        setLocaleState(preferredLocale);
-      });
-    }, 0);
-
-    persistLocale(preferredLocale);
-    return () => window.clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const setLocale = useCallback((nextLocale: Locale) => {
-    persistLocale(nextLocale);
+    writeLocaleCookieMirror(nextLocale);
     const seq = ++loadSeqRef.current;
     void loadMessages(nextLocale).then((nextMessages) => {
       if (seq !== loadSeqRef.current) return;

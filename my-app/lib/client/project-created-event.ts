@@ -38,3 +38,21 @@ export function subscribeToProjectUpdated(
   window.addEventListener(PROJECT_UPDATED_EVENT, handleEvent);
   return () => window.removeEventListener(PROJECT_UPDATED_EVENT, handleEvent);
 }
+
+const PROJECT_DELETED_EVENT = "lunery:project-deleted";
+
+/** Announces a successful deletion so shell lists drop the stale row. */
+export function announceProjectDeleted(project: CreatedProjectSummary): void {
+  window.dispatchEvent(new CustomEvent(PROJECT_DELETED_EVENT, { detail: project }));
+}
+
+export function subscribeToProjectDeleted(
+  listener: (project: CreatedProjectSummary) => void,
+): () => void {
+  const handleEvent = (event: Event) => {
+    const project = (event as CustomEvent<CreatedProjectSummary>).detail;
+    if (project?.id) listener(project);
+  };
+  window.addEventListener(PROJECT_DELETED_EVENT, handleEvent);
+  return () => window.removeEventListener(PROJECT_DELETED_EVENT, handleEvent);
+}

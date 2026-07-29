@@ -51,12 +51,22 @@ const videoModel: VideoModelEntry = {
   source: "byok",
 };
 
+const alternateVideoModel: VideoModelEntry = {
+  ...videoModel,
+  id: "byok:fal:alternate",
+  providerModelId: "fal-alternate",
+  label: "Fal Alternate",
+  labelZh: "Fal 备用",
+};
+
 function baseInput(overrides: Partial<CreativeCapabilityReadinessInput> = {}): CreativeCapabilityReadinessInput {
   return {
     imageModels: [],
     videoModels: [],
     catalogLoading: false,
     bootstrapDefaultImageModel: "",
+    bootstrapDefaultTextModel: "",
+    bootstrapDefaultVideoModel: "",
     providers: {},
     providerConnections: {},
     localSummary: {
@@ -115,10 +125,28 @@ describe("deriveCreativeCapabilityReadiness", () => {
     expect(readiness.primaryIssue?.id).not.toBe("promptRefinement");
   });
 
-  it("marks text refinement ready when a configured provider has a text model slot", () => {
+  it("does not mark text refinement ready from an unrelated first BYOK text slot", () => {
     const readiness = deriveCreativeCapabilityReadiness(
       baseInput({
         imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        providers: { anthropic: { configured: true, source: "keychain" } },
+        providerConnections: {
+          anthropic: { hasSecret: true, models: { text: "claude-sonnet-4-6" } },
+        },
+      }),
+    );
+
+    expect(readiness.byId.promptRefinement.status).toBe("partial");
+    expect(readiness.byId.promptRefinement.activeLabel).toBeUndefined();
+  });
+
+  it("marks text refinement ready only for the exact bootstrap default text selection", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "byok:anthropic:claude-sonnet-4-6",
         providers: { anthropic: { configured: true, source: "keychain" } },
         providerConnections: {
           anthropic: { hasSecret: true, models: { text: "claude-sonnet-4-6" } },
@@ -128,6 +156,67 @@ describe("deriveCreativeCapabilityReadiness", () => {
 
     expect(readiness.byId.promptRefinement.status).toBe("ready");
     expect(readiness.byId.promptRefinement.activeLabel).toContain("claude-sonnet-4-6");
+  });
+
+  it("keeps local text partial when a ready runtime does not match the explicit default", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "local:wanted-model",
+        localSummary: {
+          desktop: true,
+          currentImageModel: "Local Image",
+          currentTextModel: "other-model",
+          currentTextModelId: "other-model",
+          hasReadyImage: true,
+          hasReadyText: true,
+        },
+      }),
+    );
+
+    expect(readiness.byId.promptRefinement.status).toBe("partial");
+  });
+
+  it("marks local text ready only when the exact normalized runtime id matches", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "local:llama3.2",
+        localSummary: {
+          desktop: true,
+          currentImageModel: "Local Image",
+          currentTextModel: "Llama 3.2",
+          currentTextModelId: "LLAMA3.2:latest",
+          hasReadyImage: true,
+          hasReadyText: true,
+        },
+      }),
+    );
+
+    expect(readiness.byId.promptRefinement.status).toBe("ready");
+    expect(readiness.byId.promptRefinement.activeLabel).toBe("Llama 3.2");
+  });
+
+  it("does not accept a suffix-only local model match", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "local:wanted-model",
+        localSummary: {
+          desktop: true,
+          currentImageModel: "Local Image",
+          currentTextModel: "Wrong model",
+          currentTextModelId: "different-wanted-model",
+          hasReadyImage: true,
+          hasReadyText: true,
+        },
+      }),
+    );
+
+    expect(readiness.byId.promptRefinement.status).toBe("partial");
   });
 
   it("does not turn missing optional prompt help into the Studio primary issue", () => {
@@ -156,10 +245,12 @@ describe("deriveCreativeCapabilityReadiness", () => {
       baseInput({
         imageModels: [imageModel],
         bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "local:Local Text",
         localSummary: {
           desktop: true,
           currentImageModel: "Local Image",
           currentTextModel: "Local Text",
+          currentTextModelId: "Local Text",
           hasReadyImage: true,
           hasReadyText: true,
         },
@@ -172,13 +263,98 @@ describe("deriveCreativeCapabilityReadiness", () => {
     expect(readiness.byId.videoGeneration.title).toBe("capabilityReadiness.video.missingTitle");
     expect(readiness.byId.videoGeneration.detail).toBe("capabilityReadiness.video.missingDetail");
     expect(readiness.byId.videoGeneration.reason).toBe("capabilityReadiness.video.missingReason");
-    expect(readiness.byId.videoGeneration.href).toBe("/settings?panel=provider-connections");
+    expect(readiness.byId.videoGeneration.href).toBe("/settings?panel=video");
     expect(readiness.byId.videoGeneration.actionLabel).toBe(
       "capabilityReadiness.actions.connectVideoProvider",
     );
   });
 
-  it("treats one available image model as selected even without a saved default", () => {
+  it("treats a non-empty video catalog without an explicit default as partial", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        videoModels: [videoModel, alternateVideoModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "local:Local Text",
+        localSummary: {
+          desktop: true,
+          currentImageModel: "Local Image",
+          currentTextModel: "Local Text",
+          hasReadyImage: true,
+          hasReadyText: true,
+        },
+      }),
+    );
+
+    expect(readiness.byId.videoGeneration.status).toBe("partial");
+    expect(readiness.byId.videoGeneration.activeLabel).toBeUndefined();
+    expect(readiness.byId.videoGeneration.href).toBe("/settings?panel=video");
+  });
+
+  it("labels video readiness from the explicit bootstrap default, not the first catalog entry", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        videoModels: [videoModel, alternateVideoModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "local:Local Text",
+        bootstrapDefaultVideoModel: alternateVideoModel.id,
+        localSummary: {
+          desktop: true,
+          currentImageModel: "Local Image",
+          currentTextModel: "Local Text",
+          hasReadyImage: true,
+          hasReadyText: true,
+        },
+      }),
+    );
+
+    expect(readiness.byId.videoGeneration.status).toBe("ready");
+    expect(readiness.byId.videoGeneration.activeLabel).toBe("Fal Alternate");
+  });
+
+  it("labels a ready image capability with the resolved explicit default, not the first catalog entry", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel, alternateImageModel],
+        bootstrapDefaultImageModel: alternateImageModel.id,
+        localSummary: {
+          desktop: true,
+          currentImageModel: "Local Image",
+          currentTextModel: "Local Text",
+          hasReadyImage: true,
+          hasReadyText: true,
+        },
+      }),
+    );
+
+    expect(readiness.byId.imageGeneration.status).toBe("ready");
+    expect(readiness.byId.imageGeneration.activeLabel).toBe("Alternate Local Image");
+    expect(readiness.byId.imageGeneration.detail).toBe(
+      "capabilityReadiness.image.readyDetailWithModel",
+    );
+    expect(readiness.byId.imageGeneration.activeLabel).not.toBe("Local Image");
+  });
+
+  it("keeps the running local image label only when it matches the resolved default", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel, alternateImageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        localSummary: {
+          desktop: true,
+          currentImageModel: "Local Image",
+          currentTextModel: "Local Text",
+          hasReadyImage: true,
+          hasReadyText: true,
+        },
+      }),
+    );
+
+    expect(readiness.byId.imageGeneration.activeLabel).toBe("Local Image");
+  });
+
+  it("requires an explicit default even when only one image model is available", () => {
     const readiness = deriveCreativeCapabilityReadiness(
       baseInput({
         imageModels: [imageModel],
@@ -192,13 +368,41 @@ describe("deriveCreativeCapabilityReadiness", () => {
       }),
     );
 
-    expect(readiness.overallStatus).toBe("ready");
-    expect(readiness.primaryIssue).toBeNull();
-    expect(readiness.byId.defaults.status).toBe("ready");
-    expect(readiness.byId.defaults.activeLabel).toBe("Local Image");
+    // A ready local image model without a selected default is not ready and
+    // must never silently dispatch.
+    expect(readiness.byId.imageGeneration.status).toBe("partial");
+    expect(readiness.byId.imageGeneration.href).toBe("/settings?panel=image");
+    expect(readiness.byId.imageGeneration.actionLabel).toBe(
+      "capabilityReadiness.actions.openImageSettings",
+    );
+    expect(readiness.byId.defaults.status).toBe("partial");
+    expect(readiness.overallStatus).toBe("partial");
+    expect(readiness.primaryIssue?.id).toBe("imageGeneration");
   });
 
-  it("prioritizes task model selection before optional video provider setup when several models are available", () => {
+  it("routes missing text capability actions to the Text settings tab", () => {
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+      }),
+    );
+
+    expect(readiness.byId.promptRefinement.status).toBe("partial");
+    expect(readiness.byId.promptRefinement.href).toBe("/settings?panel=text");
+
+    const withSecret = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        providers: { anthropic: { configured: true, source: "keychain" } },
+        providerConnections: { anthropic: { hasSecret: true, models: {} } },
+      }),
+    );
+    expect(withSecret.byId.promptRefinement.href).toBe("/settings?panel=text");
+  });
+
+  it("surfaces the missing default as the image-generation issue when several models are available", () => {
     const readiness = deriveCreativeCapabilityReadiness(
       baseInput({
         imageModels: [imageModel, alternateImageModel],
@@ -213,8 +417,10 @@ describe("deriveCreativeCapabilityReadiness", () => {
     );
 
     expect(readiness.overallStatus).toBe("partial");
-    expect(readiness.primaryIssue?.id).toBe("defaults");
-    expect(readiness.primaryIssue?.href).toBe("/settings?panel=general");
+    expect(readiness.primaryIssue?.id).toBe("imageGeneration");
+    expect(readiness.primaryIssue?.href).toBe("/settings?panel=image");
+    expect(readiness.byId.defaults.status).toBe("partial");
+    expect(readiness.byId.defaults.href).toBe("/settings?panel=image");
   });
 
   it("reports ready when every creative capability is available", () => {
@@ -223,10 +429,13 @@ describe("deriveCreativeCapabilityReadiness", () => {
         imageModels: [imageModel],
         videoModels: [videoModel],
         bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel: "local:Local Text",
+        bootstrapDefaultVideoModel: videoModel.id,
         localSummary: {
           desktop: true,
           currentImageModel: "Local Image",
           currentTextModel: "Local Text",
+          currentTextModelId: "Local Text",
           hasReadyImage: true,
           hasReadyText: true,
         },
@@ -236,5 +445,26 @@ describe("deriveCreativeCapabilityReadiness", () => {
     expect(readiness.overallStatus).toBe("ready");
     expect(readiness.primaryIssue).toBeNull();
     expect(readiness.readyCount).toBe(5);
+  });
+
+  it("threads the same bootstrap text default id into readiness for chat and prompt gating", () => {
+    const bootstrapDefaultTextModel = "byok:openai:gpt-4.1-mini";
+    const readiness = deriveCreativeCapabilityReadiness(
+      baseInput({
+        imageModels: [imageModel],
+        bootstrapDefaultImageModel: imageModel.id,
+        bootstrapDefaultTextModel,
+        providers: { openai: { configured: true, source: "keychain" } },
+        providerConnections: {
+          openai: { hasSecret: true, models: { text: "gpt-4.1-mini" } },
+        },
+      }),
+    );
+
+    expect(readiness.byId.promptRefinement.status).toBe("ready");
+    expect(readiness.byId.promptRefinement.activeLabel).toContain("gpt-4.1-mini");
+    // Downstream surfaces (Canvas chat, AgentThread, Studio refine) gate on this
+    // exact ready status derived from the bootstrap default id.
+    expect(bootstrapDefaultTextModel).toBe("byok:openai:gpt-4.1-mini");
   });
 });

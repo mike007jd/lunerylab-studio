@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname, useRouter } from "next/navigation";
-import { type ElementType, useCallback, useEffect, useState } from "react";
+import { type ElementType, useCallback, useEffect, useRef, useState } from "react";
 import {
   Bot,
   FolderOpen,
@@ -33,8 +33,11 @@ import {
 } from "@/lib/constants/shell-navigation";
 import {
   subscribeToProjectCreated,
+  subscribeToProjectDeleted,
   subscribeToProjectUpdated,
 } from "@/lib/client/project-created-event";
+import { fetchJson } from "@/lib/client/fetch-json";
+import { refillRecentProjects } from "@/lib/project-pagination";
 
 export interface SidebarProject {
   id: string;
@@ -206,21 +209,63 @@ export function Sidebar({
   const [projects, setProjects] = useState(() =>
     initialProjects.slice(0, SIDEBAR_RECENT_PROJECT_LIMIT),
   );
+  const deletedProjectIdsRef = useRef(new Set<string>());
+  const refillControllerRef = useRef<AbortController | null>(null);
   const handleProjectUpserted = useCallback((project: SidebarProject) => {
+    if (deletedProjectIdsRef.current.has(project.id)) return;
     setProjects((current) => [
       project,
       ...current.filter((item) => item.id !== project.id),
     ].slice(0, SIDEBAR_RECENT_PROJECT_LIMIT));
   }, []);
+  const handleProjectDeleted = useCallback((project: SidebarProject) => {
+    deletedProjectIdsRef.current.add(project.id);
+    refillControllerRef.current?.abort();
+    const controller = new AbortController();
+    refillControllerRef.current = controller;
+    // Drop immediately, then refill from the current projects list API so the
+    // six-item recent section does not stay underfilled after a deletion.
+    setProjects((current) =>
+      current.filter((item) => !deletedProjectIdsRef.current.has(item.id)),
+    );
+    void (async () => {
+      try {
+        const page = await fetchJson<{
+          projects: SidebarProject[];
+        }>(`/api/projects?limit=${SIDEBAR_RECENT_PROJECT_LIMIT}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted || refillControllerRef.current !== controller) return;
+        setProjects((current) =>
+          refillRecentProjects(
+            current,
+            deletedProjectIdsRef.current,
+            page.projects,
+            SIDEBAR_RECENT_PROJECT_LIMIT,
+          ),
+        );
+      } catch {
+        // Keep the filtered list when the refill request fails.
+      } finally {
+        if (refillControllerRef.current === controller) {
+          refillControllerRef.current = null;
+        }
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     const unsubscribeCreated = subscribeToProjectCreated(handleProjectUpserted);
     const unsubscribeUpdated = subscribeToProjectUpdated(handleProjectUpserted);
+    const unsubscribeDeleted = subscribeToProjectDeleted(handleProjectDeleted);
     return () => {
+      refillControllerRef.current?.abort();
       unsubscribeCreated();
       unsubscribeUpdated();
+      unsubscribeDeleted();
     };
-  }, [handleProjectUpserted]);
+  }, [handleProjectDeleted, handleProjectUpserted]);
 
   const closeMobileSidebar = useCloseMobileSidebar();
 

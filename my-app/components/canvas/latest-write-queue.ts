@@ -5,6 +5,11 @@ interface LatestWriteQueueOptions<T> {
   retryDelayMs: (attempt: number) => number;
   /** Hard ceiling for one write attempt, including a stalled fetch. */
   writeTimeoutMs?: number;
+  /**
+   * Terminal client/server conflicts (e.g. geometry against a locked layer).
+   * Skip retries, drop the failed value, and surface onExhausted immediately.
+   */
+  isNonRetryableError?: (error: unknown) => boolean;
   onStart?: () => void;
   onSettled?: (succeeded: boolean) => void;
   onLatestSaved?: (value: T) => void;
@@ -30,6 +35,7 @@ export function createLatestWriteQueue<T>({
   maxRetries,
   retryDelayMs,
   writeTimeoutMs = 10_000,
+  isNonRetryableError,
   onStart,
   onSettled,
   onLatestSaved,
@@ -81,29 +87,39 @@ export function createLatestWriteQueue<T>({
           terminalFailure = false;
           if (!pending && !closed) onLatestSaved?.(current);
         } catch (error) {
-          const hasNewerPending = pending !== null;
-          // Never restore an older value over a newer edit that arrived while
-          // this request was in flight.
-          pending = pending
-            ? (mergePending?.(current, pending) ?? pending)
-            : current;
-          failedAttempts += 1;
-          if (closed && hasNewerPending) {
-            // The active request was already in flight when close began. It is
-            // not the final write if a newer value was queued behind it, so
-            // give the merged latest value exactly one delivery attempt.
-            pausedAfterFailure = false;
-            shouldAttemptNewerAfterClose = true;
-          } else if (!closed && failedAttempts <= maxRetries) {
-            retryTimer = setTimeout(() => {
-              retryTimer = null;
-              drain();
-            }, retryDelayMs(failedAttempts));
-          } else {
+          if (isNonRetryableError?.(error)) {
+            // A locked-layer 409 (or equivalent) will not succeed on retry.
+            // Drop coalesced geometry and resync via onExhausted immediately.
+            pending = null;
+            failedAttempts = maxRetries + 1;
             pausedAfterFailure = true;
             terminalFailure = true;
-            if (closed) pending = null;
             if (!closed) onExhausted?.(error);
+          } else {
+            const hasNewerPending = pending !== null;
+            // Never restore an older value over a newer edit that arrived while
+            // this request was in flight.
+            pending = pending
+              ? (mergePending?.(current, pending) ?? pending)
+              : current;
+            failedAttempts += 1;
+            if (closed && hasNewerPending) {
+              // The active request was already in flight when close began. It is
+              // not the final write if a newer value was queued behind it, so
+              // give the merged latest value exactly one delivery attempt.
+              pausedAfterFailure = false;
+              shouldAttemptNewerAfterClose = true;
+            } else if (!closed && failedAttempts <= maxRetries) {
+              retryTimer = setTimeout(() => {
+                retryTimer = null;
+                drain();
+              }, retryDelayMs(failedAttempts));
+            } else {
+              pausedAfterFailure = true;
+              terminalFailure = true;
+              if (closed) pending = null;
+              if (!closed) onExhausted?.(error);
+            }
           }
         } finally {
           if (timeoutId) clearTimeout(timeoutId);

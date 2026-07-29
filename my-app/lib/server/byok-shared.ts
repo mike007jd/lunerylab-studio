@@ -11,9 +11,10 @@
 
 import "server-only";
 import { lookup } from "node:dns/promises";
-import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
+import http, { type IncomingHttpHeaders, type IncomingMessage } from "node:http";
 import https from "node:https";
 import net from "node:net";
+import { Readable } from "node:stream";
 import { BYOK_PROVIDERS } from "@/lib/byok-providers";
 import { ApiError } from "@/lib/server/errors";
 import { readDesktopStatusRevision } from "@/lib/server/desktop-status-revision";
@@ -392,20 +393,150 @@ function isPrivateIpv4(ip: string): boolean {
   );
 }
 
+/**
+ * Expand an IPv6 literal into eight hextets. Accepts compressed forms and the
+ * dotted-quad IPv4-mapped suffix (`::ffff:127.0.0.1`).
+ */
+function parseIpv6Hextets(ip: string): number[] | null {
+  if (!net.isIPv6(ip)) return null;
+  let normalized = ip.toLowerCase();
+  const dotted = normalized.match(/^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (dotted) {
+    const octets = dotted[2]!.split(".").map((part) => Number(part));
+    if (
+      octets.length !== 4 ||
+      octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+    ) {
+      return null;
+    }
+    const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
+    const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
+    normalized = `${dotted[1]}${hi}:${lo}`;
+  }
+
+  if (normalized.includes("::")) {
+    const [left = "", right = ""] = normalized.split("::");
+    const leftParts = left ? left.split(":") : [];
+    const rightParts = right ? right.split(":") : [];
+    const missing = 8 - leftParts.length - rightParts.length;
+    if (missing < 0) return null;
+    normalized = [...leftParts, ...Array(missing).fill("0"), ...rightParts].join(":");
+  }
+
+  const parts = normalized.split(":");
+  if (parts.length !== 8 || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) {
+    return null;
+  }
+  return parts.map((part) => Number.parseInt(part, 16));
+}
+
+function ipv4FromMappedIpv6(hextets: number[]): string | null {
+  // ::ffff:0:0/96 — hextets 0-4 zero, hextet 5 = 0xffff.
+  if (
+    hextets.length !== 8 ||
+    hextets[0] !== 0 ||
+    hextets[1] !== 0 ||
+    hextets[2] !== 0 ||
+    hextets[3] !== 0 ||
+    hextets[4] !== 0 ||
+    hextets[5] !== 0xffff
+  ) {
+    return null;
+  }
+  const hi = hextets[6]!;
+  const lo = hextets[7]!;
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
+function ipv4FromWellKnownNat64(hextets: number[]): string | null {
+  // 64:ff9b::/96 is the globally reachable NAT64 well-known prefix. Its
+  // embedded IPv4 destination still must be public.
+  if (
+    hextets.length !== 8 ||
+    hextets[0] !== 0x0064 ||
+    hextets[1] !== 0xff9b ||
+    hextets[2] !== 0 ||
+    hextets[3] !== 0 ||
+    hextets[4] !== 0 ||
+    hextets[5] !== 0
+  ) {
+    return null;
+  }
+  const hi = hextets[6]!;
+  const lo = hextets[7]!;
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
+function isGloballyReachableIetfAssignment(hextets: number[]): boolean {
+  if (hextets[0] !== 0x2001) return false;
+  const second = hextets[1]!;
+
+  // More-specific globally reachable allocations inside IANA's otherwise
+  // non-global 2001::/23 protocol block.
+  if (
+    second === 0x0001 &&
+    hextets.slice(2, 7).every((part) => part === 0) &&
+    hextets[7]! >= 1 &&
+    hextets[7]! <= 3
+  ) {
+    return true;
+  }
+  if (second === 0x0003) return true; // AMT 2001:3::/32
+  if (second === 0x0004 && hextets[2] === 0x0112) return true; // AS112-v6 /48
+  if (second >= 0x0020 && second <= 0x002f) return true; // ORCHIDv2 /28
+  if (second >= 0x0030 && second <= 0x003f) return true; // DETs /28
+  return false;
+}
+
+function isPrivateIpv6(ip: string): boolean {
+  const hextets = parseIpv6Hextets(ip);
+  if (!hextets) return true;
+
+  // Unspecified :: and loopback ::1.
+  if (hextets.every((part) => part === 0)) return true;
+  if (hextets.slice(0, 7).every((part) => part === 0) && hextets[7] === 1) return true;
+
+  const mappedIpv4 = ipv4FromMappedIpv6(hextets);
+  if (mappedIpv4) return isPrivateIpv4(mappedIpv4);
+
+  const nat64Ipv4 = ipv4FromWellKnownNat64(hextets);
+  if (nat64Ipv4) return isPrivateIpv4(nat64Ipv4);
+
+  const first = hextets[0]!;
+  const second = hextets[1]!;
+
+  // Positive global-unicast classification: ordinary public IPv6 lives in
+  // 2000::/3. Everything outside it is special/non-global unless explicitly
+  // accepted above (the public NAT64 well-known prefix).
+  if ((first & 0xe000) !== 0x2000) return true;
+
+  // IANA special-purpose exceptions inside 2000::/3:
+  // - 2001::/23: protocol assignments (Teredo, benchmarking, ORCHID, etc.)
+  // - 2001:db8::/32 and 3fff::/20: documentation
+  // - 2002::/16: deprecated 6to4 transition addressing
+  if (first === 0x2001 && second <= 0x01ff) {
+    return !isGloballyReachableIetfAssignment(hextets);
+  }
+  if (first === 0x2001 && second === 0x0db8) return true;
+  if (first === 0x2002) return true;
+  if (first === 0x3fff && (second & 0xf000) === 0) return true;
+
+  return false;
+}
+
 function isPrivateIp(ip: string): boolean {
   if (net.isIPv4(ip)) return isPrivateIpv4(ip);
   if (!net.isIPv6(ip)) return true;
-  const lower = ip.toLowerCase();
-  if (lower === "::" || lower === "::1") return true;
-  if (lower.startsWith("fc") || lower.startsWith("fd") || lower.startsWith("fe80:")) return true;
-  const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  return mapped ? isPrivateIpv4(mapped[1]!) : false; // safe: capture group 1 present when mapped is non-null
+  return isPrivateIpv6(ip);
 }
 
 function isLoopbackIp(ip: string): boolean {
   if (net.isIPv4(ip)) return ip.split(".")[0] === "127";
-  const lower = ip.toLowerCase();
-  return lower === "::1" || /^::ffff:127\./.test(lower);
+  const hextets = parseIpv6Hextets(ip);
+  if (!hextets) return false;
+  if (hextets.slice(0, 7).every((part) => part === 0) && hextets[7] === 1) return true;
+  const mappedIpv4 = ipv4FromMappedIpv6(hextets);
+  return mappedIpv4 ? mappedIpv4.split(".")[0] === "127" : false;
 }
 
 function normalizeEndpointHostname(hostname: string): string {
@@ -426,6 +557,27 @@ async function resolveEndpointHost(hostname: string): Promise<Array<{ address: s
   }
 }
 
+export interface ValidatedProviderEndpoint {
+  url: string;
+  records: Array<{ address: string; family: number }>;
+}
+
+export function selectPinnedLookupRecords(
+  records: Array<{ address: string; family: number }>,
+  options: number | string | { all?: boolean; family?: number | string },
+): Array<{ address: string; family: number }> {
+  const rawFamily =
+    typeof options === "object" ? options.family : options;
+  const requestedFamily =
+    rawFamily === "IPv4" ? 4 : rawFamily === "IPv6" ? 6 : rawFamily;
+  const candidates =
+    requestedFamily === 4 || requestedFamily === 6
+      ? records.filter((record) => record.family === requestedFamily)
+      : records;
+  if (typeof options === "object" && options.all) return candidates;
+  return candidates.slice(0, 1);
+}
+
 /**
  * Validate a user-supplied BYOK provider endpoint at the trust boundary
  * (connection write + test-connection + generation dispatch). Loopback is
@@ -434,7 +586,9 @@ async function resolveEndpointHost(hostname: string): Promise<Array<{ address: s
  * into a private-host SSRF / key-exfiltration primitive. Returns the normalized
  * URL or an error message.
  */
-export async function validateProviderEndpoint(value: string): Promise<{ url: string } | { error: string }> {
+export async function validateProviderEndpoint(
+  value: string,
+): Promise<ValidatedProviderEndpoint | { error: string }> {
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -443,6 +597,15 @@ export async function validateProviderEndpoint(value: string): Promise<{ url: st
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return { error: "Endpoint must use http or https." };
+  }
+  if (parsed.username || parsed.password) {
+    return { error: "Endpoint must not include URL credentials." };
+  }
+  // Query/fragment must not survive into the trusted base URL: adapters append
+  // API paths with string joins, and a `?` / `#` would turn those paths into
+  // query or fragment text instead of path segments.
+  if (parsed.search || parsed.hash) {
+    return { error: "Endpoint must not include a query or fragment." };
   }
   const host = normalizeEndpointHostname(parsed.hostname);
   if (isBlockedMetadataHost(host)) {
@@ -462,10 +625,12 @@ export async function validateProviderEndpoint(value: string): Promise<{ url: st
   if (parsed.protocol === "http:" && !allLoopback) {
     return { error: "Endpoint must use https unless it points to loopback." };
   }
-  return { url: parsed.toString() };
+  return { url: parsed.toString(), records };
 }
 
-export async function requireValidatedProviderEndpoint(value: string): Promise<string> {
+export async function requireValidatedProviderEndpoint(
+  value: string,
+): Promise<ValidatedProviderEndpoint> {
   const endpointCheck = await validateProviderEndpoint(value);
   if ("error" in endpointCheck) {
     throw new ApiError({
@@ -475,14 +640,139 @@ export async function requireValidatedProviderEndpoint(value: string): Promise<s
       retryable: false,
     });
   }
-  return endpointCheck.url;
+  return endpointCheck;
+}
+
+function isPathWithinEndpoint(targetPath: string, endpointPath: string): boolean {
+  const basePath = endpointPath.replace(/\/+$/, "");
+  return basePath === "" || targetPath === basePath || targetPath.startsWith(`${basePath}/`);
+}
+
+function createPinnedDnsLookup(
+  records: Array<{ address: string; family: number }>,
+) {
+  return (
+    _hostname: string,
+    options: Parameters<typeof selectPinnedLookupRecords>[1],
+    callback: (
+      error: NodeJS.ErrnoException | null,
+      address: string,
+      family: number,
+    ) => void,
+  ) => {
+    const selectedRecords = selectPinnedLookupRecords(records, options);
+    const record = selectedRecords[0];
+    if (!record) {
+      callback(new Error("Validated provider endpoint has no pinned address."), "", 4);
+      return;
+    }
+    if (typeof options === "object" && options.all) {
+      (
+        callback as unknown as (
+          error: NodeJS.ErrnoException | null,
+          addresses: Array<{ address: string; family: number }>,
+        ) => void
+      )(null, selectedRecords);
+    } else {
+      callback(null, record.address, record.family);
+    }
+  };
+}
+
+/**
+ * Return a Fetch-compatible transport whose socket lookup is pinned to the
+ * public/loopback answers validated above. The requested origin and base path
+ * cannot change, and redirects are returned to the caller instead of followed,
+ * so credentials never cross the validated trust boundary.
+ */
+export function createPinnedProviderFetch(
+  endpoint: ValidatedProviderEndpoint,
+): typeof fetch {
+  const baseUrl = new URL(endpoint.url);
+  const lookup = createPinnedDnsLookup(endpoint.records);
+
+  return async (input: URL | RequestInfo, init?: RequestInit): Promise<Response> => {
+    const request = new Request(input, { ...init, redirect: "manual" });
+    const targetUrl = new URL(request.url);
+    if (
+      targetUrl.origin !== baseUrl.origin ||
+      !isPathWithinEndpoint(targetUrl.pathname, baseUrl.pathname)
+    ) {
+      throw new ApiError({
+        status: 400,
+        code: "invalid_provider_endpoint",
+        message: "Provider request escaped the validated endpoint.",
+        retryable: false,
+      });
+    }
+
+    const transport = targetUrl.protocol === "https:" ? https : http;
+    return new Promise<Response>((resolve, reject) => {
+      const requestHeaders = Object.fromEntries(request.headers.entries());
+      requestHeaders["accept-encoding"] ??= "identity";
+      const outgoing = transport.request(
+        targetUrl,
+        {
+          method: request.method,
+          headers: requestHeaders,
+          signal: request.signal,
+          lookup,
+        },
+        (incoming) => {
+          const headers = new Headers();
+          for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+            const name = incoming.rawHeaders[index];
+            const value = incoming.rawHeaders[index + 1];
+            if (name && value !== undefined) headers.append(name, value);
+          }
+          const hasBody =
+            request.method !== "HEAD" &&
+            incoming.statusCode !== 204 &&
+            incoming.statusCode !== 205 &&
+            incoming.statusCode !== 304;
+          resolve(
+            new Response(
+              hasBody ? (Readable.toWeb(incoming) as ReadableStream<Uint8Array>) : null,
+              {
+                status: incoming.statusCode ?? 500,
+                statusText: incoming.statusMessage,
+                headers,
+              },
+            ),
+          );
+        },
+      );
+      outgoing.on("error", reject);
+
+      void (async () => {
+        try {
+          if (request.body) {
+            const reader = request.body.getReader();
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const chunk = value;
+              if (!outgoing.write(chunk)) {
+                await new Promise<void>((resume) => outgoing.once("drain", resume));
+              }
+            }
+          }
+          outgoing.end();
+        } catch (error) {
+          outgoing.destroy(error instanceof Error ? error : new Error(String(error)));
+        }
+      })();
+    });
+  };
 }
 
 async function resolvePublicHost(hostname: string): Promise<Array<{ address: string; family: number }>> {
-  const directIp = net.isIP(hostname);
+  // WHATWG URL hostnames keep IPv6 literals bracketed; strip before isIP/DNS.
+  const host = normalizeEndpointHostname(hostname);
+  const directIp = net.isIP(host);
   const records = directIp
-    ? [{ address: hostname, family: directIp }]
-    : await lookup(hostname, { all: true, verbatim: false });
+    ? [{ address: host, family: directIp }]
+    : await lookup(host, { all: true, verbatim: false });
   if (records.length === 0 || records.some((record) => isPrivateIp(record.address))) {
     throw new ApiError({
       status: 502,
@@ -500,7 +790,6 @@ function requestPinnedHttps(
   timeoutMs: number,
   abortSignal?: AbortSignal,
 ): Promise<IncomingMessage> {
-  let addressIndex = 0;
   return new Promise((resolve, reject) => {
     const request = https.request(
       url,
@@ -508,11 +797,7 @@ function requestPinnedHttps(
         method: "GET",
         timeout: timeoutMs,
         signal: abortSignal,
-        lookup: (_hostname, _options, callback) => {
-          const record = records[Math.min(addressIndex, records.length - 1)]!; // safe: resolvePublicHost throws on empty records; index clamped in-bounds
-          addressIndex += 1;
-          callback(null, record.address, record.family);
-        },
+        lookup: createPinnedDnsLookup(records),
       },
       resolve,
     );

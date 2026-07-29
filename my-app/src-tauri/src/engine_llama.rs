@@ -23,6 +23,7 @@ static LLAMA_ENGINE_INFO: OnceLock<Mutex<Option<LlamaEngineInfo>>> = OnceLock::n
 pub(crate) struct LlamaEngineInfo {
     pub(crate) endpoint: String,
     pub(crate) model_path: String,
+    pub(crate) model_id: String,
 }
 
 pub(crate) fn llama_engine_slot() -> &'static Mutex<Option<LlamaEngineInfo>> {
@@ -34,6 +35,22 @@ pub(crate) struct LlamaServerStatus {
     running: bool,
     endpoint: Option<String>,
     model_path: Option<String>,
+    model_id: Option<String>,
+}
+
+fn validate_model_alias(model_id: String) -> Result<String, String> {
+    let model_id = model_id.trim().to_string();
+    if model_id.is_empty() {
+        return Err("model_id is required".to_string());
+    }
+    if model_id.len() > 512
+        || model_id
+            .chars()
+            .any(|character| character.is_control() || character == ',')
+    {
+        return Err("model_id is not a valid llama.cpp alias".to_string());
+    }
+    Ok(model_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -114,8 +131,12 @@ fn bridge_engine_root() -> Result<PathBuf, String> {
 }
 
 /// Start the embedded llama.cpp server through the private HTTP bridge.
-pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus, String> {
+pub(crate) fn bridge_start_llama(
+    model_path: String,
+    model_id: String,
+) -> Result<LlamaServerStatus, String> {
     let model_path = model_path.trim().to_string();
+    let model_id = validate_model_alias(model_id)?;
     if model_path.is_empty() {
         return Err("model_path is required".to_string());
     }
@@ -137,12 +158,13 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
     if alive {
         if let Some(info) = current
             .as_ref()
-            .filter(|info| info.model_path == model_path)
+            .filter(|info| info.model_path == model_path && info.model_id == model_id)
         {
             return Ok(LlamaServerStatus {
                 running: true,
                 endpoint: Some(info.endpoint.clone()),
                 model_path: Some(model_path),
+                model_id: Some(model_id),
             });
         }
     }
@@ -177,6 +199,8 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
     let child = Command::new(&bin)
         .arg("--model")
         .arg(&model_path)
+        .arg("--alias")
+        .arg(&model_id)
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
@@ -218,6 +242,7 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
         *engine_slot = Some(LlamaEngineInfo {
             endpoint: endpoint.clone(),
             model_path: model_path.clone(),
+            model_id: model_id.clone(),
         });
         drop(engine_slot);
         let registration_id = registration.id().to_string();
@@ -233,6 +258,7 @@ pub(crate) fn bridge_start_llama(model_path: String) -> Result<LlamaServerStatus
         running: true,
         endpoint: Some(endpoint),
         model_path: Some(model_path),
+        model_id: Some(model_id),
     })
 }
 
@@ -247,7 +273,8 @@ pub(crate) fn bridge_stop_llama() {
 mod tests {
     use super::{
         bridge_stop_llama, cleanup_llama_exit_if_current, llama_bridge_child, llama_engine_slot,
-        llama_residency_slot, prepare_llama_start, LlamaEngineInfo, LLAMA_LIFECYCLE,
+        llama_residency_slot, prepare_llama_start, validate_model_alias, LlamaEngineInfo,
+        LLAMA_LIFECYCLE,
     };
     use crate::llama_resident::LlamaResident;
     use crate::model_residency::ResidencyManager;
@@ -266,6 +293,18 @@ mod tests {
                 std::env::remove_var("LUNERY_RUNTIME_DIR");
             }
         }
+    }
+
+    #[test]
+    fn model_alias_accepts_exact_ids_and_rejects_llama_alias_lists() {
+        assert_eq!(
+            validate_model_alias(" imported:llama-cpp:qwen-3 ".to_string())
+                .expect("valid explicit id"),
+            "imported:llama-cpp:qwen-3"
+        );
+        assert!(validate_model_alias("".to_string()).is_err());
+        assert!(validate_model_alias("first,second".to_string()).is_err());
+        assert!(validate_model_alias("bad\nalias".to_string()).is_err());
     }
 
     // bridge_stop_llama must kill AND reap (wait) — the old code only killed,
@@ -331,6 +370,7 @@ mod tests {
         *llama_engine_slot().lock().unwrap() = Some(LlamaEngineInfo {
             endpoint: "http://127.0.0.1:2".to_string(),
             model_path: model_path.clone(),
+            model_id: "replacement-model".to_string(),
         });
         let stale_epoch = LLAMA_LIFECYCLE.next_epoch();
         LLAMA_LIFECYCLE.next_epoch();
@@ -394,6 +434,7 @@ mod tests {
         *llama_engine_slot().lock().unwrap() = Some(LlamaEngineInfo {
             endpoint: "http://127.0.0.1:1".to_string(),
             model_path: old_path.to_string_lossy().to_string(),
+            model_id: "old-model".to_string(),
         });
         *llama_bridge_child().lock().unwrap() = Some(
             std::process::Command::new("sleep")
@@ -415,6 +456,7 @@ mod tests {
         *llama_engine_slot().lock().unwrap() = Some(LlamaEngineInfo {
             endpoint: "http://127.0.0.1:2".to_string(),
             model_path: new_path.to_string_lossy().to_string(),
+            model_id: "replacement-model".to_string(),
         });
         let replacement_registration = residency
             .register_persistent(LlamaResident::new(

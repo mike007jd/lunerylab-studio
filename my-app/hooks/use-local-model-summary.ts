@@ -25,6 +25,7 @@ interface InstalledModelStatus {
 interface LlamaStatus {
   running: boolean;
   modelPath: string | null;
+  modelId?: string | null;
 }
 
 export interface LocalModelSummary {
@@ -33,6 +34,8 @@ export interface LocalModelSummary {
   isChecking: boolean;
   installedCount: number;
   currentTextModel: string | null;
+  /** Exact runtime/catalog model id behind currentTextModel. */
+  currentTextModelId: string | null;
   currentImageModel: string | null;
   hasReadyText: boolean;
   hasReadyImage: boolean;
@@ -78,6 +81,36 @@ export function isTextCapabilityReady({
   llamaRunning: boolean;
 }): boolean {
   return Boolean((llamaRunning && llamaModel) || externalTextModel);
+}
+
+export function resolveCurrentTextModelId({
+  llamaRunning,
+  llamaModelId,
+  externalTextModel,
+}: {
+  llamaRunning: boolean;
+  llamaModelId?: string | null;
+  externalTextModel: string | null;
+}): string | null {
+  if (llamaRunning) {
+    const embeddedId = llamaModelId?.trim();
+    if (embeddedId) return embeddedId;
+  }
+  return externalTextModel;
+}
+
+export function resolveEmbeddedTextModelLabel({
+  inventoryLabel,
+  llamaRunning,
+  llamaModelId,
+}: {
+  inventoryLabel: string | null;
+  llamaRunning: boolean;
+  llamaModelId?: string | null;
+}): string | null {
+  if (inventoryLabel) return inventoryLabel;
+  if (!llamaRunning) return null;
+  return llamaModelId?.trim() || null;
 }
 
 // Detect Tauri WebView without import-time side effects (SSR-safe).
@@ -148,7 +181,12 @@ export function useLocalModelSummary(): LocalModelSummary {
       if (llamaRes) {
         const next = llamaRes as LlamaStatus;
         setLlama((prev) =>
-          prev && prev.running === next.running && prev.modelPath === next.modelPath ? prev : next,
+          prev &&
+          prev.running === next.running &&
+          prev.modelPath === next.modelPath &&
+          prev.modelId === next.modelId
+            ? prev
+            : next,
         );
       }
       setExternalTextModel(firstDiscoveredExternalTextModel(externalProbeResults));
@@ -230,20 +268,32 @@ export function useLocalModelSummary(): LocalModelSummary {
 
   return useMemo(() => {
     const installedItems = Object.values(installed);
-    const llamaTextModel =
-      installedItems.find(
+    const installedLlamaTextModel = installedItems.find(
         (item) =>
           item.imported &&
           item.installed &&
           item.runtimeTarget === "llama-cpp" &&
           Boolean(item.modelPath && llama?.modelPath === item.modelPath),
-      )?.label ??
-      HF_MODEL_CATALOG.find(
+      );
+    const catalogLlamaTextModel = HF_MODEL_CATALOG.find(
         (entry) =>
           entry.runtimeTarget === "llama-cpp" &&
           Boolean(entry.fileName && llama?.modelPath?.endsWith(entry.fileName)),
-      )?.label ??
-      null;
+      );
+    const llamaTextModel = resolveEmbeddedTextModelLabel({
+      inventoryLabel:
+        installedLlamaTextModel?.label ?? catalogLlamaTextModel?.label ?? null,
+      llamaRunning: llama?.running === true,
+      llamaModelId: llama?.modelId,
+    });
+    // The embedded bridge owns the exact alias passed to llama.cpp. Prefer it
+    // over reconstructing identity from a path/catalog match so UI readiness
+    // and /v1/models execution agree for curated and imported models.
+    const currentTextModelId = resolveCurrentTextModelId({
+      llamaRunning: llama?.running === true,
+      llamaModelId: llama?.modelId,
+      externalTextModel,
+    });
     const currentTextModel = llamaTextModel ?? externalTextModel;
     const currentImageModel =
       installedItems.find((item) => item.imported && item.installed && item.capability === "image-gen")?.label ??
@@ -263,6 +313,7 @@ export function useLocalModelSummary(): LocalModelSummary {
       isChecking: isLocalModelSummaryChecking(desktop, hasLoadedRuntimeDetails),
       installedCount,
       currentTextModel,
+      currentTextModelId,
       currentImageModel,
       hasReadyText,
       hasReadyImage,
@@ -270,5 +321,5 @@ export function useLocalModelSummary(): LocalModelSummary {
       accel,
       externalTextProbes,
     };
-  }, [accel, desktop, externalTextModel, externalTextProbes, hasLoadedRuntimeDetails, installed, llama?.modelPath, llama?.running, runtimes]);
+  }, [accel, desktop, externalTextModel, externalTextProbes, hasLoadedRuntimeDetails, installed, llama?.modelId, llama?.modelPath, llama?.running, runtimes]);
 }

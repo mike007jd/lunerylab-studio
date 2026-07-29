@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 import { formatProviderCapabilities } from "@/lib/provider-capabilities";
 import {
   byokModelInputRoles,
+  resolveByokModelGuidance,
   type ByokConnectionModels,
   type ByokModelRole,
   type ByokProviderMeta,
@@ -105,11 +106,11 @@ export function ProviderConnectionsPanel({
   const [providerPendingRemoval, setProviderPendingRemoval] = useState<string | null>(null);
   const [providerRemovalPending, setProviderRemovalPending] = useState(false);
   const inputRoles = visibleRoles ?? byokModelInputRoles(activeMeta);
-  // A single-slot provider keeps its helpful catalog example as the placeholder;
-  // for multi-slot providers an image example in the text field would mislead,
-  // so fall back to a generic hint.
-  const modelPlaceholder =
-    inputRoles.length === 1 ? activeMeta.placeholderModelId ?? copy.modelIdHint : copy.modelIdHint;
+  const modelGuidance = resolveByokModelGuidance(activeMeta, inputRoles);
+  const modelPlaceholder = modelGuidance?.placeholderModelId ?? copy.modelIdHint;
+  const modelIdHint = modelGuidance?.modelIdFromEndpoint
+    ? copy.endpointModelIdHint
+    : copy.modelIdHint;
   const hasAnyModel = inputRoles.some((role) => draftModels[role]?.trim());
 
   // Durable secret state for the active provider — distinct from the transient
@@ -220,16 +221,18 @@ export function ProviderConnectionsPanel({
               ))}
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-(--border-subtle) pt-3 text-xs leading-5 text-(--text-muted)">
-              <span>{copy.modelIdHint}</span>
-              <a
-                href={activeMeta.sourceEvidence.url}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 font-medium text-(--text-secondary) underline-offset-2 hover:text-(--text-primary) hover:underline"
-              >
-                {copy.openModelList}
-                <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-              </a>
+              <span>{modelIdHint}</span>
+              {modelGuidance?.sourceEvidence ? (
+                <a
+                  href={modelGuidance.sourceEvidence.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 font-medium text-(--text-secondary) underline-offset-2 hover:text-(--text-primary) hover:underline"
+                >
+                  {copy.openModelList}
+                  <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+                </a>
+              ) : null}
             </div>
           </AdvancedDisclosure>
 

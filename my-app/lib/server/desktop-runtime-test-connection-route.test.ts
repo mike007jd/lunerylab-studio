@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   getByokConnectionMeta: vi.fn(),
   tryReadByokKey: vi.fn(),
   validateProviderEndpoint: vi.fn(),
+  createPinnedProviderFetch: vi.fn(),
 }));
 
 vi.mock("@/lib/server/desktop-bridge", () => ({
@@ -22,6 +23,7 @@ vi.mock("@/lib/server/byok-connection-store", () => ({
 }));
 
 vi.mock("@/lib/server/byok-shared", () => ({
+  createPinnedProviderFetch: mocks.createPinnedProviderFetch,
   tryReadByokKey: mocks.tryReadByokKey,
   validateProviderEndpoint: mocks.validateProviderEndpoint,
 }));
@@ -50,8 +52,12 @@ describe("/api/desktop-runtime/test-connection", () => {
     mocks.findByokProvider.mockReturnValue(providerMeta);
     mocks.getByokConnectionMeta.mockReturnValue({ endpoint: "https://saved.example/v1" });
     mocks.tryReadByokKey.mockResolvedValue(null);
-    mocks.validateProviderEndpoint.mockImplementation(async (value: string) => ({ url: value }));
+    mocks.validateProviderEndpoint.mockImplementation(async (value: string) => ({
+      url: value,
+      records: [{ address: "203.0.113.10", family: 4 }],
+    }));
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status: 200 })));
+    mocks.createPinnedProviderFetch.mockImplementation(() => fetch);
   });
 
   afterEach(() => {

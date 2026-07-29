@@ -5,11 +5,11 @@ import { parseJsonBody } from "@/lib/server/http-validation";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 import { requireWritableCanvasSession } from "@/lib/server/canvas-session-access";
 import {
+  assertCanvasLayerWriteApplied,
   buildCanvasLayerUpdateData,
   canvasLayerGeometrySchema,
   canvasLayerInclude,
   canvasLayerNotFoundError,
-  canvasSessionNotFoundError,
   needsFullLayerResponse,
   toLayerPayload,
 } from "../../../_layer-route-helpers";
@@ -31,19 +31,18 @@ export async function DELETE(_request: NextRequest, { params }: Params) {
     };
 
     const deleted = await prisma.canvasLayer.deleteMany({
-      where: sessionOwnedLayer,
+      where: {
+        ...sessionOwnedLayer,
+        locked: false,
+      },
     });
 
-    if (deleted.count !== 1) {
-      const session = await prisma.canvasSession.findUnique({
-        where: { id, userId: user.id },
-        select: { id: true },
-      });
-      if (session) {
-        throw canvasLayerNotFoundError();
-      }
-      throw canvasSessionNotFoundError();
-    }
+    await assertCanvasLayerWriteApplied({
+      affectedCount: deleted.count,
+      layerWhere: sessionOwnedLayer,
+      sessionId: id,
+      userId: user.id,
+    });
 
     return NextResponse.json({ ok: true });
   } catch (error) {
@@ -58,37 +57,37 @@ export async function PATCH(request: NextRequest, { params }: Params) {
     await requireWritableCanvasSession(id, user.id);
 
     const body = await parseJsonBody(request, canvasLayerGeometrySchema);
+    const data = buildCanvasLayerUpdateData(body);
+    const sessionOwnedLayer = {
+      id: layerId,
+      sessionId: id,
+      session: { userId: user.id },
+    };
 
     const updated = await prisma.canvasLayer.updateMany({
       where: {
-        id: layerId,
-        sessionId: id,
-        session: { userId: user.id },
+        ...sessionOwnedLayer,
+        // An explicit unlock may cross the lock boundary. Every other update
+        // atomically requires the database row to still be unlocked so a stale
+        // client cannot race a newly-arrived agent lock.
+        ...(body.locked === false ? {} : { locked: false }),
       },
-      data: buildCanvasLayerUpdateData(body),
+      data,
     });
 
-    if (updated.count !== 1) {
-      const session = await prisma.canvasSession.findUnique({
-        where: { id, userId: user.id },
-        select: { id: true },
-      });
-      if (session) {
-        throw canvasLayerNotFoundError();
-      }
-      throw canvasSessionNotFoundError();
-    }
+    await assertCanvasLayerWriteApplied({
+      affectedCount: updated.count,
+      layerWhere: sessionOwnedLayer,
+      sessionId: id,
+      userId: user.id,
+    });
 
     if (!needsFullLayerResponse(body)) {
       return NextResponse.json({ ok: true });
     }
 
     const layer = await prisma.canvasLayer.findFirst({
-      where: {
-        id: layerId,
-        sessionId: id,
-        session: { userId: user.id },
-      },
+      where: sessionOwnedLayer,
       include: canvasLayerInclude,
     });
 

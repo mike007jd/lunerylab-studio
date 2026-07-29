@@ -55,6 +55,7 @@ interface FalEditConfig {
   providerId: string;
   apiKey: string;
   apiBase: string;
+  fetch: typeof fetch;
   modelPath: string;
 }
 
@@ -86,6 +87,7 @@ async function resolveFalEditConfig(
     providerId,
     apiKey: resolved.apiKey,
     apiBase: resolved.endpoint,
+    fetch: resolved.fetch,
     modelPath: resolved.modelId,
   };
 }
@@ -103,6 +105,7 @@ async function callFal(
   const url = await falQueueSubmit<FalImageResult>({
     apiKey: config.apiKey,
     apiBase: config.apiBase,
+    fetch: config.fetch,
     modelPath: config.modelPath,
     body,
     extractUrl: (p) => p.image?.url ?? p.images?.[0]?.url,

@@ -93,6 +93,7 @@ export async function generateImagesByok(
   const config: ResolvedByokConfig = {
     apiKey: resolved.apiKey,
     endpoint: resolved.endpoint,
+    fetch: resolved.fetch,
     modelId: resolved.modelId,
   };
 

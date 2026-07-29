@@ -620,10 +620,11 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
             #[serde(rename_all = "camelCase")]
             struct StartBody {
                 model_path: String,
+                model_id: String,
             }
             match serde_json::from_str::<StartBody>(&body)
                 .map_err(|e| e.to_string())
-                .and_then(|b| bridge_start_llama(b.model_path))
+                .and_then(|b| bridge_start_llama(b.model_path, b.model_id))
                 .and_then(|s| serde_json::to_string(&s).map_err(|e| e.to_string()))
             {
                 Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
@@ -644,6 +645,7 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
                 "running": info.is_some(),
                 "endpoint": info.as_ref().map(|e| e.endpoint.clone()),
                 "modelPath": info.as_ref().map(|e| e.model_path.clone()),
+                "modelId": info.as_ref().map(|e| e.model_id.clone()),
             })
             .to_string();
             write_http_response(&mut stream, "200 OK", &payload);

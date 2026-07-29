@@ -48,7 +48,7 @@ function renderInEnglish(content: ReactElement): string {
 }
 
 describe("Studio history efficiency", () => {
-  it("keeps runtime history at the same strict limit as persistence", () => {
+  it("keeps session runtime history at the same strict limit", () => {
     const existing = Array.from(
       { length: STUDIO_HISTORY_LIMIT },
       (_, index) => entry(`existing-${index}`),

@@ -1,21 +1,11 @@
 "use client";
 
 /**
- * use-canvas-session-refresh — agent-driven inbound sync for the canvas stage.
- *
- * Why polling (not SSE / custom event):
- *   - Agent runtime finishes by writing to Prisma (`canvasSession.updatedAt`,
- *     new CanvasLayer rows). There is no existing SSE channel from agent → UI.
- *   - A lightweight revision probe checks the parent timestamp plus layer
- *     count/latest timestamp; the full payload is fetched only after a change.
- *   - We gate on `document.visibilityState === "visible"` so a backgrounded
- *     tab doesn't burn requests; refresh fires immediately on tab return.
- *
- * The hook stays unopinionated about merging — it hands the latest session
- * payload back to the caller. Conflict resolution against in-flight user
- * edits is handled by the active canvas stage.
+ * Agent-driven inbound canvas sync via revision probe + visibility-gated poll.
+ * Callers own merge/conflict resolution against in-flight edits.
  */
 import { useEffect, useRef } from "react";
+import type { AuthoritativeResponseOrder } from "@/components/canvas/canvas-authoritative-reconcile";
 import type {
   CanvasRawLayer,
   CanvasSessionResponse,
@@ -31,6 +21,12 @@ export interface UseCanvasSessionRefreshArgs {
   onLayers: (layers: CanvasRawLayer[]) => void;
   /** Called with the full session payload when any render-relevant field changes. */
   onSession?: (session: CanvasSessionResponse["session"]) => void;
+  /**
+   * Shared with recovery resync: claim a poll token before the first await so a
+   * delayed poll cannot reconcile after a newer authoritative response. While
+   * recovery holds its lease, claimPoll returns null and the tick skips.
+   */
+  responseOrder?: AuthoritativeResponseOrder;
 }
 
 export function buildCanvasSessionRefreshSignature(session: CanvasSessionResponse["session"]): string {
@@ -97,12 +93,14 @@ export function createCanvasSessionRefreshController({
   isVisible,
   onChanged,
   probe = probeCanvasSessionRefresh,
+  responseOrder,
 }: {
   sessionId: string;
   intervalMs: number;
   isVisible: () => boolean;
   onChanged: (session: CanvasSessionResponse["session"]) => void;
   probe?: typeof probeCanvasSessionRefresh;
+  responseOrder?: AuthoritativeResponseOrder;
 }): CanvasSessionRefreshController {
   let stopped = false;
   let running = false;
@@ -131,8 +129,14 @@ export function createCanvasSessionRefreshController({
     }
     running = true;
     try {
+      // Claim before the first await when allowed. Recovery's higher-priority
+      // lease denies the claim so this tick skips the probe and reschedules
+      // via finally — it must not bump sequence over an in-flight resync.
+      const orderToken = responseOrder?.claimPoll();
+      if (responseOrder && orderToken == null) return;
       const result = await probe(sessionId, lastRevision, abortController.signal);
       if (stopped) return;
+      if (orderToken && !orderToken.isCurrent()) return;
       lastRevision = result.revision;
       if (result.session) onChanged(result.session);
     } catch {
@@ -182,8 +186,9 @@ export function useCanvasSessionRefresh({
   intervalMs = 3000,
   onLayers,
   onSession,
+  responseOrder,
 }: UseCanvasSessionRefreshArgs): void {
-  // Latest `onLayers` without re-arming the interval each render.
+  // Latest callbacks without re-arming the interval each render.
   const onLayersRef = useRef(onLayers);
   const onSessionRef = useRef(onSession);
   useEffect(() => {
@@ -201,6 +206,7 @@ export function useCanvasSessionRefresh({
       sessionId,
       intervalMs,
       isVisible: () => document.visibilityState === "visible",
+      responseOrder,
       onChanged(session) {
         const layers = session.layers ?? [];
         // Signature only captures fields the stage actually renders — avoids
@@ -226,5 +232,5 @@ export function useCanvasSessionRefresh({
       controller.stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [sessionId, enabled, intervalMs]);
+  }, [sessionId, enabled, intervalMs, responseOrder]);
 }

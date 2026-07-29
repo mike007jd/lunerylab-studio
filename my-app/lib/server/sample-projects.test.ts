@@ -9,9 +9,11 @@ const mocks = vi.hoisted(() => ({
   assetCreate: vi.fn(),
   canvasSessionCreate: vi.fn(),
   canvasLayerCreateMany: vi.fn(),
+  userSettingsFindUnique: vi.fn(),
   transaction: vi.fn(),
   writeGeneratedImage: vi.fn(),
   deleteStoredFile: vi.fn(),
+  getPlainT: vi.fn(),
 }));
 
 vi.mock("node:fs", () => ({
@@ -24,9 +26,8 @@ vi.mock("@/lib/sample-data", () => ({
   }],
   SAMPLE_SOURCE_MIME_TYPE: "image/webp",
 }));
-vi.mock("@/lib/i18n/server", () => ({ resolveLocale: vi.fn().mockResolvedValue("en") }));
 vi.mock("@/lib/i18n/plain", () => ({
-  getPlainT: () => (key: string) => key,
+  getPlainT: mocks.getPlainT,
 }));
 vi.mock("@/lib/server/storage", () => ({
   writeGeneratedImage: mocks.writeGeneratedImage,
@@ -36,6 +37,7 @@ vi.mock("@/lib/server/storage", () => ({
 vi.mock("@/lib/server/prisma", () => ({
   prisma: {
     project: { findMany: mocks.projectFindMany },
+    userSettings: { findUnique: mocks.userSettingsFindUnique },
     $transaction: mocks.transaction,
   },
 }));
@@ -55,6 +57,8 @@ beforeEach(() => {
   mocks.generationJobCreate.mockResolvedValue({ id: "job-1" });
   mocks.assetCreate.mockResolvedValue({ id: "asset-1" });
   mocks.canvasSessionCreate.mockResolvedValue({ id: "session-1" });
+  mocks.userSettingsFindUnique.mockResolvedValue({ defaultLocale: "en" });
+  mocks.getPlainT.mockImplementation(() => (key: string) => key);
   mocks.writeGeneratedImage.mockResolvedValue({
     storagePath: "generated/sample.webp",
     mimeType: "image/webp",
@@ -75,12 +79,25 @@ describe("built-in project template initialization", () => {
   it("fills missing templates without creating a personal project", async () => {
     await ensureBuiltInProjectTemplates("owner-1");
 
+    expect(mocks.userSettingsFindUnique).toHaveBeenCalledWith({
+      where: { userId: "owner-1" },
+      select: { defaultLocale: true },
+    });
+    expect(mocks.getPlainT).toHaveBeenCalledWith("en");
     expect(mocks.projectCreate).toHaveBeenCalledTimes(1);
     expect(mocks.projectCreate).toHaveBeenCalledWith({
       data: expect.objectContaining({ isTemplate: true, templateKey: "built-in-one" }),
       select: { id: true },
     });
     expect(mocks.projectCreate.mock.calls.every(([call]) => call.data.isTemplate === true)).toBe(true);
+  });
+
+  it("uses the profile locale without re-entering workspace initialization", async () => {
+    mocks.userSettingsFindUnique.mockResolvedValue({ defaultLocale: "zh-Hant" });
+
+    await ensureBuiltInProjectTemplates("owner-1");
+
+    expect(mocks.getPlainT).toHaveBeenCalledWith("zh-TW");
   });
 
   it("is idempotent across repeated initialization", async () => {

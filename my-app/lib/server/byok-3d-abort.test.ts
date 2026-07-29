@@ -18,6 +18,8 @@ vi.mock("@/lib/server/byok-provider-config", () => ({
 
 import { generateModel3dByok } from "@/lib/server/byok-3d";
 
+const providerFetch: typeof fetch = (input, init) => fetch(input, init);
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.resolveByokProviderConfig.mockResolvedValue({
@@ -30,6 +32,7 @@ beforeEach(() => {
     },
     apiKey: "key",
     endpoint: "https://api.meshy.example",
+    fetch: providerFetch,
     modelId: "image-to-3d",
   });
   mocks.downloadRemoteBytes.mockResolvedValue({

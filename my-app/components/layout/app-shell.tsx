@@ -1,5 +1,6 @@
 "use client";
 
+import { BootstrapLocaleSync } from "@/components/layout/bootstrap-locale-sync";
 import { Sidebar as AppSidebar, type SidebarProject } from "@/components/layout/sidebar";
 import { TopHeader } from "@/components/layout/top-header";
 import {
@@ -13,6 +14,8 @@ import {
   CONSOLE_CONTENT_FRAME_CLASS,
   CONSOLE_CONTENT_SCOPE_CLASS,
 } from "@/components/design-system/shell";
+import { GenerationActivityRegistryProvider } from "@/components/studio/controllers/generation-activity-registry";
+import { StudioGenerationHistoryProvider } from "@/components/studio/use-studio-generation-history";
 
 export function AppShell({
   children,
@@ -26,15 +29,20 @@ export function AppShell({
   return (
     <RouteTransitionProvider>
       <div className="min-h-screen bg-(--bg-base)">
-        <SidebarProvider defaultOpen={defaultSidebarOpen}>
-          <AppSidebar projects={initialProjects} />
-          <SidebarInset className="min-h-screen min-w-0 bg-(--bg-base)">
-            <TopHeader />
-            <div id="console-content-scope" className={CONSOLE_CONTENT_SCOPE_CLASS}>
-              <div className={CONSOLE_CONTENT_FRAME_CLASS}>{children}</div>
-            </div>
-          </SidebarInset>
-        </SidebarProvider>
+        <BootstrapLocaleSync />
+        <StudioGenerationHistoryProvider>
+          <GenerationActivityRegistryProvider>
+            <SidebarProvider defaultOpen={defaultSidebarOpen}>
+              <AppSidebar projects={initialProjects} />
+              <SidebarInset className="min-h-screen min-w-0 bg-(--bg-base)">
+                <TopHeader />
+                <div id="console-content-scope" className={CONSOLE_CONTENT_SCOPE_CLASS}>
+                  <div className={CONSOLE_CONTENT_FRAME_CLASS}>{children}</div>
+                </div>
+              </SidebarInset>
+            </SidebarProvider>
+          </GenerationActivityRegistryProvider>
+        </StudioGenerationHistoryProvider>
       </div>
     </RouteTransitionProvider>
   );

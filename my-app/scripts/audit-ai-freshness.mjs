@@ -102,6 +102,11 @@ const currentCatalogRequiredPatterns = [
 // actively track the recommended leaf model.
 const exactSourceChecks = [
   {
+    id: "gpt-5.6-sol",
+    url: "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    strategy: "source-text",
+  },
+  {
     id: "gpt-image-2",
     url: "https://developers.openai.com/api/docs/models/gpt-image-2",
     strategy: "source-text",
@@ -125,6 +130,11 @@ const exactSourceChecks = [
     id: "MiniMax-Hailuo-2.3",
     aliases: ["MiniMax Hailuo 2.3", "Hailuo 2.3"],
     url: "https://platform.minimax.io/docs/api-reference/video-generation-t2v",
+    strategy: "source-text",
+  },
+  {
+    id: "MiniMax-M3",
+    url: "https://platform.minimax.io/docs/api-reference/text-openai-api",
     strategy: "source-text",
   },
   {
@@ -177,9 +187,24 @@ const exactSourceChecks = [
 const recommendedCurrentModels = [
   {
     providerId: "openai",
+    role: "text",
+    expected: "gpt-5.6-sol",
+    checkedAt: "2026-07-29",
+    source: "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+  },
+  {
+    providerId: "openai",
+    role: "imageGenerate",
     expected: "gpt-image-2",
-    checkedAt: "2026-06-22",
+    checkedAt: "2026-07-29",
     source: "https://developers.openai.com/api/docs/models/gpt-image-2",
+  },
+  {
+    providerId: "minimax",
+    role: "text",
+    expected: "MiniMax-M3",
+    checkedAt: "2026-07-29",
+    source: "https://platform.minimax.io/docs/api-reference/text-openai-api",
   },
 ];
 
@@ -189,6 +214,14 @@ function extractProviderBlock(text, providerId) {
   if (start < 0) return "";
   const next = text.indexOf('\n    id: "', start + startMarker.length);
   return text.slice(start, next < 0 ? text.length : next);
+}
+
+function extractModelGuidanceRoleBlock(providerBlock, role) {
+  const marker = `\n      ${role}: {`;
+  const start = providerBlock.indexOf(marker);
+  if (start < 0) return "";
+  const end = providerBlock.indexOf("\n      },", start + marker.length);
+  return providerBlock.slice(start, end < 0 ? providerBlock.length : end + 9);
 }
 
 const today = process.env.AI_FRESHNESS_TODAY ?? new Date().toISOString().slice(0, 10);
@@ -625,13 +658,21 @@ for (const file of metadataFiles) {
   for (const id of extractProviderExactIds(text)) {
     if (!exactCheckIds.has(id)) failures.push(`BYOK exact model id has no audit check: ${id}`);
   }
-  // Recommended-current: placeholder must equal the tracked current leaf model.
+  // Recommended-current: each capability-specific placeholder must keep its
+  // exact leaf id, official source and checked date aligned.
   for (const rec of recommendedCurrentModels) {
-    const block = extractProviderBlock(text, rec.providerId);
-    const actual = block.match(/placeholderModelId:\s*"([^"]+)"/)?.[1];
-    if (actual !== rec.expected) {
+    const providerBlock = extractProviderBlock(text, rec.providerId);
+    const roleBlock = extractModelGuidanceRoleBlock(providerBlock, rec.role);
+    const actual = roleBlock.match(/placeholderModelId:\s*"([^"]+)"/)?.[1];
+    const source = roleBlock.match(/url:\s*"([^"]+)"/)?.[1];
+    const checkedAt = roleBlock.match(/lastVerifiedAt:\s*"(\d{4}-\d{2}-\d{2})"/)?.[1];
+    if (
+      actual !== rec.expected ||
+      source !== rec.source ||
+      checkedAt !== rec.checkedAt
+    ) {
       failures.push(
-        `recommended-current check: ${rec.providerId} placeholder is "${actual ?? "(none)"}", expected current "${rec.expected}" (verified ${rec.checkedAt}, ${rec.source})`,
+        `recommended-current check: ${rec.providerId}:${rec.role} is id="${actual ?? "(none)"}" source="${source ?? "(none)"}" checkedAt="${checkedAt ?? "(none)"}"; expected "${rec.expected}", "${rec.source}", "${rec.checkedAt}"`,
       );
     }
   }

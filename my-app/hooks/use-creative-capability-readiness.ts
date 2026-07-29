@@ -56,6 +56,8 @@ function useCreativeCapabilityReadinessValue(): CreativeCapabilityReadiness {
         videoModels: catalog.videoModels,
         catalogLoading: catalog.loading,
         bootstrapDefaultImageModel: bootstrap?.app.defaultImageModel ?? "",
+        bootstrapDefaultTextModel: bootstrap?.app.defaultTextModel ?? "",
+        bootstrapDefaultVideoModel: bootstrap?.app.defaultVideoModel ?? "",
         providers: bootstrap?.providers ?? {},
         providerConnections,
         localSummary,
@@ -66,6 +68,8 @@ function useCreativeCapabilityReadinessValue(): CreativeCapabilityReadiness {
       }),
     [
       bootstrap?.app.defaultImageModel,
+      bootstrap?.app.defaultTextModel,
+      bootstrap?.app.defaultVideoModel,
       bootstrap?.providers,
       catalog.imageModels,
       catalog.loading,

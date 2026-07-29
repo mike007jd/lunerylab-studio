@@ -116,7 +116,7 @@ function goodBackup(): WorkspaceBackup {
     manifest: {
       format: BACKUP_FORMAT,
       version: BACKUP_VERSION,
-      appVersion: "1.0.0",
+      appVersion: "0.2.0",
       schemaVersion: CURRENT_SCHEMA_VERSION,
       createdAt: "2026-07-15T00:00:00.000Z",
       counts: {},
@@ -142,6 +142,7 @@ describe("exportWorkspaceBackup", () => {
     const backup = await exportWorkspaceBackup("2026-07-15T00:00:00.000Z");
 
     expect(backup.manifest.format).toBe(BACKUP_FORMAT);
+    expect(backup.manifest.appVersion).toBe("0.2.0");
     expect(backup.manifest.excluded).toContain("keychain-secrets");
     expect(backup.manifest.excluded).toEqual(expect.arrayContaining(["models", "logs", "runtime-temp"]));
     expect(backup.manifest.dataSha256).toMatch(/^[a-f0-9]{64}$/);

@@ -1,12 +1,13 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Globe } from "@/components/ui/icons";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useI18n } from "@/lib/i18n/provider";
 import { isChineseLocale, type Locale } from "@/lib/i18n/locale";
+import { persistProfileLocale } from "@/lib/client/persist-locale";
 import { useRouteTransition } from "@/components/motion/route-transition-provider";
 import { useMotionReducedPreference } from "@/components/motion/motion-primitives";
 import { lunaMotion } from "@/components/design-system/grammar/motion";
@@ -50,6 +51,8 @@ export function TopHeader() {
   const reduced = useMotionReducedPreference();
   const { activePathname } = useRouteTransition();
   const { locale, setLocale, t } = useI18n();
+  const [localePending, setLocalePending] = useState(false);
+  const [localeSaveFailed, setLocaleSaveFailed] = useState(false);
 
   const isEnglish = locale === "en";
   // Remember the last Chinese variant the user was on so English → 中 restores
@@ -71,11 +74,40 @@ export function TopHeader() {
       : nextLocale === "zh-TW"
         ? t("shell.languageTraditionalChinese")
         : t("shell.languageSimplifiedChinese");
-  const handleLocaleToggle = () => setLocale(nextLocale);
+
+  const handleLocaleToggle = () => {
+    if (localePending) return;
+    setLocalePending(true);
+    void persistProfileLocale(nextLocale)
+      .then((saved) => {
+        setLocaleSaveFailed(false);
+        setLocale(saved);
+      })
+      .catch(() => {
+        // Keep the current locale when the profile PATCH fails and surface the
+        // failure inline; clicking the toggle again retries and clears it.
+        setLocaleSaveFailed(true);
+      })
+      .finally(() => {
+        setLocalePending(false);
+      });
+  };
 
   const titleKey = resolvePageTitleKey(activePathname);
   const title = titleKey ? t(titleKey) : "";
   const projectDetailOwnsHeading = /^\/projects\/[^/]+$/.test(activePathname);
+
+  // Keep the document chrome in the active locale: <html lang> and the tab
+  // title must flip with the catalog, or stale Simplified-Chinese accessible
+  // text survives after switching to English or zh-TW. Brand suffix mirrors
+  // the root metadata template and stays unlocalized. Project detail owns its
+  // own document title — do not clobber it with the generic Projects label.
+  useEffect(() => {
+    document.documentElement.lang = locale;
+    if (projectDetailOwnsHeading) return;
+    document.title = title ? `${title} — Lunery Lab Studio` : "Lunery Lab Studio";
+  }, [locale, projectDetailOwnsHeading, title]);
+
   return (
     <header
       className="sticky top-0 z-20 flex h-12 items-center justify-between border-b border-(--border-subtle) bg-(--bg-base)/82 px-5 backdrop-blur-md"
@@ -98,12 +130,14 @@ export function TopHeader() {
       </div>
 
       {/* Right: low-noise locale utility; creative readiness stays contextual. */}
-      <div className="flex items-center gap-1.5">
+      <div className="relative flex items-center gap-1.5">
         <TapScale reduced={reduced}>
           <Button
             variant="ghostMuted"
             size="toolbar"
             onClick={handleLocaleToggle}
+            disabled={localePending}
+            aria-busy={localePending || undefined}
             aria-label={t("shell.switchLanguageTo", { language: nextLocaleName })}
             title={t("shell.switchLanguageTo", { language: nextLocaleName })}
             className="h-9 min-w-9 gap-1.5 px-2.5"
@@ -112,6 +146,14 @@ export function TopHeader() {
             {localeToggleLabel}
           </Button>
         </TapScale>
+        {localeSaveFailed ? (
+          <p
+            role="alert"
+            className="absolute right-0 top-full mt-1 whitespace-nowrap rounded-(--radius-panel) border border-(--border-subtle) bg-(--bg-surface) px-2.5 py-1.5 text-xs text-destructive shadow-md"
+          >
+            {t("shell.localeSaveError")}
+          </p>
+        ) : null}
       </div>
     </header>
   );

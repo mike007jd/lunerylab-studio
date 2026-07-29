@@ -30,6 +30,7 @@ const en = {
     "toggleNavigation": "Show or hide navigation",
     "goToStudio": "Go to Studio",
     "switchLanguageTo": "Switch language to {language}",
+    "localeSaveError": "Couldn't save the language. Try again.",
     "languageEnglish": "English",
     "languageSimplifiedChinese": "Simplified Chinese",
     "languageTraditionalChinese": "Traditional Chinese"
@@ -80,7 +81,8 @@ const en = {
       "selectTextModel": "Pick text model",
       "selectVideoModel": "Pick video model",
       "selectDefault": "Pick model",
-      "changeDefault": "Change"
+      "changeDefault": "Change",
+      "openImageSettings": "Open Image settings"
     },
     "runtime": {
       "readyTitle": "Connected",
@@ -417,7 +419,9 @@ const en = {
     "configureImageAi": "Configure Image AI",
     "videoAiRequiredTitle": "Video AI required",
     "videoAiRequiredDetail": "Add a video model to execute this video step. The task can continue afterward.",
-    "configureVideoAi": "Configure Video AI"
+    "configureVideoAi": "Configure Video AI",
+    "openTextSettings": "Open Text settings",
+    "textDraftHint": "Your draft stays here. Set up a text model to send."
   },
   "library": {
     "title": "Creation History",
@@ -431,6 +435,11 @@ const en = {
     "useTemplate": "Use template",
     "renameProject": "Rename project",
     "renameProjectFailed": "Failed to rename project",
+    "projectActions": "Project actions",
+    "deleteProject": "Delete project",
+    "deleteProjectConfirm": "Delete this project? Generated assets stay in Library; the project itself will be removed.",
+    "deleteProjectFailed": "Failed to delete project",
+    "deletingProject": "Deleting…",
     "projectNameDescription": "Choose a name you'll recognize.",
     "jobs": "Jobs",
     "canvasAndJobs": "Canvas & Jobs",
@@ -635,7 +644,10 @@ const en = {
       "hideLayer": "Hide layer",
       "lockLayer": "Lock layer",
       "unlockLayer": "Unlock layer",
-      "hint": "Select a layer to reorder."
+      "hint": "Select a layer to reorder.",
+      "keyboardHint": "Tab reaches each layer · Enter selects · Arrow keys move the selected layer · Shift+Arrow keys resize · Delete removes",
+      "layerLocked": "Locked",
+      "lockedSelected": "The selected layer is locked. Move, resize, and delete are unavailable."
     },
     "transferExpired": "Link expired. Generate again.",
     "defaults": {

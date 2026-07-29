@@ -46,13 +46,14 @@ function assertTextCapableProvider(meta: ByokProviderMeta) {
 }
 
 async function buildByokModel(config: ResolvedByokProviderConfig): Promise<LanguageModel> {
-  const { providerId, providerMeta: meta, apiKey, modelId, endpoint } = config;
+  const { providerId, providerMeta: meta, apiKey, modelId, endpoint, fetch } = config;
 
   switch (providerId) {
     case "openai": {
       const provider = createOpenAI({
         apiKey,
         baseURL: endpoint,
+        fetch,
       });
       return provider(modelId) as LanguageModel;
     }
@@ -60,6 +61,7 @@ async function buildByokModel(config: ResolvedByokProviderConfig): Promise<Langu
       const provider = createAnthropic({
         apiKey,
         baseURL: endpoint,
+        fetch,
       });
       return provider(modelId) as LanguageModel;
     }
@@ -67,6 +69,7 @@ async function buildByokModel(config: ResolvedByokProviderConfig): Promise<Langu
       const provider = createGoogleGenerativeAI({
         apiKey,
         baseURL: endpoint,
+        fetch,
       });
       return provider(modelId) as LanguageModel;
     }
@@ -91,6 +94,7 @@ async function buildByokModel(config: ResolvedByokProviderConfig): Promise<Langu
         name: providerId,
         baseURL: endpoint,
         apiKey,
+        fetch,
       });
       return provider(modelId) as LanguageModel;
     }

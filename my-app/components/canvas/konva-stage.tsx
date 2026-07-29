@@ -13,6 +13,8 @@ import { Image as KonvaImage, Layer, Line, Rect, Stage, Transformer } from "reac
 import type Konva from "konva";
 import { Button } from "@/components/ui/button";
 import { MousePointer2, PenTool, Square, Trash2 } from "@/components/ui/icons";
+import { CanvasLayerControl } from "@/components/canvas/canvas-layer-control";
+import { shouldDeleteSelectedCanvasLayer } from "@/components/canvas/canvas-keyboard";
 import { useT } from "@/lib/i18n/useT";
 import {
   EMPTY_DRAWING_STATE,
@@ -61,6 +63,8 @@ interface KonvaStageProps {
     patch: Partial<Pick<KonvaLayerItem, "x" | "y" | "width" | "height" | "rotation">>,
   ) => Promise<void> | void;
   onDeleteLayer?: (layerId: string) => void;
+  onToggleLock?: (layerId: string, locked: boolean) => void;
+  isLockPending?: (layerId: string) => boolean;
   onDrawingStateChange?: (state: CanvasDrawingState) => Promise<void> | void;
   onDrawingStateDirty?: () => void;
   stageRef?: RefObject<KonvaStageHandle | null>;
@@ -123,9 +127,22 @@ function AssetNode({
       shadowOpacity={selected ? 0.28 : 0.16}
       onClick={onSelect}
       onTap={onSelect}
-      onDragEnd={(event) => onPatch({ x: event.target.x(), y: event.target.y() })}
+      onDragEnd={(event) => {
+        if (item.locked) {
+          event.target.position({ x: item.x, y: item.y });
+          return;
+        }
+        onPatch({ x: event.target.x(), y: event.target.y() });
+      }}
       onTransformEnd={(event) => {
         const node = event.target;
+        if (item.locked) {
+          node.position({ x: item.x, y: item.y });
+          node.rotation(item.rotation ?? 0);
+          node.scaleX(1);
+          node.scaleY(1);
+          return;
+        }
         const width = Math.max(24, node.width() * node.scaleX());
         const height = Math.max(24, node.height() * node.scaleY());
         node.scaleX(1);
@@ -150,6 +167,8 @@ export function KonvaStage({
   onSelectLayer,
   onPatchLayer,
   onDeleteLayer,
+  onToggleLock,
+  isLockPending,
   onDrawingStateChange,
   onDrawingStateDirty,
   stageRef,
@@ -207,6 +226,10 @@ export function KonvaStage({
     () => layers.filter((layer) => !layer.hidden).sort((a, b) => a.zIndex - b.zIndex),
     [layers],
   );
+  const selectedLayer = useMemo(
+    () => layers.find((layer) => layer.id === selectedLayerId) ?? null,
+    [layers, selectedLayerId],
+  );
 
   const fitAll = useCallback(() => {
     if (visibleLayers.length === 0) {
@@ -238,9 +261,9 @@ export function KonvaStage({
     const transformer = transformerRef.current;
     if (!transformer) return;
     const node = selectedLayerId ? assetNodesRef.current.get(selectedLayerId) : undefined;
-    transformer.nodes(node && tool === "select" ? [node] : []);
+    transformer.nodes(node && tool === "select" && !selectedLayer?.locked ? [node] : []);
     transformer.getLayer()?.batchDraw();
-  }, [selectedLayerId, tool, visibleLayers]);
+  }, [selectedLayer?.locked, selectedLayerId, tool, visibleLayers]);
 
   const persistDrawing = useCallback((next: CanvasDrawingState) => {
     drawingRef.current = next;
@@ -342,11 +365,16 @@ export function KonvaStage({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.key === "Backspace" || event.key === "Delete") && selectedLayerId && tool === "select") {
-        const target = event.target as HTMLElement | null;
-        if (target?.matches("input, textarea, [contenteditable=true]")) return;
+      if (
+        shouldDeleteSelectedCanvasLayer({
+          key: event.key,
+          target: event.target,
+          tool,
+          selectedLayer,
+        })
+      ) {
         event.preventDefault();
-        onDeleteLayer?.(selectedLayerId);
+        onDeleteLayer?.(selectedLayer!.id);
       }
       if (event.key === "Escape") {
         setTool("select");
@@ -355,7 +383,7 @@ export function KonvaStage({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onDeleteLayer, onSelectLayer, selectedLayerId, tool]);
+  }, [onDeleteLayer, onSelectLayer, selectedLayer, selectedLayerId, tool]);
 
   const beginMask = (stage: Konva.Stage) => {
     const point = toWorldPoint(stage);
@@ -491,6 +519,16 @@ export function KonvaStage({
           />
         </Layer>
       </Stage>
+
+      <CanvasLayerControl
+        layers={layers}
+        selectedLayerId={selectedLayerId}
+        onSelectLayer={onSelectLayer}
+        onPatchLayer={onPatchLayer}
+        onDeleteLayer={onDeleteLayer}
+        onToggleLock={onToggleLock}
+        isLockPending={isLockPending}
+      />
 
       <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-xl border border-(--border-subtle) bg-(--scrim-strong) p-1.5 shadow-xl backdrop-blur">
         <Button type="button" size="icon-sm" variant={tool === "select" ? "selected" : "ghostMuted"} onClick={() => setTool("select")} aria-label={t("canvas.selectAssets")}>

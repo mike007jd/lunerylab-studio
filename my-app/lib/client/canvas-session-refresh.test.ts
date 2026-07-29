@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAuthoritativeResponseOrder } from "@/components/canvas/canvas-authoritative-reconcile";
 import {
   buildCanvasSessionRefreshSignature,
   createCanvasSessionRefreshController,
@@ -172,5 +173,111 @@ describe("createCanvasSessionRefreshController", () => {
     expect(activeSignal?.aborted).toBe(true);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it("claims response order at probe start and drops a superseded callback", async () => {
+    vi.useFakeTimers();
+    const responseOrder = createAuthoritativeResponseOrder();
+    let releaseProbe!: (value: {
+      revision: string;
+      session: CanvasSessionResponse["session"];
+    }) => void;
+    const probe = vi.fn(
+      () =>
+        new Promise<{
+          revision: string;
+          session: CanvasSessionResponse["session"];
+        }>((resolve) => {
+          releaseProbe = resolve;
+        }),
+    );
+    const onChanged = vi.fn();
+    const controller = createCanvasSessionRefreshController({
+      sessionId: "session-1",
+      intervalMs: 3000,
+      isVisible: () => true,
+      onChanged,
+      probe,
+      responseOrder,
+    });
+
+    controller.start();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(probe).toHaveBeenCalledOnce();
+
+    // A newer recovery resync claims while the poll is in flight.
+    const resync = responseOrder.beginRecovery();
+    expect(resync.isCurrent()).toBe(true);
+
+    releaseProbe({ revision: "revision-1", session: sessionWithLocked(false) });
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledOnce());
+    await Promise.resolve();
+
+    expect(onChanged).not.toHaveBeenCalled();
+    resync.finish();
+    controller.stop();
+  });
+
+  it("skips polls while recovery is active so an unchanged-revision probe cannot drop a restoring resync", async () => {
+    vi.useFakeTimers();
+    const responseOrder = createAuthoritativeResponseOrder();
+    const revision = "revision-unchanged";
+    const serverSession = sessionWithLocked(false);
+    serverSession.layers = [
+      {
+        id: "L",
+        assetId: "asset-1",
+        x: 10,
+        y: 20,
+        width: 300,
+        height: 200,
+        rotation: 0,
+        zIndex: 1,
+        hidden: false,
+        locked: false,
+      },
+    ];
+
+    const probe = vi
+      .fn()
+      .mockResolvedValueOnce({ revision, session: serverSession })
+      .mockResolvedValue({ revision });
+    const onChanged = vi.fn();
+    const controller = createCanvasSessionRefreshController({
+      sessionId: "session-1",
+      intervalMs: 3000,
+      isVisible: () => true,
+      onChanged,
+      probe,
+      responseOrder,
+    });
+
+    controller.start();
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.waitFor(() => expect(onChanged).toHaveBeenCalledOnce());
+    expect(probe).toHaveBeenCalledOnce();
+
+    // Failed optimistic delete: local UI lost L; recovery A begins and defers.
+    let localLayers: Array<{ id: string }> = [];
+    const recoveryA = responseOrder.beginRecovery();
+
+    // Poll interval/request while A is active must not probe or supersede.
+    controller.requestRefresh();
+    await Promise.resolve();
+    expect(probe).toHaveBeenCalledOnce();
+    expect(responseOrder.claimPoll()).toBeNull();
+
+    // A applies a full unchanged-revision snapshot and restores L.
+    expect(recoveryA.isCurrent()).toBe(true);
+    localLayers = serverSession.layers!.map((layer) => ({ id: layer.id }));
+    recoveryA.finish();
+    expect(localLayers.map((layer) => layer.id)).toEqual(["L"]);
+
+    // After A finishes, the deferred schedule allows a later poll.
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(2));
+    // Unchanged revision: no second onChanged, and no forced full GET.
+    expect(onChanged).toHaveBeenCalledOnce();
+    controller.stop();
   });
 });

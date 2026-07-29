@@ -3,6 +3,7 @@ import {
   byokModelInputRoles,
   findByokProvider,
   normalizeByokModels,
+  resolveByokModelGuidance,
   type ByokProviderMeta,
 } from "@/lib/byok-providers";
 
@@ -28,6 +29,76 @@ describe("byokModelInputRoles", () => {
   it("asks for no model id when the operation is fixed (meshy/tripo)", () => {
     expect(byokModelInputRoles(meta("meshy"))).toEqual([]);
     expect(byokModelInputRoles(meta("tripo"))).toEqual([]);
+  });
+});
+
+describe("resolveByokModelGuidance", () => {
+  it("keeps OpenAI text and image examples capability-specific", () => {
+    expect(resolveByokModelGuidance(meta("openai"), ["text"])).toMatchObject({
+      placeholderModelId: "gpt-5.6-sol",
+      sourceEvidence: {
+        url: "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+        lastVerifiedAt: "2026-07-29",
+      },
+    });
+    expect(resolveByokModelGuidance(meta("openai"), ["imageGenerate"])).toMatchObject({
+      placeholderModelId: "gpt-image-2",
+      sourceEvidence: {
+        url: "https://developers.openai.com/api/docs/models/gpt-image-2",
+      },
+    });
+  });
+
+  it("never leaks one provider-wide example into a different capability", () => {
+    expect(resolveByokModelGuidance(meta("minimax"), ["text"])).toMatchObject({
+      placeholderModelId: "MiniMax-M3",
+      sourceEvidence: { url: "https://platform.minimax.io/docs/api-reference/text-openai-api" },
+    });
+    const replicateVideo = resolveByokModelGuidance(meta("replicate"), ["video"]);
+    expect(replicateVideo).toMatchObject({
+      sourceEvidence: { url: "https://replicate.com/collections/text-to-video" },
+    });
+    expect(replicateVideo?.placeholderModelId).toBeUndefined();
+  });
+
+  it("gives every multi-slot settings role an authoritative destination", () => {
+    for (const providerId of [
+      "openai",
+      "minimax",
+      "replicate",
+      "fal",
+      "together",
+      "fireworks",
+      "openai-compatible",
+    ]) {
+      const provider = meta(providerId);
+      for (const role of byokModelInputRoles(provider)) {
+        const guidance = resolveByokModelGuidance(provider, [role]);
+        expect(guidance, `${providerId}:${role}`).toBeDefined();
+        expect(
+          Boolean(guidance?.sourceEvidence?.url) || guidance?.modelIdFromEndpoint === true,
+          `${providerId}:${role}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("treats the configured /models response as authority for compatible endpoints", () => {
+    const guidance = resolveByokModelGuidance(meta("openai-compatible"), ["text"]);
+    expect(guidance).toMatchObject({
+      placeholderModelId: "local-model-id",
+      modelIdFromEndpoint: true,
+    });
+    expect(guidance?.sourceEvidence).toBeUndefined();
+  });
+
+  it("preserves guidance for a genuinely single-slot provider", () => {
+    expect(resolveByokModelGuidance(meta("anthropic"), ["text"])).toMatchObject({
+      placeholderModelId: "claude-sonnet-4-6",
+      sourceEvidence: {
+        url: "https://platform.claude.com/docs/en/about-claude/models/overview",
+      },
+    });
   });
 });
 

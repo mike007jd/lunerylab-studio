@@ -84,6 +84,60 @@ export function mergeKeyedCursorPage<TItem extends { id: string }>(
   };
 }
 
+/**
+ * Remove a deleted project from a keyed cursor page. When the deleted id is the
+ * current Load More cursor, retarget to the new page tail so subsequent pages
+ * remain reachable.
+ */
+export function removeItemFromKeyedCursorPage<TItem extends { id: string }>(
+  current: KeyedCursorPage<TItem>,
+  deletedId: string,
+): KeyedCursorPage<TItem> {
+  const items = current.items.filter((item) => item.id !== deletedId);
+  if (items.length === current.items.length) return current;
+
+  const cursorWasDeleted = current.nextCursor === deletedId;
+  if (!cursorWasDeleted) {
+    return {
+      ...current,
+      items,
+    };
+  }
+
+  const nextCursor = items[items.length - 1]?.id ?? null;
+  const hasMore = Boolean(current.hasMore && nextCursor);
+  return {
+    ...current,
+    items,
+    hasMore,
+    nextCursor: hasMore ? nextCursor : null,
+  };
+}
+
+/**
+ * After sidebar deletions, keep the recent list filled up to `limit` while
+ * tombstoning every deleted id across overlapping refill responses.
+ */
+export function refillRecentProjects<TItem extends { id: string }>(
+  current: readonly TItem[],
+  excludedIds: ReadonlySet<string>,
+  candidates: readonly TItem[],
+  limit: number,
+): TItem[] {
+  const remaining = current.filter((item) => !excludedIds.has(item.id));
+  if (remaining.length >= limit) return remaining.slice(0, limit);
+
+  const seen = new Set(remaining.map((item) => item.id));
+  const next = [...remaining];
+  for (const candidate of candidates) {
+    if (excludedIds.has(candidate.id) || seen.has(candidate.id)) continue;
+    next.push(candidate);
+    seen.add(candidate.id);
+    if (next.length >= limit) break;
+  }
+  return next.slice(0, limit);
+}
+
 export function buildProjectActivitySearchParams(
   section: "jobs" | "canvasSessions",
   cursor: string,

@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { ApiError } from "@/lib/server/errors";
+import { prisma } from "@/lib/server/prisma";
 
 export const canvasLayerInclude = Prisma.validator<Prisma.CanvasLayerInclude>()({
   asset: {
@@ -117,6 +118,47 @@ export function canvasLayerNotFoundError() {
     message: "Canvas layer not found.",
     retryable: false,
   });
+}
+
+export function canvasLayerLockedError() {
+  return new ApiError({
+    status: 409,
+    code: "canvas_layer_locked",
+    message: "Unlock this layer before changing or deleting it.",
+    retryable: false,
+  });
+}
+
+/** Shared DELETE/PATCH miss path: locked → 409, else layer/session not found. */
+export async function assertCanvasLayerWriteApplied(args: {
+  affectedCount: number;
+  layerWhere: {
+    id: string;
+    sessionId: string;
+    session: { userId: string };
+  };
+  sessionId: string;
+  userId: string;
+}): Promise<void> {
+  if (args.affectedCount === 1) return;
+  const layer = await prisma.canvasLayer.findFirst({
+    where: args.layerWhere,
+    select: { locked: true },
+  });
+  // The atomic unlocked-row predicate already missed. If the row exists now,
+  // it was locked at mutation time or changed concurrently; both are conflicts,
+  // never a not-found success signal.
+  if (layer) {
+    throw canvasLayerLockedError();
+  }
+  const session = await prisma.canvasSession.findUnique({
+    where: { id: args.sessionId, userId: args.userId },
+    select: { id: true },
+  });
+  if (session) {
+    throw canvasLayerNotFoundError();
+  }
+  throw canvasSessionNotFoundError();
 }
 
 export function toLayerPayload(layer: CanvasLayerWithAsset) {

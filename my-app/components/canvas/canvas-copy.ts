@@ -36,6 +36,7 @@ export const COPY = {
     toastSaveFailed:
       "Couldn't save canvas changes after several tries. Check your connection — your layout is still on screen.",
     toastDeleteLayerFailed: "Couldn't remove the layer. Restoring it from your saved canvas.",
+    toastLockLayerFailed: "Couldn't update the layer lock. Restoring the previous state.",
     toastAssetNotOnCanvas: "This image is no longer on the canvas. Add it again from Library.",
     toastRestoreLayerFailed: "Couldn't restore the layer. Add it again from Library.",
     toastRotatedLayerMask:
@@ -86,6 +87,7 @@ export const COPY = {
     toastSaveFailed:
       "多次尝试后仍无法保存画布更改。请检查你的网络连接——你的布局仍显示在屏幕上。",
     toastDeleteLayerFailed: "无法删除图层，已从已保存的画布恢复。",
+    toastLockLayerFailed: "无法更新图层锁定状态，已还原之前的状态。",
     toastAssetNotOnCanvas: "这张图片已不在画布上。请从素材库重新添加。",
     toastRestoreLayerFailed: "无法恢复图层，请从素材库重新添加。",
     toastRotatedLayerMask: "局部重绘暂不支持旋转后的图层。请先将图层旋转归零，再绘制遮罩。",
@@ -135,6 +137,7 @@ export const COPY = {
     toastSaveFailed:
       "多次嘗試後仍無法儲存畫布變更。請檢查你的網路連線——你的版面仍顯示在螢幕上。",
     toastDeleteLayerFailed: "無法刪除圖層，已從已儲存的畫布還原。",
+    toastLockLayerFailed: "無法更新圖層鎖定狀態，已還原之前的狀態。",
     toastAssetNotOnCanvas: "這張圖片已不在畫布上。請從素材庫重新加入。",
     toastRestoreLayerFailed: "無法還原圖層，請從素材庫重新加入。",
     toastRotatedLayerMask: "局部重繪暫不支援旋轉後的圖層。請先將圖層旋轉歸零，再繪製遮罩。",
