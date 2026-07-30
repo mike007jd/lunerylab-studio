@@ -5,7 +5,7 @@ import { generateImages } from "@/lib/server/image-generate";
 import { toAssetDTO } from "@/lib/server/dto";
 import {
   assertRequestContentLength,
-  validateFiles,
+  prepareImageFiles,
   withAssetWriteTransaction,
 } from "@/lib/server/file-validation";
 import { deleteStoredFile, writeFilesOrCleanup, writeGeneratedImage } from "@/lib/server/storage";
@@ -30,9 +30,9 @@ import {
   parseGenerationParameters,
   parseRepeatedFormStrings,
   resolveOwnedProjectId,
+  preparedImageFingerprint,
   trimFormString,
   trimFormStringOrNull,
-  uploadedFileFingerprint,
 } from "@/lib/server/generate-request";
 import { completeGenerationJob, failRunningGenerationJob } from "@/lib/server/generation-job";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
@@ -145,15 +145,15 @@ export async function POST(request: NextRequest) {
       }
     }
     const files = getUploadedFiles(formData, "files");
-    await validateFiles(files, { maxFiles: 4 });
+    const preparedFiles = await prepareImageFiles(files, { maxFiles: 4 });
     const referenceAssetIds = parseRepeatedFormStrings(formData, "referenceAssetIds");
     // Cap total references (files + unique asset ids) at the boundary, before
     // any reference file is read — 400 instead of a silent slice(0,4) later.
-    assertReferenceLimit(files.length, referenceAssetIds.length);
-    const referenceCount = files.length + referenceAssetIds.length;
+    assertReferenceLimit(preparedFiles.length, referenceAssetIds.length);
+    const referenceCount = preparedFiles.length + referenceAssetIds.length;
     const requiresReferenceModel = referenceCount > 0;
 
-    if (!prompt && files.length === 0 && referenceAssetIds.length === 0) {
+    if (!prompt && preparedFiles.length === 0 && referenceAssetIds.length === 0) {
       throw new ApiError({
         status: 400,
         code: "invalid_request",
@@ -210,7 +210,7 @@ export async function POST(request: NextRequest) {
       projectId,
       source,
       referenceAssetIds,
-      files: files.map(uploadedFileFingerprint),
+      files: preparedFiles.map(preparedImageFingerprint),
       generationParameters,
     });
 
@@ -253,7 +253,7 @@ export async function POST(request: NextRequest) {
     const uploadedReferences = await persistUploadedImageReferenceFiles({
       projectId,
       jobId: job.id,
-      files,
+      files: preparedFiles,
       userId: user.id,
     });
     const references = [...assetReferences, ...uploadedReferences];

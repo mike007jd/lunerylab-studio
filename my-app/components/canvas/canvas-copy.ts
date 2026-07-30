@@ -155,3 +155,6 @@ export const COPY = {
     loadFailedFallback: "載入工作階段失敗。",
   },
 } as const satisfies Record<Locale, Record<string, string>>;
+
+/** Resolved canvas copy for one locale, as every canvas owner consumes it. */
+export type CanvasCopy = (typeof COPY)[keyof typeof COPY];

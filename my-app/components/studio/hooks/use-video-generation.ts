@@ -13,7 +13,12 @@ import type {
 } from "@/components/studio/use-studio-generation-history";
 import type { GenerationActivityRegistry } from "@/components/studio/controllers/generation-activity-registry";
 
-type PollErrorKind = "network" | "server_5xx" | "client_4xx" | "timeout";
+type PollErrorKind =
+  | "network"
+  | "server_5xx"
+  | "job_missing"
+  | "client_4xx"
+  | "timeout";
 
 export interface VideoGenerationSubmitInput {
   prompt: string;
@@ -49,11 +54,14 @@ interface VideoRunInput {
   aspectRatio: string;
   projectId: string | null;
   referenceAssetIds: string[];
+  /** When set, rejoin this provider job instead of creating a new one. */
+  rejoinJobId?: string | null;
 }
 
 function classifyPollError(error: unknown): PollErrorKind {
   if (error instanceof HttpError) {
     if (error.status >= 500) return "server_5xx";
+    if (error.status === 404 || error.status === 410) return "job_missing";
     if (error.status >= 400) return "client_4xx";
   }
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
@@ -76,7 +84,7 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 function videoPollFailureMessage(kind: PollErrorKind): string {
-  return kind === "client_4xx"
+  return kind === "job_missing"
     ? "Video job not found"
     : "Connection lost. Check your network.";
 }
@@ -97,15 +105,20 @@ export function createVideoGenerationController({
     payload: VideoStatusResponse,
   ): boolean => {
     if (!registry.isCurrent(entryId, runId)) return true;
-    if (payload.status === "RUNNING") return false;
+    if (payload.status === "RUNNING") {
+      history.update(entryId, { status: "running", error: null });
+      return false;
+    }
     if (payload.status === "FAILED") {
-      history.update(entryId, { status: "failed", error: payload.error });
+      // Authoritative failure clears the session job id so retry creates fresh.
+      history.update(entryId, { status: "failed", error: payload.error, jobId: null });
       return true;
     }
     history.update(entryId, {
       status: payload.asset ? "succeeded" : "failed",
       assets: payload.asset ? [payload.asset] : [],
       error: payload.asset ? null : t("studio.videoFailed"),
+      jobId: payload.asset ? history.find(entryId)?.jobId ?? null : null,
     });
     return true;
   };
@@ -132,9 +145,21 @@ export function createVideoGenerationController({
           if (!registry.isCurrent(entryId, runId) || pollController.signal.aborted) return;
           const kind = classifyPollError(error);
           consecutiveErrors += 1;
-          if (kind === "client_4xx" || consecutiveErrors >= maxPollErrors) {
+          if (kind === "job_missing") {
+            // Authoritative not-found clears jobId so retry creates a new job.
             history.update(entryId, {
               status: "failed",
+              error: videoPollFailureMessage(kind),
+              jobId: null,
+            });
+            return;
+          }
+          if (consecutiveErrors >= maxPollErrors) {
+            // Release global generation ownership after a bounded outage so
+            // the WebView cannot become permanently busy. Keep jobId: Retry
+            // rejoins this same billable job and never creates a second one.
+            history.update(entryId, {
+              status: "interrupted",
               error: videoPollFailureMessage(kind),
             });
             return;
@@ -156,40 +181,57 @@ export function createVideoGenerationController({
       aspectRatio,
       projectId,
       referenceAssetIds,
+      rejoinJobId,
     }: VideoRunInput,
     runId: string,
     requestController: AbortController,
     pollController: AbortController,
   ): Promise<VideoGenerationResult> => {
-    const formData = new FormData();
-    formData.append("prompt", prompt);
-    formData.append("modelId", modelId);
-    formData.append("duration", String(duration));
-    formData.append("aspectRatio", aspectRatio);
-    formData.append("idempotencyKey", crypto.randomUUID());
-    if (projectId) formData.append("projectId", projectId);
-    if (referenceAssetIds[0]) formData.append("referenceAssetId", referenceAssetIds[0]);
-
     try {
-      const response = videoCreateResponseSchema.parse(
-        await request("/api/generate/video", {
-          method: "POST",
-          body: formData,
-          signal: requestController.signal,
-        }),
-      );
-      if (!registry.isCurrent(entryId, runId)) {
-        return { started: true, entryId, error: null, stale: true };
+      let jobId = rejoinJobId?.trim() || null;
+
+      if (!jobId) {
+        const formData = new FormData();
+        formData.append("prompt", prompt);
+        formData.append("modelId", modelId);
+        formData.append("duration", String(duration));
+        formData.append("aspectRatio", aspectRatio);
+        formData.append("idempotencyKey", crypto.randomUUID());
+        if (projectId) formData.append("projectId", projectId);
+        if (referenceAssetIds[0]) formData.append("referenceAssetId", referenceAssetIds[0]);
+
+        const response = videoCreateResponseSchema.parse(
+          await request("/api/generate/video", {
+            method: "POST",
+            body: formData,
+            signal: requestController.signal,
+          }),
+        );
+        if (!registry.isCurrent(entryId, runId)) {
+          return { started: true, entryId, error: null, stale: true };
+        }
+        jobId = response.jobId;
+        history.update(entryId, {
+          status: "running",
+          warnings: response.warnings ?? [],
+          jobId,
+          error: null,
+        });
+      } else {
+        if (!registry.isCurrent(entryId, runId)) {
+          return { started: true, entryId, error: null, stale: true };
+        }
+        history.update(entryId, { status: "running", error: null, jobId });
       }
-      history.update(entryId, { status: "running", warnings: response.warnings ?? [] });
-      void poll(entryId, runId, response.jobId, pollController);
+
+      void poll(entryId, runId, jobId, pollController);
       return { started: true, entryId, error: null, stale: false };
     } catch (error) {
       if (!registry.isCurrent(entryId, runId)) {
         return { started: true, entryId, error: null, stale: true };
       }
       const message = toErrorMessage(error, t("studio.videoFailed"));
-      history.update(entryId, { status: "failed", error: message });
+      history.update(entryId, { status: "failed", error: message, jobId: null });
       registry.finish(entryId, runId);
       return { started: true, entryId, error: message, stale: false };
     }
@@ -231,6 +273,7 @@ export function createVideoGenerationController({
       batchVariants: null,
       generationParameters: {},
       videoDuration: input.duration,
+      jobId: null,
     });
     const runId = createRunId();
     const requestController = new AbortController();
@@ -261,6 +304,7 @@ export function createVideoGenerationController({
       history.update(entryId, {
         status: aborted ? "canceled" : "failed",
         error: message,
+        jobId: null,
       });
       registry.finish(entryId, runId);
       return { started: true, entryId, error: message, stale: false };
@@ -290,6 +334,7 @@ export function createVideoGenerationController({
     if (!entry || entry.mode !== "video" || entry.videoDuration == null) {
       return { started: false };
     }
+    const rejoinJobId = entry.jobId;
     return run(
       {
         entryId,
@@ -299,8 +344,17 @@ export function createVideoGenerationController({
         aspectRatio: entry.aspectRatio,
         projectId: entry.projectId,
         referenceAssetIds: entry.referenceAssetIds,
+        rejoinJobId,
       },
-      () => history.update(entryId, { status: "running", error: null, assets: [] }),
+      () =>
+        history.update(entryId, {
+          status: "running",
+          error: null,
+          assets: [],
+          // Retain jobId across interrupt→retry rejoin; cleared only on
+          // authoritative failure / not-found.
+          jobId: rejoinJobId ?? null,
+        }),
     );
   };
 

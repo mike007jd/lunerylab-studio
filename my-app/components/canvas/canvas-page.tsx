@@ -1,71 +1,46 @@
 "use client";
 
-/** Canvas workspace: persisted Konva asset stage, editing tools, and Luna. */
+/**
+ * Canvas workspace: persisted Konva asset stage, editing tools, and Luna.
+ *
+ * This surface composes owners; it does not own canvas state. The write ledger
+ * holds dirty/pending facts, `useCanvasAuthoritativeSync` owns server truth and
+ * reconciliation, `useCanvasPersistenceCoordinator` owns every outbound write
+ * plus the flush/exit contract, and `useCanvasLayerLockBinding` wires the lock
+ * controller to both. Page-level state here is limited to what the chrome
+ * itself owns: layer selection and the agent dock.
+ */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import type { KonvaStageHandle, KonvaLayerItem } from "@/components/canvas/konva-stage";
-import type { CanvasDrawingState } from "@/lib/canvas/drawing-state";
-import { useCanvasSessionRefresh } from "@/components/canvas/use-canvas-session-refresh";
-import {
-  createLatestWriteQueue,
-  type LatestWriteQueue,
-} from "@/components/canvas/latest-write-queue";
+import type { KonvaStageHandle } from "@/components/canvas/konva-stage";
 import { hasFalImageEditBackend } from "@/components/canvas/image-edit-capability";
-import {
-  bindUnsavedCanvasGuard,
-  canClearDirtyGeometry,
-  canReportCanvasSaved,
-  canUseDrawingStateKeepalive,
-  deferDrawingQueueDisposal,
-} from "@/components/canvas/drawing-state-lifecycle";
 import { CanvasRouteState } from "@/components/canvas/canvas-route-state";
 import {
-  canvasExitFailureNotify,
-  createAuthoritativeFetchOwner,
-  createAuthoritativeResponseOrder,
-  isCanvasUnloadDirty,
-  reconcileAuthoritativeCanvasLayers,
-} from "@/components/canvas/canvas-authoritative-reconcile";
-import {
-  CANVAS_LAYER_LOCK_TIMEOUT_MS,
   createCanvasLayerLockController,
   type CanvasLayerLockController,
 } from "@/components/canvas/canvas-layer-lock";
 import { CanvasStageLoading } from "@/components/canvas/canvas-stage-loading";
 import { CanvasExportPopover } from "@/components/canvas/canvas-export-popover";
+import {
+  CanvasTextPromptDialog,
+  useCanvasTextPrompt,
+} from "@/components/canvas/canvas-text-prompt";
 import { COPY } from "@/components/canvas/canvas-copy";
 import {
-  PATCH_DEBOUNCE_MS,
-  PATCH_MAX_RETRIES,
-  mapLayers,
-} from "@/components/canvas/canvas-types";
-import type {
-  LayerGeometryPatch,
-  RawLayer,
-  SessionResponse,
-} from "@/components/canvas/canvas-types";
-import {
-  deleteCanvasLayer,
-  fetchCanvasSession,
-  isCanvasLayerLockedError,
-  patchCanvasLayer,
-  setCanvasLayerLocked,
-} from "@/lib/client/canvas-sessions";
+  createCanvasWriteLedger,
+  type CanvasWriteLedger,
+} from "@/components/canvas/canvas-write-ledger";
+import { useCanvasAuthoritativeSync } from "@/components/canvas/use-canvas-authoritative-sync";
+import { useCanvasExport } from "@/components/canvas/use-canvas-export";
+import { useCanvasLayerLockBinding } from "@/components/canvas/use-canvas-layer-lock-binding";
+import { useCanvasPersistenceCoordinator } from "@/components/canvas/use-canvas-persistence-coordinator";
 import { AgentChatPanel } from "@/components/studio/agent-chat-panel";
 import { useAgentChat } from "@/components/studio/agent-chat/use-agent-chat";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { ArrowLeft, Check, Loader2, Sparkles, Wand2, X } from "@/components/ui/icons";
-import { Textarea } from "@/components/ui/textarea";
 import {
   resolveSelectableImageModelId,
   useModelCatalog,
@@ -75,27 +50,6 @@ import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
 import { useCreativeCapabilityReadiness } from "@/hooks/use-creative-capability-readiness";
 import { resolveCanvasReturnTarget } from "@/lib/client/creation-flow";
-import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
-
-interface CanvasExportResponse {
-  exports: Array<{
-    id: string;
-    url: string;
-    presetId: string;
-    downloadName: string;
-  }>;
-}
-
-function downloadCanvasExports(exports: CanvasExportResponse["exports"]): void {
-  for (const item of exports) {
-    const anchor = document.createElement("a");
-    anchor.href = item.url;
-    anchor.download = item.downloadName;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-  }
-}
 
 // Konva is browser-only; load it on the client. We pass the imperative
 // handle as a `stageRef` prop because next/dynamic strips React refs.
@@ -106,17 +60,6 @@ const KonvaStage = dynamic(
     loading: CanvasStageLoading,
   },
 );
-
-interface DrawingStateWrite {
-  state: CanvasDrawingState;
-  epoch: number;
-}
-
-interface LayerPatchWrite {
-  patch: LayerGeometryPatch;
-}
-
-const CANVAS_WRITE_TIMEOUT_MS = 5_000;
 
 export function CanvasPage({ sessionId }: { sessionId: string }) {
   const router = useRouter();
@@ -145,308 +88,8 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
   const hasImageBackend = Boolean(activeImageModelId);
   const hasFalImageEditing = hasFalImageEditBackend(imageModels);
 
-  const [layers, setLayers] = useState<KonvaLayerItem[]>([]);
-  const layersRef = useRef<KonvaLayerItem[]>([]);
-  const [lockUiEpoch, setLockUiEpoch] = useState(0);
-  const [drawingState, setDrawingState] = useState<CanvasDrawingState | undefined>();
   const [selectedLayerId, setSelectedLayerId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  // Re-key session loading for retry without a full document reload.
-  const [reloadToken, setReloadToken] = useState(0);
-  const [exitPending, setExitPending] = useState(false);
-  const [exportBusy, setExportBusy] = useState(false);
-  const exitPendingRef = useRef(false);
-
   const stageRef = useRef<KonvaStageHandle | null>(null);
-
-  // Prevent inbound refreshes from clobbering annotations until the newest
-  // local drawing state has actually reached storage.
-  const drawingStateDirtyRef = useRef(false);
-  const drawingStateEpochRef = useRef(0);
-  const dirtyGeometryLayersRef = useRef<Set<string>>(new Set());
-  const geometrySaveFailuresRef = useRef<Set<string>>(new Set());
-  const pendingCreatedLayerIdsRef = useRef<Set<string>>(new Set());
-  const pendingDeletedLayerIdsRef = useRef<Set<string>>(new Set());
-
-  // Reflect debounced geometry and drawing-state writes without shifting layout.
-  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
-  const inFlightSavesRef = useRef(0);
-  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const markSavePending = useCallback(() => {
-    if (savedTimerRef.current) {
-      clearTimeout(savedTimerRef.current);
-      savedTimerRef.current = null;
-    }
-    setSaveStatus("saving");
-  }, []);
-  const beginSave = useCallback(() => {
-    inFlightSavesRef.current += 1;
-    markSavePending();
-  }, [markSavePending]);
-  const endSave = useCallback(() => {
-    inFlightSavesRef.current = Math.max(0, inFlightSavesRef.current - 1);
-    if (inFlightSavesRef.current === 0) {
-      // Failed or merely debounced writes remain dirty and must never produce
-      // a false positive "Saved" badge. Only the newest successful write for
-      // every persistence channel clears its dirty marker.
-      if (!canReportCanvasSaved({
-        inFlightWrites: inFlightSavesRef.current,
-        drawingStateDirty: drawingStateDirtyRef.current,
-        dirtyGeometryLayers: dirtyGeometryLayersRef.current.size,
-      })) {
-        setSaveStatus("idle");
-        return;
-      }
-      setSaveStatus("saved");
-      savedTimerRef.current = setTimeout(() => {
-        savedTimerRef.current = null;
-        setSaveStatus("idle");
-      }, 1800);
-    }
-  }, []);
-  useEffect(() => {
-    return () => {
-      if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
-    };
-  }, []);
-
-  const authoritativeFetchOwnerRef = useRef(createAuthoritativeFetchOwner());
-  const [authoritativeResponseOrder] = useState(createAuthoritativeResponseOrder);
-  const layerLockControllerRef = useRef<CanvasLayerLockController | null>(null);
-
-  useEffect(
-    () =>
-      bindUnsavedCanvasGuard({
-        windowTarget: window,
-        isDirty: () =>
-          isCanvasUnloadDirty({
-            drawingStateDirty: drawingStateDirtyRef.current,
-            dirtyGeometryLayers: dirtyGeometryLayersRef.current.size,
-            inFlightWrites: inFlightSavesRef.current,
-            pendingLockTransitions: Boolean(
-              layerLockControllerRef.current?.hasPendingTransitions(),
-            ),
-          }),
-      }),
-    [],
-  );
-
-  // Latest localized copy for callbacks whose deps stay [sessionId] (re-running
-  // on locale change would refetch / churn). Read .current at call time. Updated
-  // in an effect (not during render) so the refs-during-render lint stays happy;
-  // `copy` only changes identity on a locale switch, so this is effectively idle.
-  const copyRef = useRef(copy);
-  useEffect(() => {
-    copyRef.current = copy;
-  }, [copy]);
-  useEffect(() => {
-    layersRef.current = layers;
-  }, [layers]);
-
-  // One serialized writer owns drawingState persistence. While a request is in
-  // flight, repeated edits collapse to the newest state; an older response can
-  // therefore never land after and overwrite a newer one.
-  const drawingStateSaveQueueRef = useRef<LatestWriteQueue<DrawingStateWrite> | null>(null);
-  useEffect(() => {
-    const queue = createLatestWriteQueue<DrawingStateWrite>({
-      write: async ({ state }, signal) => {
-        const body = JSON.stringify({ drawingState: state });
-        const response = await fetch(
-          `/api/canvas/sessions/${encodeURIComponent(sessionId)}`,
-          {
-            method: "PATCH",
-            headers: { "content-type": "application/json" },
-            body,
-            signal,
-            // Browser keepalive is limited to small bodies. Oversized snapshots
-            // use the normal queue; explicit exits await it and window teardown
-            // is blocked while the latest state remains dirty.
-            keepalive: canUseDrawingStateKeepalive(body),
-          },
-        );
-        if (!response.ok) throw new Error(`status ${response.status}`);
-      },
-      maxRetries: PATCH_MAX_RETRIES,
-      retryDelayMs: (attempt) => PATCH_DEBOUNCE_MS * Math.min(attempt + 1, 5),
-      writeTimeoutMs: CANVAS_WRITE_TIMEOUT_MS,
-      onStart: beginSave,
-      onSettled: endSave,
-      onLatestSaved: ({ epoch }) => {
-        // A canvas edit may already be waiting inside the stage's debounce and
-        // therefore not be visible to the network queue yet.
-        if (drawingStateEpochRef.current === epoch) {
-          drawingStateDirtyRef.current = false;
-        }
-      },
-      onExhausted: () => {
-        toast.error(copyRef.current.toastSaveFailed);
-      },
-    });
-    drawingStateSaveQueueRef.current = queue;
-    return () => {
-      deferDrawingQueueDisposal(() => {
-        queue.close();
-        if (drawingStateSaveQueueRef.current === queue) {
-          drawingStateSaveQueueRef.current = null;
-        }
-      });
-    };
-  }, [sessionId, beginSave, endSave]);
-
-  // Per-layer debounced geometry persistence. A single drag/resize emits a
-  // stream of geometry changes; the old handler fired an immediate PATCH for
-  // each one, which could blow past the 60-req/min CRUD limit — and because it
-  // ignored the response, 429s/validation failures were swallowed and the
-  // optimistic canvas silently diverged from storage. We now coalesce to the
-  // latest patch per layer, flush after a short idle, check response.ok, and
-  // retry with backoff, surfacing a single error toast (not one per write) so
-  // layout changes are never lost silently.
-  const pendingPatchesRef = useRef<Map<string, LayerGeometryPatch>>(new Map());
-  const patchTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  const layerPatchQueuesRef = useRef<Map<string, LatestWriteQueue<LayerPatchWrite>>>(new Map());
-  // Holds the latest flush implementation so the stable scheduler can call it
-  // without a useCallback dependency cycle.
-  const flushLayerPatchRef = useRef<((layerId: string) => void) | undefined>(undefined);
-
-  // Lock/unlock is a durable write owned by a small session-scoped controller:
-  // synchronous interaction barrier → (lock) flush geometry → bounded PATCH →
-  // retain intent until an authoritative poll confirms. Unlock never exposes
-  // editable local state before the server confirms.
-  const [layerLockController] = useState<CanvasLayerLockController>(() =>
-    createCanvasLayerLockController(),
-  );
-  useEffect(() => {
-    layerLockControllerRef.current = layerLockController;
-  }, [layerLockController]);
-
-  const discardLayerPatchState = useCallback(
-    (layerId: string, options?: { closeQueue?: boolean }) => {
-      const timer = patchTimersRef.current.get(layerId);
-      if (timer) clearTimeout(timer);
-      patchTimersRef.current.delete(layerId);
-      pendingPatchesRef.current.delete(layerId);
-      dirtyGeometryLayersRef.current.delete(layerId);
-      geometrySaveFailuresRef.current.delete(layerId);
-      if (options?.closeQueue) {
-        layerPatchQueuesRef.current.get(layerId)?.close();
-        layerPatchQueuesRef.current.delete(layerId);
-      }
-    },
-    [],
-  );
-
-  const retireServerDeletedDirtyLayers = useCallback(
-    (serverDeletedDirtyIds: string[]) => {
-      for (const layerId of serverDeletedDirtyIds) {
-        discardLayerPatchState(layerId, { closeQueue: true });
-      }
-      if (serverDeletedDirtyIds.length > 0) {
-        const deleted = new Set(serverDeletedDirtyIds);
-        setSelectedLayerId((current) => (current && deleted.has(current) ? null : current));
-      }
-    },
-    [discardLayerPatchState],
-  );
-
-  const applyAuthoritativeLayers = useCallback(
-    (incomingRaw: RawLayer[]) => {
-      const incoming = mapLayers(incomingRaw);
-      const { nextLayers, serverDeletedDirtyIds } = reconcileAuthoritativeCanvasLayers({
-        current: layersRef.current,
-        incoming,
-        dirtyGeometryIds: dirtyGeometryLayersRef.current,
-        pendingCreatedIds: pendingCreatedLayerIdsRef.current,
-        pendingDeletedIds: pendingDeletedLayerIdsRef.current,
-        acknowledgeAuthoritativeLocks: (layers) =>
-          layerLockController.acknowledgeAuthoritativeLocks(layers),
-        lockIntents: layerLockController.lockIntents,
-      });
-      retireServerDeletedDirtyLayers(serverDeletedDirtyIds);
-      layersRef.current = nextLayers;
-      setLayers(nextLayers);
-    },
-    [layerLockController, retireServerDeletedDirtyLayers],
-  );
-
-  // Re-sync layer state from the server — used as the recovery path when an
-  // optimistic delete or lock write fails (so the UI never drifts from
-  // storage). Shares the same reconcile path and response-order authority as
-  // polling so a delayed pre-lock poll cannot land after a newer resync.
-  const resyncLayers = useCallback(async () => {
-    const request = authoritativeFetchOwnerRef.current.begin();
-    const orderToken = authoritativeResponseOrder.beginRecovery();
-    try {
-      const json = await fetchCanvasSession(sessionId, request.signal);
-      if (!request.isCurrent() || !orderToken.isCurrent()) return;
-      applyAuthoritativeLayers(json.session.layers);
-    } catch {
-      if (request.signal.aborted) return;
-      // Network still down — the save-failed toast already told the user.
-    } finally {
-      orderToken.finish();
-    }
-  }, [sessionId, applyAuthoritativeLayers, authoritativeResponseOrder]);
-
-  useEffect(() => {
-    const fetchOwner = authoritativeFetchOwnerRef.current;
-    fetchOwner.invalidate();
-    authoritativeResponseOrder.invalidate();
-    layerLockController.bindSession(sessionId);
-    layerLockController.configure({
-      flushPendingGeometry: async (layerId) => {
-        const timer = patchTimersRef.current.get(layerId);
-        if (timer) {
-          clearTimeout(timer);
-          patchTimersRef.current.delete(layerId);
-        }
-        flushLayerPatchRef.current?.(layerId);
-        const queue = layerPatchQueuesRef.current.get(layerId);
-        return queue ? queue.flush() : true;
-      },
-      persistLocked: (layerId, locked, signal) =>
-        setCanvasLayerLocked(sessionId, layerId, locked, signal),
-      getLocalLocked: (layerId) =>
-        Boolean(layersRef.current.find((layer) => layer.id === layerId)?.locked),
-      setLocalLocked: (layerId, locked) => {
-        // Keep the ref current inside the updater so a queued unlock in the
-        // same controller turn does not read a stale unlocked value and no-op.
-        setLayers((prev) => {
-          const next = prev.map((layer) =>
-            layer.id === layerId ? { ...layer, locked } : layer,
-          );
-          layersRef.current = next;
-          return next;
-        });
-      },
-      onFailure: () => {
-        toast.error(copyRef.current.toastLockLayerFailed);
-        void resyncLayers();
-      },
-      onTransitionChange: () => setLockUiEpoch((epoch) => epoch + 1),
-      timeoutMs: CANVAS_LAYER_LOCK_TIMEOUT_MS,
-    });
-    return () => {
-      fetchOwner.invalidate();
-      authoritativeResponseOrder.invalidate();
-      layerLockController.dispose();
-    };
-  }, [layerLockController, sessionId, resyncLayers, authoritativeResponseOrder]);
-
-  const handleToggleLayerLock = useCallback(
-    (layerId: string, locked: boolean) => {
-      void layerLockController.toggle(layerId, locked);
-    },
-    [layerLockController],
-  );
-
-  const isLayerLockPending = useCallback(
-    (layerId: string) => {
-      void lockUiEpoch;
-      return layerLockController.isPending(layerId);
-    },
-    [layerLockController, lockUiEpoch],
-  );
 
   // Agent chat — message state + SSE streaming + abort all live in useAgentChat
   // now (assistant-ui ExternalStoreRuntime is fed from it inside AgentChatPanel).
@@ -462,6 +105,56 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
   });
   const sendChatMessage = chat.sendMessage;
 
+  // Shared, component-scoped owners. The ledger is the one place local dirty
+  // state lives; the lock controller outlives any single session binding.
+  const [writeLedger] = useState<CanvasWriteLedger>(createCanvasWriteLedger);
+  const [layerLockController] = useState<CanvasLayerLockController>(
+    createCanvasLayerLockController,
+  );
+
+  // Selection is page chrome, so removals have to be released here.
+  const handleLayersRemoved = useCallback((removedIds: readonly string[]) => {
+    setSelectedLayerId((current) =>
+      current && removedIds.includes(current) ? null : current,
+    );
+  }, []);
+
+  const sync = useCanvasAuthoritativeSync({
+    sessionId,
+    ledger: writeLedger,
+    lockController: layerLockController,
+    copy,
+    // Only the agent mutates the canvas from outside this window.
+    pollWhenActive: chatOpen || chat.isRunning,
+    pollIntervalMs: chat.isRunning ? 3000 : 8000,
+    onLayersRemoved: handleLayersRemoved,
+  });
+  const { layers, drawingState, loading, error } = sync;
+
+  const persistence = useCanvasPersistenceCoordinator({
+    sessionId,
+    ledger: writeLedger,
+    lockController: layerLockController,
+    stageRef,
+    copy,
+    isLayerLocked: sync.isLayerLocked,
+    applyLocalDrawingState: sync.applyLocalDrawingState,
+    requestAuthoritativeResync: sync.resyncLayers,
+  });
+
+  const layerLock = useCanvasLayerLockBinding({
+    sessionId,
+    lockController: layerLockController,
+    copy,
+    flushPendingGeometry: persistence.flushPendingGeometry,
+    getLocalLocked: sync.isLayerLocked,
+    setLocalLocked: sync.setLayerLockedLocally,
+    requestAuthoritativeResync: sync.resyncLayers,
+  });
+
+  const canvasExport = useCanvasExport({ sessionId, stageRef, copy });
+  const { askText, prompt: textPrompt } = useCanvasTextPrompt();
+
   // Chat history outlives the layers it produced. Both the availability probe
   // and the focus action resolve against current layers, so a deleted layer's
   // thumbnail is marked unavailable rather than silently missing on click.
@@ -475,334 +168,21 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
     (assetId: string) => {
       const layer = layers.find((l) => l.assetId === assetId);
       if (!layer) {
-        toast.error(copyRef.current.toastAssetNotOnCanvas);
+        toast.error(copy.toastAssetNotOnCanvas);
         return;
       }
       setSelectedLayerId(layer.id);
     },
-    [layers],
+    [layers, copy],
   );
 
-  // In-canvas text prompt — replaces the native window.prompt (no styling, no
-  // focus management, blocks the main thread). `askText` opens a controlled
-  // shadcn Dialog and resolves with the trimmed value on confirm, or null on
-  // cancel / dismiss. One dialog instance is reused; concurrent calls are not
-  // expected (each is awaited from a user-gated button handler).
-  const [promptState, setPromptState] = useState<{
-    open: boolean;
-    title: string;
-    placeholder: string;
-    defaultValue: string;
-    required: boolean;
-    resolve: ((value: string | null) => void) | null;
-  }>({
-    open: false,
-    title: "",
-    placeholder: "",
-    defaultValue: "",
-    required: false,
-    resolve: null,
-  });
-  const [promptValue, setPromptValue] = useState("");
-  // Callback ref instead of a forwardRef on the shadcn Textarea (which is a
-  // plain function component and would drop a passed ref). We focus + select
-  // the element via this ref when the dialog opens.
-  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
-
-  const askText = useCallback(
-    (opts: {
-      title: string;
-      placeholder?: string;
-      defaultValue?: string;
-      required?: boolean;
-    }): Promise<string | null> =>
-      new Promise((resolve) => {
-        setPromptValue(opts.defaultValue ?? "");
-        setPromptState({
-          open: true,
-          title: opts.title,
-          placeholder: opts.placeholder ?? "",
-          defaultValue: opts.defaultValue ?? "",
-          required: opts.required ?? false,
-          resolve,
-        });
-      }),
-    [],
-  );
-
-  const closePrompt = useCallback(
-    (value: string | null) => {
-      promptState.resolve?.(value);
-      setPromptState((prev) => ({ ...prev, open: false, resolve: null }));
-    },
-    [promptState],
-  );
-
-  const confirmPrompt = useCallback(() => {
-    const trimmed = promptValue.trim();
-    if (promptState.required && !trimmed) return; // required + empty → no-op
-    closePrompt(trimmed);
-  }, [promptValue, promptState.required, closePrompt]);
-
-  // Focus the input when the dialog opens (Radix focuses DialogContent by
-  // default; we want the caret in the field).
-  useEffect(() => {
-    if (!promptState.open) return;
-    const id = window.setTimeout(() => {
-      promptInputRef.current?.focus();
-      promptInputRef.current?.select();
-    }, 0);
-    return () => window.clearTimeout(id);
-  }, [promptState.open]);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      setLoading(true);
-      setError(null);
-      try {
-        const json = await fetchCanvasSession(sessionId);
-        if (cancelled) return;
-        setLayers(mapLayers(json.session.layers));
-        setDrawingState(json.session.drawingState);
-      } catch (err) {
-        if (!cancelled) setError((err as Error).message || copyRef.current.loadFailedFallback);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, reloadToken]);
-
-  // Retry the session fetch without reloading the document.
-  const handleRetry = useCallback(() => {
-    setError(null);
-    setLoading(true);
-    setReloadToken((n) => n + 1);
-  }, []);
-
-  const shouldPollSession = !loading && !error && (chatOpen || chat.isRunning);
-
-  // Agent-driven inbound refresh (poll-on-visible). The stage's lastSyncedRef
-  // takes care of not stomping on the user's in-flight drag.
-  useCanvasSessionRefresh({
-    sessionId,
-    enabled: shouldPollSession,
-    intervalMs: chat.isRunning ? 3000 : 8000,
-    responseOrder: authoritativeResponseOrder,
-    onLayers: useCallback((next: RawLayer[]) => {
-      applyAuthoritativeLayers(next);
-    }, [applyAuthoritativeLayers]),
-    onSession: useCallback((session: SessionResponse["session"]) => {
-      // Skip the inbound snapshot while local annotations are unsaved, or it
-      // would silently delete them (H1). The next successful PATCH clears dirty
-      // and the following poll syncs normally.
-      if (drawingStateDirtyRef.current) return;
-      setDrawingState(session.drawingState);
-    }, []),
-  });
-
-  const getLayerPatchQueue = useCallback((layerId: string) => {
-    const existing = layerPatchQueuesRef.current.get(layerId);
-    if (existing) return existing;
-
-    const queue = createLatestWriteQueue<LayerPatchWrite>({
-      write: ({ patch }, signal) => patchCanvasLayer(sessionId, layerId, patch, signal),
-      // Geometry updates are partial. If x fails while a newer y is queued,
-      // the retry must carry both fields (with the newer value winning) or the
-      // failed field is silently lost.
-      mergePending: (older, newer) => ({
-        patch: { ...older.patch, ...newer.patch },
-      }),
-      maxRetries: PATCH_MAX_RETRIES,
-      retryDelayMs: (attempt) => PATCH_DEBOUNCE_MS * Math.min(attempt + 1, 5),
-      writeTimeoutMs: CANVAS_WRITE_TIMEOUT_MS,
-      isNonRetryableError: isCanvasLayerLockedError,
-      onStart: beginSave,
-      onSettled: endSave,
-      onLatestSaved: () => {
-        // A newer edit can still be waiting in the outer debounce even when
-        // the queue itself has no pending value. Keep the layer dirty until
-        // that newer patch also reaches storage.
-        if (!canClearDirtyGeometry(pendingPatchesRef.current.has(layerId))) return;
-        dirtyGeometryLayersRef.current.delete(layerId);
-        geometrySaveFailuresRef.current.delete(layerId);
-      },
-      onExhausted: (error) => {
-        if (isCanvasLayerLockedError(error)) {
-          discardLayerPatchState(layerId);
-          toast.error(copyRef.current.toastLockLayerFailed);
-          void resyncLayers();
-          return;
-        }
-        const shouldNotify = geometrySaveFailuresRef.current.size === 0;
-        geometrySaveFailuresRef.current.add(layerId);
-        if (shouldNotify) toast.error(copyRef.current.toastSaveFailed);
-      },
-    });
-    layerPatchQueuesRef.current.set(layerId, queue);
-    return queue;
-  }, [sessionId, beginSave, endSave, resyncLayers, discardLayerPatchState]);
-
-  const flushLayerPatch = useCallback((layerId: string) => {
-    patchTimersRef.current.delete(layerId);
-    const patch = pendingPatchesRef.current.get(layerId);
-    pendingPatchesRef.current.delete(layerId);
-    if (!patch || Object.keys(patch).length === 0) return;
-    getLayerPatchQueue(layerId).enqueue({ patch });
-  }, [getLayerPatchQueue]);
-
-  useEffect(() => {
-    flushLayerPatchRef.current = flushLayerPatch;
-  }, [flushLayerPatch]);
-
-  const flushAllCanvasWrites = useCallback(async (): Promise<{
-    ok: boolean;
-    notify: "save" | null;
-  }> => {
-    stageRef.current?.flushDrawingState();
-    for (const timer of patchTimersRef.current.values()) clearTimeout(timer);
-    patchTimersRef.current.clear();
-    for (const layerId of pendingPatchesRef.current.keys()) flushLayerPatch(layerId);
-    pendingPatchesRef.current.clear();
-
-    const queues = [
-      ...(drawingStateSaveQueueRef.current ? [drawingStateSaveQueueRef.current] : []),
-      ...layerPatchQueuesRef.current.values(),
-    ];
-    const outcomes = await Promise.all(queues.map((queue) => queue.flush()));
-    const queuesOk =
-      outcomes.every(Boolean) &&
-      !drawingStateDirtyRef.current &&
-      dirtyGeometryLayersRef.current.size === 0;
-    // Explicit in-app exit awaits bounded lock completion; unmount does not
-    // magically persist — dispose aborts, and window close stays guarded.
-    const locksOk = await layerLockController.awaitPendingTransitions();
-    return {
-      ok: queuesOk && locksOk,
-      notify: canvasExitFailureNotify({ locksOk, queuesOk }),
-    };
-  }, [flushLayerPatch, layerLockController]);
-
-  // In-app exits wait for drawing/geometry queues and pending lock transitions.
-  // Actual window teardown is separately guarded while any channel remains dirty.
+  // In-app exits wait for drawing/geometry queues and pending lock transitions
+  // before navigating; a failed drain keeps the user on the canvas.
   const handleExitToLibrary = useCallback(async () => {
-    if (exitPendingRef.current) return;
-    exitPendingRef.current = true;
-    setExitPending(true);
-    const result = await flushAllCanvasWrites();
-    if (!result.ok) {
-      if (result.notify === "save") {
-        toast.error(copyRef.current.toastSaveFailed);
-      }
-      exitPendingRef.current = false;
-      setExitPending(false);
-      return;
-    }
+    const drained = await persistence.flushForExit();
+    if (!drained) return;
     router.push(returnTarget.href);
-  }, [flushAllCanvasWrites, returnTarget.href, router]);
-
-  // User deleted an image layer inside the canvas — persist it so it doesn't
-  // resurrect on reload. Optimistic: local state updates immediately, a
-  // failed DELETE re-syncs from the server and tells the user.
-  const handleDeleteLayer = useCallback((layerId: string) => {
-    if (layerLockController.isInteractionBlocked(layerId)) return;
-    if (layersRef.current.find((layer) => layer.id === layerId)?.locked) return;
-    pendingCreatedLayerIdsRef.current.delete(layerId);
-    pendingDeletedLayerIdsRef.current.add(layerId);
-    discardLayerPatchState(layerId, { closeQueue: true });
-    setLayers((prev) => prev.filter((layer) => layer.id !== layerId));
-    setSelectedLayerId((prev) => (prev === layerId ? null : prev));
-    void (async () => {
-      try {
-        const resp = await deleteCanvasLayer(sessionId, layerId);
-        if (resp.status === 404) {
-          // Confirm current server truth instead of treating every 404 as proof
-          // the layer stayed absent; a concurrent undo may have re-created it.
-          pendingDeletedLayerIdsRef.current.delete(layerId);
-          await resyncLayers();
-          return;
-        }
-        if (!resp.ok) throw new Error(`status ${resp.status}`);
-      } catch {
-        pendingDeletedLayerIdsRef.current.delete(layerId);
-        toast.error(copyRef.current.toastDeleteLayerFailed);
-        void resyncLayers();
-      }
-    })();
-  }, [sessionId, resyncLayers, layerLockController, discardLayerPatchState]);
-
-  // Undo-of-delete / paste / duplicate re-materialised a layer shape without a
-  // Debounced patch — coalesce a stream of drag events into a single PATCH per
-  // layer. Stable identity (no deps): all mutable state lives in refs.
-  const handlePatchLayer = useCallback(async (layerId: string, patch: LayerGeometryPatch) => {
-    // The lock controller's barrier is the single gate for every mutation path
-    // (Konva, keyboard, DOM a11y). Do not admit new geometry once a transition
-    // has started — including during the lock flush window.
-    if (layerLockController.isInteractionBlocked(layerId)) return;
-    if (layersRef.current.find((layer) => layer.id === layerId)?.locked) return;
-    dirtyGeometryLayersRef.current.add(layerId);
-    markSavePending();
-    pendingPatchesRef.current.set(layerId, {
-      ...pendingPatchesRef.current.get(layerId),
-      ...patch,
-    });
-    const existing = patchTimersRef.current.get(layerId);
-    if (existing) clearTimeout(existing);
-    patchTimersRef.current.set(
-      layerId,
-      setTimeout(() => void flushLayerPatchRef.current?.(layerId), PATCH_DEBOUNCE_MS),
-    );
-  }, [markSavePending, layerLockController]);
-
-  // On unmount, flush any pending geometry so a quick navigate-away doesn't drop
-  // the last move (keepalive lets the PATCH outlive the page), and clear timers
-  // to avoid leaks / setState-after-unmount.
-  useEffect(() => {
-    const timers = patchTimersRef.current;
-    const pending = pendingPatchesRef.current;
-    const queues = layerPatchQueuesRef.current;
-    return () => {
-      for (const timer of timers.values()) clearTimeout(timer);
-      timers.clear();
-      // Enqueue through the same per-layer serial writer. A direct keepalive
-      // request here could overtake an older in-flight PATCH and then be
-      // overwritten by that older response.
-      for (const layerId of pending.keys()) {
-        flushLayerPatchRef.current?.(layerId);
-      }
-      pending.clear();
-      for (const queue of queues.values()) queue.close();
-      queues.clear();
-    };
-  }, [sessionId]);
-
-  const handleDrawingStateChange = useCallback(
-    (next: CanvasDrawingState) => {
-      // Mark dirty before enqueueing so any poll firing during persistence
-      // skips the inbound snapshot.
-      drawingStateDirtyRef.current = true;
-      setDrawingState(next);
-      drawingStateSaveQueueRef.current?.enqueue({
-        state: next,
-        epoch: drawingStateEpochRef.current,
-      });
-    },
-    [],
-  );
-
-  const handleDrawingStateDirty = useCallback(() => {
-    drawingStateDirtyRef.current = true;
-    drawingStateEpochRef.current += 1;
-    if (savedTimerRef.current) {
-      clearTimeout(savedTimerRef.current);
-      savedTimerRef.current = null;
-    }
-    setSaveStatus("saving");
-  }, []);
+  }, [persistence, returnTarget.href, router]);
 
   // Inpaint the masked region: produce the b/w mask PNG via Konva export,
   // upload it as a temporary token, then dispatch a chat message so the agent's
@@ -893,46 +273,6 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
     );
   }, [selectedLayerId, sendChatMessage, copy, chat.isRunning]);
 
-  const exportCanvas = useCallback(async (
-    mode: "original" | "platforms",
-    presetIds: string[] = [],
-  ): Promise<boolean> => {
-    if (exportBusy) return false;
-    const composition = await stageRef.current?.exportComposition();
-    if (!composition?.ok) {
-      toast.error(composition?.reason === "empty" ? copy.exportEmptyTooltip : copy.exportUnavailable);
-      return false;
-    }
-    setExportBusy(true);
-    try {
-      const formData = new FormData();
-      formData.append("source", composition.blob, `canvas-${sessionId}.png`);
-      formData.append("mode", mode);
-      presetIds.forEach((presetId) => formData.append("presetIds", presetId));
-      const response = await fetchJson<CanvasExportResponse>(
-        `/api/canvas/sessions/${encodeURIComponent(sessionId)}/export`,
-        { method: "POST", body: formData },
-      );
-      downloadCanvasExports(response.exports);
-      toast.success(copy.exportComplete);
-      return true;
-    } catch (exportError) {
-      toast.error(toErrorMessage(exportError, copy.exportFailed));
-      return false;
-    } finally {
-      setExportBusy(false);
-    }
-  }, [copy, exportBusy, sessionId]);
-
-  const handleExportOriginal = useCallback(
-    () => exportCanvas("original"),
-    [exportCanvas],
-  );
-  const handleExportPlatforms = useCallback(
-    (presetIds: string[]) => exportCanvas("platforms", presetIds),
-    [exportCanvas],
-  );
-
   // These two tools currently have a Fal-only server implementation. Gate on
   // a connected Fal catalog row instead of any image model, which
   // would advertise actions that deterministically fail for local/OpenAI-only
@@ -944,10 +284,15 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
         description={error}
         tone="danger"
       >
-        <Button type="button" variant="accent" onClick={handleRetry}>
+        <Button type="button" variant="accent" onClick={sync.retry}>
           {copy.retry}
         </Button>
-        <Button type="button" variant="outline" loading={exitPending} onClick={handleExitToLibrary}>
+        <Button
+          type="button"
+          variant="outline"
+          loading={persistence.exitPending}
+          onClick={handleExitToLibrary}
+        >
           {returnLabel}
         </Button>
       </CanvasRouteState>
@@ -971,12 +316,12 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
         drawingState={drawingState}
         selectedLayerId={selectedLayerId}
         onSelectLayer={setSelectedLayerId}
-        onPatchLayer={handlePatchLayer}
-        onDeleteLayer={handleDeleteLayer}
-        onToggleLock={handleToggleLayerLock}
-        isLockPending={isLayerLockPending}
-        onDrawingStateDirty={handleDrawingStateDirty}
-        onDrawingStateChange={handleDrawingStateChange}
+        onPatchLayer={persistence.patchLayerGeometry}
+        onDeleteLayer={sync.deleteLayer}
+        onToggleLock={layerLock.toggleLayerLock}
+        isLockPending={layerLock.isLayerLockPending}
+        onDrawingStateDirty={persistence.handleDrawingStateDirty}
+        onDrawingStateChange={persistence.handleDrawingStateChange}
       />
 
       {/* Persistent exit — canvas chrome has no app navigation, so without this
@@ -988,7 +333,7 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
           size="sm"
           variant="outline"
           className="pointer-events-auto shadow-md"
-          loading={exitPending}
+          loading={persistence.exitPending}
           onClick={handleExitToLibrary}
         >
           <ArrowLeft className="h-3.5 w-3.5" />
@@ -997,11 +342,11 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
         <div className="pointer-events-auto">
           <CanvasExportPopover
             disabled={!layers.some((layer) => !layer.hidden)}
-            busy={exportBusy}
+            busy={canvasExport.exportBusy}
             isChinese={locale.startsWith("zh")}
             copy={copy}
-            onExportOriginal={handleExportOriginal}
-            onExportPlatforms={handleExportPlatforms}
+            onExportOriginal={canvasExport.exportOriginal}
+            onExportPlatforms={canvasExport.exportPlatforms}
           />
         </div>
         {/* Fixed width prevents save-status changes from shifting the toolbar. */}
@@ -1010,12 +355,12 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
           style={{ minWidth: "5.5rem" }}
           aria-live="polite"
         >
-          {saveStatus === "saving" ? (
+          {persistence.saveStatus === "saving" ? (
             <span className="flex items-center gap-1.5 text-(--text-muted)">
               <Loader2 className="h-3 w-3 animate-spin" />
               {copy.saving}
             </span>
-          ) : saveStatus === "saved" ? (
+          ) : persistence.saveStatus === "saved" ? (
             <span className="flex items-center gap-1.5 text-(--success)">
               <Check className="h-3 w-3" />
               {copy.saved}
@@ -1046,7 +391,12 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
                   <Sparkles className="h-4 w-4" />
                   {copy.noLayersPrimaryCta}
                 </Button>
-                <Button type="button" variant="outline" loading={exitPending} onClick={handleExitToLibrary}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  loading={persistence.exitPending}
+                  onClick={handleExitToLibrary}
+                >
                   {copy.library}
                 </Button>
               </div>
@@ -1071,7 +421,12 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
                     </Button>
                   ) : null}
                 </div>
-                <Button type="button" variant="outline" loading={exitPending} onClick={handleExitToLibrary}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  loading={persistence.exitPending}
+                  onClick={handleExitToLibrary}
+                >
                   {returnLabel}
                 </Button>
               </div>
@@ -1199,50 +554,7 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
         </div>
       </div>
 
-      {/* In-canvas prompt for the inpaint description. */}
-      <Dialog
-        open={promptState.open}
-        onOpenChange={(open) => {
-          // Closing via Escape / overlay / X resolves the pending askText with
-          // null (treated as cancel).
-          if (!open) closePrompt(null);
-        }}
-      >
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>{promptState.title}</DialogTitle>
-          </DialogHeader>
-          <Textarea
-            ref={(el) => {
-              promptInputRef.current = el;
-            }}
-            value={promptValue}
-            onChange={(e) => setPromptValue(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                confirmPrompt();
-              }
-            }}
-            placeholder={promptState.placeholder}
-            rows={3}
-            className="resize-none"
-          />
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => closePrompt(null)}>
-              {copy.cancel}
-            </Button>
-            <Button
-              type="button"
-              variant="accent"
-              onClick={confirmPrompt}
-              disabled={promptState.required && !promptValue.trim()}
-            >
-              {copy.confirm}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <CanvasTextPromptDialog prompt={textPrompt} copy={copy} />
     </div>
   );
 }

@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ApiError, jsonError } from "@/lib/server/errors";
-import { assertRequestContentLength, validateFiles, withAssetWriteTransaction } from "@/lib/server/file-validation";
+import {
+  assertRequestContentLength,
+  prepareImageFiles,
+  withAssetWriteTransaction,
+} from "@/lib/server/file-validation";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { deleteStoredFile, writeReferenceFile } from "@/lib/server/storage";
 import { toAssetDTO } from "@/lib/server/dto";
@@ -29,9 +33,17 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    await validateFiles([file], { maxFiles: 1 });
-
-    const stored = await writeReferenceFile(file);
+    const preparedFiles = await prepareImageFiles([file], { maxFiles: 1 });
+    const prepared = preparedFiles[0];
+    if (!prepared) {
+      throw new ApiError({
+        status: 400,
+        code: "invalid_request",
+        message: "A non-empty file is required.",
+        retryable: false,
+      });
+    }
+    const stored = await writeReferenceFile(prepared);
 
     const asset = await withAssetWriteTransaction(async (tx) => {
       // Every asset is attached to a generation job by schema contract.

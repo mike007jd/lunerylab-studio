@@ -297,6 +297,7 @@ export function createImageGenerationController({
       batchVariants: input.batchVariants,
       generationParameters: input.generationParameters,
       videoDuration: null,
+      jobId: null,
     });
     const runId = createRunId();
     const requestController = new AbortController();

@@ -6,11 +6,13 @@ import path from "node:path";
 import { APP_VERSION } from "@/lib/app-version";
 import { prisma } from "@/lib/server/prisma";
 import {
+  getStoredFileMetadata,
   listStoredRelativePaths,
   readStoredFile,
 } from "@/lib/server/storage";
 import { ApiError } from "@/lib/server/errors";
 import { luneryConfigDir, luneryMediaDir } from "@/lib/server/lunery-profile";
+import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
 
 /**
  * Workspace backup / restore.
@@ -31,7 +33,8 @@ import { luneryConfigDir, luneryMediaDir } from "@/lib/server/lunery-profile";
 export const BACKUP_FORMAT = "lunery-workspace-backup";
 export const BACKUP_VERSION = 2;
 /** Bump alongside any prisma/migrations change so a stale backup can't restore. */
-export const CURRENT_SCHEMA_VERSION = "20260601000000_initial";
+export const CURRENT_SCHEMA_VERSION =
+  "20260601000000_initial.reference-set-default-v2";
 
 // Prisma model delegates, listed so a parent is always created before its
 // children on restore. Circular / self nullable FKs are stripped on first insert
@@ -106,8 +109,14 @@ function assertRelativeBackupPath(value: string, allowedRoots?: ReadonlySet<stri
   return normalized;
 }
 
-async function listDirectoryFiles(root: string): Promise<Array<{ path: string; bytes: Buffer }>> {
-  const files: Array<{ path: string; bytes: Buffer }> = [];
+interface BackupFileCandidate {
+  path: string;
+  absolutePath: string;
+  bytes: number;
+}
+
+async function listDirectoryFileCandidates(root: string): Promise<BackupFileCandidate[]> {
+  const files: BackupFileCandidate[] = [];
   async function visit(dir: string, prefix: string): Promise<void> {
     let entries: import("node:fs").Dirent[];
     try {
@@ -120,12 +129,52 @@ async function listDirectoryFiles(root: string): Promise<Array<{ path: string; b
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
       const absolute = path.join(dir, entry.name);
       if (entry.isDirectory()) await visit(absolute, relative);
-      else if (entry.isFile()) files.push({ path: relative, bytes: await fs.readFile(absolute) });
+      else if (entry.isFile()) {
+        const metadata = await fs.stat(absolute);
+        files.push({ path: relative, absolutePath: absolute, bytes: metadata.size });
+      }
       else throw new Error(`Unsupported config entry in backup: ${relative}`);
     }
   }
   await visit(root, "");
   return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function backupTooLarge(message: string): never {
+  throw new ApiError({
+    status: 413,
+    code: "backup_too_large",
+    message,
+    retryable: false,
+  });
+}
+
+function base64EncodedLength(bytes: number): number {
+  return 4 * Math.ceil(bytes / 3);
+}
+
+function assertBackupFileBudget(
+  candidates: ReadonlyArray<{ path: string; bytes: number }>,
+): void {
+  if (candidates.length > WORKSPACE_RESTORE_LIMITS.maxPayloadCount) {
+    backupTooLarge(
+      `Workspace has more than ${WORKSPACE_RESTORE_LIMITS.maxPayloadCount} backup files.`,
+    );
+  }
+  let aggregate = 0;
+  for (const candidate of candidates) {
+    if (candidate.bytes > WORKSPACE_RESTORE_LIMITS.maxPerFileDecodedBytes) {
+      backupTooLarge(
+        `${candidate.path} exceeds the ${WORKSPACE_RESTORE_LIMITS.maxPerFileDecodedBytes} byte JSON backup limit.`,
+      );
+    }
+    aggregate += candidate.bytes;
+    if (aggregate > WORKSPACE_RESTORE_LIMITS.maxAggregateDecodedBytes) {
+      backupTooLarge(
+        `Workspace files exceed the ${WORKSPACE_RESTORE_LIMITS.maxAggregateDecodedBytes} byte JSON backup limit.`,
+      );
+    }
+  }
 }
 
 function delegate(model: ModelName) {
@@ -146,29 +195,57 @@ function delegate(model: ModelName) {
 export async function exportWorkspaceBackup(createdAt: string): Promise<WorkspaceBackup> {
   const data: WorkspaceBackup["data"] = {};
   const counts: Record<string, number> = {};
+  let totalRows = 0;
+  for (const model of RESTORE_ORDER) {
+    const count = await delegate(model).count();
+    if (count > WORKSPACE_RESTORE_LIMITS.maxPerModelRows) {
+      backupTooLarge(
+        `${model} exceeds the ${WORKSPACE_RESTORE_LIMITS.maxPerModelRows} row JSON backup limit.`,
+      );
+    }
+    totalRows += count;
+    if (totalRows > WORKSPACE_RESTORE_LIMITS.maxTotalRows) {
+      backupTooLarge(
+        `Workspace exceeds the ${WORKSPACE_RESTORE_LIMITS.maxTotalRows} row JSON backup limit.`,
+      );
+    }
+    counts[model] = count;
+  }
+
+  totalRows = 0;
   for (const model of RESTORE_ORDER) {
     const rows = await delegate(model).findMany();
+    if (rows.length > WORKSPACE_RESTORE_LIMITS.maxPerModelRows) {
+      backupTooLarge(
+        `${model} changed beyond the ${WORKSPACE_RESTORE_LIMITS.maxPerModelRows} row JSON backup limit.`,
+      );
+    }
+    totalRows += rows.length;
+    if (totalRows > WORKSPACE_RESTORE_LIMITS.maxTotalRows) {
+      backupTooLarge(
+        `Workspace changed beyond the ${WORKSPACE_RESTORE_LIMITS.maxTotalRows} row JSON backup limit.`,
+      );
+    }
     data[model] = rows;
     counts[model] = rows.length;
   }
 
-  const media: WorkspaceBackup["media"] = [];
-  const mediaManifest: WorkspaceBackup["manifest"]["media"] = [];
-  for (const path of await listStoredRelativePaths()) {
-    const { file } = await readStoredFile(path);
-    media.push({ path, base64: file.toString("base64") });
-    mediaManifest.push({ path, sha256: sha256(file), bytes: file.byteLength });
+  const mediaPaths = await listStoredRelativePaths();
+  const mediaCandidates: Array<{ path: string; bytes: number }> = [];
+  for (const storagePath of mediaPaths) {
+    const metadata = await getStoredFileMetadata(storagePath);
+    mediaCandidates.push({
+      path: storagePath,
+      bytes: metadata.byteSize,
+    });
   }
+  const configCandidates = await listDirectoryFileCandidates(luneryConfigDir());
+  const fileCandidates = [...mediaCandidates, ...configCandidates];
+  assertBackupFileBudget(fileCandidates);
 
-  const configFiles = await listDirectoryFiles(luneryConfigDir());
-  const config = configFiles.map((entry) => ({ path: entry.path, base64: entry.bytes.toString("base64") }));
-  const configManifest = configFiles.map((entry) => ({
-    path: entry.path,
-    sha256: sha256(entry.bytes),
-    bytes: entry.bytes.byteLength,
-  }));
-
-  return {
+  const dataSha256 = dataChecksum(data);
+  const placeholderSha = "0".repeat(64);
+  const backupSkeleton: WorkspaceBackup = {
     manifest: {
       format: BACKUP_FORMAT,
       version: BACKUP_VERSION,
@@ -176,7 +253,71 @@ export async function exportWorkspaceBackup(createdAt: string): Promise<Workspac
       schemaVersion: CURRENT_SCHEMA_VERSION,
       createdAt,
       counts,
-      dataSha256: dataChecksum(data),
+      dataSha256,
+      media: mediaCandidates.map((entry) => ({
+        path: entry.path,
+        sha256: placeholderSha,
+        bytes: entry.bytes,
+      })),
+      config: configCandidates.map((entry) => ({
+        path: entry.path,
+        sha256: placeholderSha,
+        bytes: entry.bytes,
+      })),
+      excluded: ["keychain-secrets", "models", "logs", "runtime-temp"],
+    },
+    data,
+    media: mediaCandidates.map((entry) => ({ path: entry.path, base64: "" })),
+    config: configCandidates.map((entry) => ({ path: entry.path, base64: "" })),
+  };
+  const predictedWireBytes =
+    Buffer.byteLength(JSON.stringify({ backup: backupSkeleton, confirm: true })) +
+    fileCandidates.reduce((sum, entry) => sum + base64EncodedLength(entry.bytes), 0);
+  if (predictedWireBytes > WORKSPACE_RESTORE_LIMITS.maxEncodedBytes) {
+    backupTooLarge(
+      `Workspace exceeds the ${WORKSPACE_RESTORE_LIMITS.maxEncodedBytes} byte JSON restore envelope.`,
+    );
+  }
+
+  const media: WorkspaceBackup["media"] = [];
+  const mediaManifest: WorkspaceBackup["manifest"]["media"] = [];
+  for (const candidate of mediaCandidates) {
+    const { file } = await readStoredFile(candidate.path);
+    if (file.byteLength !== candidate.bytes) {
+      backupTooLarge(`Workspace file changed while backup was being prepared: ${candidate.path}.`);
+    }
+    media.push({ path: candidate.path, base64: file.toString("base64") });
+    mediaManifest.push({
+      path: candidate.path,
+      sha256: sha256(file),
+      bytes: file.byteLength,
+    });
+  }
+
+  const config: WorkspaceBackup["config"] = [];
+  const configManifest: WorkspaceBackup["manifest"]["config"] = [];
+  for (const candidate of configCandidates) {
+    const bytes = await fs.readFile(candidate.absolutePath);
+    if (bytes.byteLength !== candidate.bytes) {
+      backupTooLarge(`Workspace config changed while backup was being prepared: ${candidate.path}.`);
+    }
+    config.push({ path: candidate.path, base64: bytes.toString("base64") });
+    configManifest.push({
+      path: candidate.path,
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    });
+  }
+
+  const backup: WorkspaceBackup = {
+    manifest: {
+      format: BACKUP_FORMAT,
+      version: BACKUP_VERSION,
+      appVersion: APP_VERSION,
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      createdAt,
+      counts,
+      dataSha256,
       media: mediaManifest,
       config: configManifest,
       excluded: ["keychain-secrets", "models", "logs", "runtime-temp"],
@@ -185,6 +326,15 @@ export async function exportWorkspaceBackup(createdAt: string): Promise<Workspac
     media,
     config,
   };
+  if (
+    Buffer.byteLength(JSON.stringify({ backup, confirm: true })) >
+    WORKSPACE_RESTORE_LIMITS.maxEncodedBytes
+  ) {
+    backupTooLarge(
+      `Workspace changed beyond the ${WORKSPACE_RESTORE_LIMITS.maxEncodedBytes} byte JSON restore envelope.`,
+    );
+  }
+  return backup;
 }
 
 function integrityError(code: string, message: string): never {

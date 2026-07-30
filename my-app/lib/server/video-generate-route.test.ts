@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   assertVideoGenerationPrismaSupport: vi.fn(),
   assertRequestContentLength: vi.fn(),
   parseFormData: vi.fn(),
-  validateFiles: vi.fn(),
+  prepareImageFiles: vi.fn(),
   ensureAppState: vi.fn(),
   resolveVideoModelEntry: vi.fn(),
   resolveVideoRuntime: vi.fn(),
@@ -28,7 +28,7 @@ vi.mock("@/lib/server/prisma", () => ({
 }));
 vi.mock("@/lib/server/file-validation", () => ({
   assertRequestContentLength: mocks.assertRequestContentLength,
-  validateFiles: mocks.validateFiles,
+  prepareImageFiles: mocks.prepareImageFiles,
 }));
 vi.mock("@/lib/server/http-validation", () => ({
   parseFormData: mocks.parseFormData,
@@ -105,7 +105,7 @@ describe("POST /api/generate/video", () => {
     mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
     mocks.assertVideoGenerationPrismaSupport.mockReturnValue(undefined);
     mocks.parseFormData.mockImplementation(async (request: Request) => request.formData());
-    mocks.validateFiles.mockResolvedValue(undefined);
+    mocks.prepareImageFiles.mockResolvedValue([]);
     mocks.ensureAppState.mockResolvedValue(undefined);
     mocks.resolveOwnedProjectId.mockResolvedValue(null);
     mocks.createRouteTelemetry.mockReturnValue({

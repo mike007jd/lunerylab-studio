@@ -6,6 +6,7 @@ import sharp from "sharp";
 
 vi.mock("server-only", () => ({}));
 
+import { prepareImageFiles } from "@/lib/server/file-validation";
 import { writeGeneratedImage, writeReferenceFile } from "@/lib/server/storage";
 
 let tmpDir: string;
@@ -35,13 +36,17 @@ it("stores the EXIF-corrected dimensions for rotated phone photos", async () => 
   // Orientation 6 = rotate 90° clockwise on display; browsers render 1080x1920.
   const bytes = await sharp(encoded).withMetadata({ orientation: 6 }).jpeg().toBuffer();
 
-  const uploaded = await writeReferenceFile(
-    new File(
-      [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
-      "portrait.jpg",
-      { type: "application/octet-stream" },
-    ),
+  const [prepared] = await prepareImageFiles(
+    [
+      new File(
+        [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
+        "portrait.jpg",
+        { type: "application/octet-stream" },
+      ),
+    ],
+    { maxFiles: 1 },
   );
+  const uploaded = await writeReferenceFile(prepared!);
 
   expect(uploaded).toMatchObject({ mimeType: "image/jpeg", width: 1080, height: 1920 });
 });
@@ -63,13 +68,17 @@ describe.each([
       .toFormat(format)
       .toBuffer();
 
-    const uploaded = await writeReferenceFile(
-      new File(
-        [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
-        `wide.${format}`,
-        { type: "application/octet-stream" },
-      ),
+    const [prepared] = await prepareImageFiles(
+      [
+        new File(
+          [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
+          `wide.${format}`,
+          { type: "application/octet-stream" },
+        ),
+      ],
+      { maxFiles: 1 },
     );
+    const uploaded = await writeReferenceFile(prepared!);
     const generated = await writeGeneratedImage({
       bytes,
       projectId: "project-1",

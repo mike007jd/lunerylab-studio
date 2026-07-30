@@ -6,7 +6,7 @@ import { ensureAppState } from "@/lib/server/app-state";
 import { normalizeDuration } from "@/lib/video-models";
 import {
   assertRequestContentLength,
-  validateFiles,
+  prepareImageFiles,
 } from "@/lib/server/file-validation";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
@@ -18,10 +18,10 @@ import { resolveVideoRuntime } from "@/lib/server/video-runtime";
 import {
   buildRequestFingerprint,
   getUploadedFiles,
+  preparedImageFingerprint,
   resolveOwnedProjectId,
   trimFormString,
   trimFormStringOrNull,
-  uploadedFileFingerprint,
 } from "@/lib/server/generate-request";
 import { failRunningGenerationJob } from "@/lib/server/generation-job";
 import {
@@ -72,8 +72,8 @@ export async function POST(request: NextRequest) {
     const providedProjectId = trimFormString(formData, "projectId");
     const referenceAssetId = trimFormStringOrNull(formData, "referenceAssetId");
     const referenceImageFiles = getUploadedFiles(formData, "referenceImage");
-    await validateFiles(referenceImageFiles, { maxFiles: 1 });
-    const referenceImage = referenceImageFiles[0] ?? null;
+    const preparedReferenceImages = await prepareImageFiles(referenceImageFiles, { maxFiles: 1 });
+    const referenceImage = preparedReferenceImages[0] ?? null;
     const aspectRatio = trimFormString(formData, "aspectRatio") || undefined;
     const idempotencyKey = trimFormStringOrNull(formData, "idempotencyKey");
 
@@ -126,7 +126,7 @@ export async function POST(request: NextRequest) {
       aspectRatio: aspectRatio ?? null,
       projectId: resolvedProjectId,
       referenceAssetId,
-      referenceImage: uploadedFileFingerprint(referenceImage),
+      referenceImage: preparedImageFingerprint(referenceImage),
     });
 
     const created = await createOrReplayGenerationJob({

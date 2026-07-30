@@ -8,6 +8,7 @@ vi.mock("server-only", () => ({}));
 const mocks = vi.hoisted(() => ({
   models: {} as Record<string, {
     findMany: ReturnType<typeof vi.fn>;
+    count: ReturnType<typeof vi.fn>;
     createMany: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
     updateMany: ReturnType<typeof vi.fn>;
@@ -15,12 +16,14 @@ const mocks = vi.hoisted(() => ({
   }>,
   transaction: vi.fn(),
   listStoredRelativePaths: vi.fn(),
+  getStoredFileMetadata: vi.fn(),
   readStoredFile: vi.fn(),
 }));
 
 function makeModel() {
   return {
     findMany: vi.fn().mockResolvedValue([]),
+    count: vi.fn().mockResolvedValue(0),
     createMany: vi.fn().mockResolvedValue({}),
     update: vi.fn().mockResolvedValue({}),
     updateMany: vi.fn().mockResolvedValue({}),
@@ -41,6 +44,7 @@ vi.mock("@/lib/server/prisma", () => {
 
 vi.mock("@/lib/server/storage", () => ({
   listStoredRelativePaths: mocks.listStoredRelativePaths,
+  getStoredFileMetadata: mocks.getStoredFileMetadata,
   readStoredFile: mocks.readStoredFile,
 }));
 
@@ -53,6 +57,8 @@ import {
   verifyBackupIntegrity,
   type WorkspaceBackup,
 } from "@/lib/server/workspace-backup";
+import { assertRestorePayloadLimits } from "@/lib/server/workspace-restore-limits";
+import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
 import { createHash } from "node:crypto";
 
 let testRoot = "";
@@ -61,6 +67,10 @@ beforeEach(async () => {
   vi.clearAllMocks();
   for (const key of Object.keys(mocks.models)) delete mocks.models[key];
   mocks.listStoredRelativePaths.mockResolvedValue([]);
+  mocks.getStoredFileMetadata.mockResolvedValue({
+    byteSize: 0,
+    mimeType: "application/octet-stream",
+  });
   testRoot = await fs.mkdtemp(path.join(tmpdir(), "lunery-backup-test-"));
   vi.stubEnv("LUNERY_CONFIG_DIR", path.join(testRoot, "config"));
   vi.stubEnv("LUNERY_MEDIA_DIR", path.join(testRoot, "media"));
@@ -135,6 +145,10 @@ describe("exportWorkspaceBackup", () => {
   it("includes a manifest excluding keychain secrets and media checksums", async () => {
     const bytes = Buffer.from("hello");
     mocks.listStoredRelativePaths.mockResolvedValue(["generated/a.png", "uploads/ref.jpg"]);
+    mocks.getStoredFileMetadata.mockImplementation(async (storagePath: string) => ({
+      byteSize: storagePath === "generated/a.png" ? 5 : 3,
+      mimeType: "image/png",
+    }));
     mocks.readStoredFile.mockImplementation(async (storagePath: string) => ({
       file: storagePath === "generated/a.png" ? bytes : Buffer.from("ref"),
     }));
@@ -160,6 +174,39 @@ describe("exportWorkspaceBackup", () => {
     ]);
     expect(backup.media.map((entry) => entry.path)).toEqual(["generated/a.png", "uploads/ref.jpg"]);
     expect(mocks.readStoredFile).toHaveBeenCalledTimes(2);
+    expect(() => assertRestorePayloadLimits(backup)).not.toThrow();
+    expect(
+      Buffer.byteLength(JSON.stringify({ backup, confirm: true })),
+    ).toBeLessThanOrEqual(WORKSPACE_RESTORE_LIMITS.maxEncodedBytes);
+  });
+
+  it("rejects one oversized file from metadata before reading bytes", async () => {
+    mocks.listStoredRelativePaths.mockResolvedValue(["generated/huge.mp4"]);
+    mocks.getStoredFileMetadata.mockResolvedValue({
+      byteSize: WORKSPACE_RESTORE_LIMITS.maxPerFileDecodedBytes + 1,
+      mimeType: "video/mp4",
+    });
+
+    await expect(
+      exportWorkspaceBackup("2026-07-15T00:00:00.000Z"),
+    ).rejects.toMatchObject({ status: 413, code: "backup_too_large" });
+    expect(mocks.readStoredFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects aggregate media overflow from metadata before reading bytes", async () => {
+    mocks.listStoredRelativePaths.mockResolvedValue([
+      "generated/a.mp4",
+      "generated/b.mp4",
+    ]);
+    mocks.getStoredFileMetadata.mockResolvedValue({
+      byteSize: 50 * 1024 * 1024,
+      mimeType: "video/mp4",
+    });
+
+    await expect(
+      exportWorkspaceBackup("2026-07-15T00:00:00.000Z"),
+    ).rejects.toMatchObject({ status: 413, code: "backup_too_large" });
+    expect(mocks.readStoredFile).not.toHaveBeenCalled();
   });
 });
 

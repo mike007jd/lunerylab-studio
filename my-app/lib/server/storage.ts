@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import { lookup as lookupMime } from "mime-types";
 import { ApiError } from "@/lib/server/errors";
 import { sniffImageMime } from "@/lib/server/byok-shared";
+import type { PreparedImage } from "@/lib/server/file-validation";
 import { assertImageByteSize, safeSharp } from "@/lib/server/image-safety";
 import { extensionFromMime } from "@/lib/mime";
 import { sniff3dModelMime, sniffVideoMime } from "@/lib/media-sniff";
@@ -188,23 +189,14 @@ async function readImageDimensions(
   }
 }
 
-export async function writeReferenceFile(file: File): Promise<WrittenReference> {
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const mimeType = sniffImageMime(buffer);
-  if (!mimeType) {
-    throw new ApiError({
-      status: 400,
-      code: "unsupported_file_type",
-      message: "Unsupported image file type.",
-      retryable: false,
-    });
-  }
-  const dimensions = await readImageDimensions(buffer, {
-    status: 400,
-    code: "unsupported_file_type",
-    message: "Unsupported image file type.",
-    retryable: false,
-  });
+/**
+ * Persist a reference image. Prefer a PreparedImage from prepareImageFiles so
+ * storage reuses the already-validated bytes (one-read path).
+ */
+export async function writeReferenceFile(
+  file: PreparedImage,
+): Promise<WrittenReference> {
+  const { buffer, mimeType, width, height } = file;
   const ext = extensionFromMime(mimeType);
   const storagePath = path.posix.join("uploads", `${Date.now()}-${randomUUID()}.${ext}`);
 
@@ -219,7 +211,8 @@ export async function writeReferenceFile(file: File): Promise<WrittenReference> 
     absolutePath,
     byteSize: buffer.byteLength,
     mimeType,
-    ...dimensions,
+    width,
+    height,
     buffer,
   };
 }

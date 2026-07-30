@@ -8,6 +8,7 @@ import { ConfirmActionDialog } from "@/components/ui/confirm-action-dialog";
 import { Download, RefreshCw, RotateCcw, Trash2 } from "@/components/ui/icons";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
 import { useT } from "@/lib/i18n/useT";
+import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
 
 interface StorageBreakdown {
   activeBytes: number;
@@ -109,6 +110,9 @@ export function WorkspaceDataPanel() {
     if (!file) return;
     setFeedback(null);
     try {
+      if (file.size > WORKSPACE_RESTORE_LIMITS.maxEncodedBytes) {
+        throw new Error("backup too large");
+      }
       const parsed = JSON.parse(await file.text()) as unknown;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid backup");
       setRestoreBackup(parsed as Record<string, unknown>);

@@ -13,6 +13,65 @@ function isApiRoute(pathname: string): boolean {
   return pathname.startsWith("/api/");
 }
 
+/**
+ * Trusted loopback binding from process startup state (Rust/dev launcher sets
+ * PORT + HOSTNAME=127.0.0.1). Never derived from Host / X-Forwarded-*.
+ */
+export function trustedDesktopLoopbackOrigin(): string | null {
+  const port = process.env.PORT?.trim();
+  if (!port || !/^\d{1,5}$/.test(port)) return null;
+  const numeric = Number(port);
+  if (!Number.isInteger(numeric) || numeric < 1 || numeric > 65535) return null;
+  return `http://127.0.0.1:${numeric}`;
+}
+
+export function trustedDesktopHost(): string | null {
+  const origin = trustedDesktopLoopbackOrigin();
+  if (!origin) return null;
+  return origin.slice("http://".length);
+}
+
+function hasUntrustedForwardingHeaders(
+  request: NextRequest,
+  expectedHost: string,
+): boolean {
+  // Next's HTTP server synthesizes x-forwarded-host/proto when they are absent,
+  // before Proxy runs. Accept only those exact canonical values; attacker-
+  // supplied values survive the server's ??= normalization and fail closed.
+  const forwardedHost = request.headers.get("x-forwarded-host");
+  const forwardedProto = request.headers.get("x-forwarded-proto");
+  return Boolean(
+    request.headers.get("forwarded") ||
+      (forwardedHost && forwardedHost !== expectedHost) ||
+      (forwardedProto && forwardedProto !== "http"),
+  );
+}
+
+/**
+ * Desktop Host gate: every matched page/API request must present the exact
+ * startup loopback Host. Reject missing, malformed, localhost, hostname,
+ * wrong-port, forwarded, and arbitrary values before any routing work.
+ */
+export function assertTrustedDesktopHost(request: NextRequest): NextResponse | null {
+  if (!isDesktopRuntime()) return null;
+
+  const expectedHost = trustedDesktopHost();
+  if (!expectedHost) {
+    return new NextResponse("Forbidden", { status: 403 });
+  }
+
+  if (hasUntrustedForwardingHeaders(request, expectedHost)) {
+    return new NextResponse("Forbidden", { status: 403 });
+  }
+
+  const rawHost = request.headers.get("host");
+  if (!rawHost || rawHost !== expectedHost) {
+    return new NextResponse("Forbidden", { status: 403 });
+  }
+
+  return null;
+}
+
 // Per-request script nonce + CSP. Style attributes stay allowed because the UI
 // uses them for CSS variables and dynamic geometry.
 // Next reads the `x-nonce` request header and stamps it onto its own inline
@@ -49,35 +108,37 @@ function refererOrigin(referer: string | null): string | null {
 }
 
 // Allowed origins for the CSRF check come ONLY from server-side sources:
-// the server's own origin plus the desktop WebView origins in desktop runtime.
-// We do NOT derive them from `x-forwarded-host`/`x-forwarded-proto` — those are
-// client-controllable, and adding them to the allow-set would let an attacker
-// present `Origin: https://evil` + `X-Forwarded-Host: evil` and bypass CSRF.
-function expectedAppOrigins(request: NextRequest): string[] {
-  const origins = new Set<string>([request.nextUrl.origin]);
+// the startup loopback origin plus the desktop WebView origins. We do NOT
+// derive them from Host / x-forwarded-* — those are client-controllable.
+function expectedAppOrigins(): string[] {
+  const origins = new Set<string>();
   const desktopRuntime = isDesktopRuntime();
   if (desktopRuntime) {
     for (const origin of DESKTOP_WEBVIEW_ORIGINS) origins.add(origin);
-    // Next normalizes a 127.0.0.1 request URL to localhost internally. Keep the
-    // server-selected port and allow both loopback spellings so the navigated
-    // WebView remains same-origin without trusting Host/X-Forwarded-* headers.
-    const port = request.nextUrl.port ? `:${request.nextUrl.port}` : "";
-    origins.add(`http://127.0.0.1${port}`);
-    origins.add(`http://localhost${port}`);
+    const loopback = trustedDesktopLoopbackOrigin();
+    if (loopback) origins.add(loopback);
+  } else {
+    // Non-desktop (public site) keeps same-origin CSRF against the request URL
+    // only when Host validation is not the desktop gate.
+    // Callers still must present Origin/Referer matching this set.
   }
   return Array.from(origins);
+}
+
+function expectedWebOrigin(request: NextRequest): string[] {
+  return [request.nextUrl.origin];
 }
 
 export async function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
   const method = request.method;
+
+  const hostRejection = assertTrustedDesktopHost(request);
+  if (hostRejection) return hostRejection;
+
   // Mint the nonce once per request and thread it through both
   // `forwardWithNonce` (sets it on the forwarded request headers Next reads
   // to stamp inline scripts) and `finalizeResponse` (writes it into the CSP).
-  // Previously each helper re-derived the nonce off `request.headers`, but
-  // `new Headers(request.headers)` is a COPY — the original NextRequest never
-  // saw the mutation, so the CSP advertised one nonce while React stamped a
-  // different one onto its bootstrap scripts. Result: CSP blocked every page.
   const nonce = expectsHtml(request) ? buildNonce() : null;
 
   // Workbench routes only open inside the desktop WebView. Browser traffic is
@@ -92,11 +153,7 @@ export async function proxy(request: NextRequest) {
   // CSRF: state-changing API requests must present an Origin/Referer that
   // matches this app's origin. (No auth — single-user local app.)
   if (isApiRoute(pathname) && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
-    // The desktop WKWebView may retain its Tauri custom-protocol origin after it
-    // navigates to the private loopback server. Those exact app-owned origins
-    // are included above; arbitrary websites must never receive a blanket
-    // desktop bypass because they can still send simple requests to localhost.
-    const expected = expectedAppOrigins(request);
+    const expected = isDesktopRuntime() ? expectedAppOrigins() : expectedWebOrigin(request);
     const origin = request.headers.get("origin");
     const refOrigin = refererOrigin(request.headers.get("referer"));
     const presented = origin ?? refOrigin;

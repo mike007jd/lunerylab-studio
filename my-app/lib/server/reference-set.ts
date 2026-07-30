@@ -4,6 +4,7 @@
  */
 
 import "server-only";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "@/lib/server/prisma";
 import { ApiError, withPrismaNotFound } from "@/lib/server/errors";
@@ -79,6 +80,38 @@ function toSnapshot(row: {
   };
 }
 
+function mapReferenceSetConstraintError(error: unknown): never {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+    throw new ApiError({
+      status: 409,
+      code: "reference_set_default_conflict",
+      message: "Another default reference set already exists for this project.",
+      retryable: true,
+    });
+  }
+  throw error;
+}
+
+async function lockOwnedProject(
+  tx: Prisma.TransactionClient,
+  projectId: string,
+  userId: string,
+): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "Project"
+    WHERE "id" = ${projectId} AND "userId" = ${userId}
+    FOR UPDATE
+  `;
+  if (rows.length === 0) {
+    throw new ApiError({
+      status: 404,
+      code: "project_not_found",
+      message: "Project not found.",
+      retryable: false,
+    });
+  }
+}
+
 async function filterValidAssetIds(
   userId: string,
   projectId: string,
@@ -142,36 +175,41 @@ export async function createReferenceSet(
   }
   const assetIds = await filterValidAssetIds(userId, projectId, input.assetIds ?? []);
 
-  return prisma.$transaction(async (tx) => {
-    const count = await tx.referenceSet.count({ where: { projectId } });
-    if (count >= MAX_REFERENCE_SETS_PER_PROJECT) {
-      throw new ApiError({
-        status: 409,
-        code: "reference_set_limit_reached",
-        message: "Reference set limit reached for this project.",
-        retryable: false,
-      });
-    }
-    if (input.isDefault) {
-      await tx.referenceSet.updateMany({
-        where: { projectId, isDefault: true },
-        data: { isDefault: false },
-      });
-    }
-    const row = await tx.referenceSet.create({
-      data: {
-        projectId,
-        name,
-        description: input.description?.trim().slice(0, 400) || null,
-        isDefault: Boolean(input.isDefault),
-        assets: {
-          create: assetIds.map((assetId, position) => ({ assetId, position })),
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await lockOwnedProject(tx, projectId, userId);
+      const count = await tx.referenceSet.count({ where: { projectId } });
+      if (count >= MAX_REFERENCE_SETS_PER_PROJECT) {
+        throw new ApiError({
+          status: 409,
+          code: "reference_set_limit_reached",
+          message: "Reference set limit reached for this project.",
+          retryable: false,
+        });
+      }
+      if (input.isDefault) {
+        await tx.referenceSet.updateMany({
+          where: { projectId, isDefault: true },
+          data: { isDefault: false },
+        });
+      }
+      const row = await tx.referenceSet.create({
+        data: {
+          projectId,
+          name,
+          description: input.description?.trim().slice(0, 400) || null,
+          isDefault: Boolean(input.isDefault),
+          assets: {
+            create: assetIds.map((assetId, position) => ({ assetId, position })),
+          },
         },
-      },
-      include: referenceSetInclude,
+        include: referenceSetInclude,
+      });
+      return toSnapshot(row);
     });
-    return toSnapshot(row);
-  });
+  } catch (error) {
+    mapReferenceSetConstraintError(error);
+  }
 }
 
 export async function updateReferenceSet(
@@ -198,35 +236,50 @@ export async function updateReferenceSet(
       retryable: false,
     });
   }
+  const validAssetIds =
+    input.assetIds === undefined
+      ? null
+      : await filterValidAssetIds(userId, projectId, input.assetIds);
 
-  return prisma.$transaction(async (tx) => {
-    if (input.isDefault === true) {
-      await tx.referenceSet.updateMany({
-        where: { projectId, isDefault: true, NOT: { id } },
-        data: { isDefault: false },
-      });
-    }
-    const data: Record<string, unknown> = {};
-    if (typeof input.name === "string" && input.name.trim()) data.name = input.name.trim().slice(0, 80);
-    if (input.description !== undefined)
-      data.description = input.description?.toString().trim().slice(0, 400) || null;
-    if (input.isDefault !== undefined) data.isDefault = input.isDefault;
-
-    if (input.assetIds !== undefined) {
-      // Replace the ordered membership atomically: drop the old rows and
-      // recreate them with fresh positions from the validated id list.
-      const validIds = await filterValidAssetIds(userId, projectId, input.assetIds);
-      await tx.referenceSetAsset.deleteMany({ where: { referenceSetId: id } });
-      if (validIds.length > 0) {
-        await tx.referenceSetAsset.createMany({
-          data: validIds.map((assetId, position) => ({ referenceSetId: id, assetId, position })),
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await lockOwnedProject(tx, projectId, userId);
+      if (input.isDefault === true) {
+        await tx.referenceSet.updateMany({
+          where: { projectId, isDefault: true, NOT: { id } },
+          data: { isDefault: false },
         });
       }
-    }
+      const data: Record<string, unknown> = {};
+      if (typeof input.name === "string" && input.name.trim()) data.name = input.name.trim().slice(0, 80);
+      if (input.description !== undefined)
+        data.description = input.description?.toString().trim().slice(0, 400) || null;
+      if (input.isDefault !== undefined) data.isDefault = input.isDefault;
 
-    const row = await tx.referenceSet.update({ where: { id }, data, include: referenceSetInclude });
-    return toSnapshot(row);
-  });
+      if (input.assetIds !== undefined) {
+        // Replace the ordered membership atomically: drop the old rows and
+        // recreate them with fresh positions from the validated id list.
+        // Validate before opening the transaction: the desktop PGlite Prisma
+        // URL intentionally has connection_limit=1, so issuing a global Prisma
+        // query while the transaction holds that connection can deadlock.
+        await tx.referenceSetAsset.deleteMany({ where: { referenceSetId: id } });
+        if (validAssetIds && validAssetIds.length > 0) {
+          await tx.referenceSetAsset.createMany({
+            data: validAssetIds.map((assetId, position) => ({
+              referenceSetId: id,
+              assetId,
+              position,
+            })),
+          });
+        }
+      }
+
+      const row = await tx.referenceSet.update({ where: { id }, data, include: referenceSetInclude });
+      return toSnapshot(row);
+    });
+  } catch (error) {
+    mapReferenceSetConstraintError(error);
+  }
 }
 
 export async function deleteReferenceSet(

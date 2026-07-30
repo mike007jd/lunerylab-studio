@@ -104,21 +104,34 @@ export function snapshotsDiffer(a: BootstrapSnapshot | null, b: BootstrapSnapsho
 export function useBootstrapSnapshot(options: UseBootstrapSnapshotOptions = {}) {
   const { intervalMs = 8_000, refreshKey, initialData, disabled = false } = options;
   const [snapshot, setSnapshot] = useState<BootstrapSnapshot | null>(initialData ?? null);
+  // Track a semantic seed key so A → B prop changes adjust state during render
+  // without looping when a parent recreates an equivalent object.
+  const initialDataKey = JSON.stringify(initialData ?? null);
+  const [seedInitialDataKey, setSeedInitialDataKey] = useState(initialDataKey);
   // Bootstrap polls every few seconds but rarely changes. Compare the fields
   // subscribers actually read so we don't notify the canvas on every poll.
   const lastSnapshotRef = useRef<BootstrapSnapshot | null>(initialData ?? null);
+
+  // When the parent hands a new SSR/seed snapshot (A → B), sync React state
+  // during render so the UI does not stay stuck on A.
+  if (seedInitialDataKey !== initialDataKey) {
+    setSeedInitialDataKey(initialDataKey);
+    setSnapshot(initialData ?? null);
+  }
+
+  useEffect(() => {
+    // Keep the poll comparison baseline aligned with the latest seed.
+    lastSnapshotRef.current = initialData ?? null;
+  }, [initialData]);
 
   useEffect(() => {
     if (disabled || intervalMs <= 0) {
       return;
     }
 
-    // Fresh SSR data can arrive via initialData on navigation; keep the diff
-    // baseline in sync so the next poll compares against it, not a stale seed.
-    if (initialData) lastSnapshotRef.current = initialData;
-
     let active = true;
-    let timer: ReturnType<typeof setInterval> | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let syncPromise: Promise<void> | null = null;
 
     const sync = async () => {
       const payload = await fetchBootstrapSnapshot();
@@ -128,18 +141,29 @@ export function useBootstrapSnapshot(options: UseBootstrapSnapshotOptions = {}) 
       setSnapshot(payload);
     };
 
+    const syncOnce = () => {
+      if (!syncPromise) {
+        syncPromise = sync().finally(() => {
+          syncPromise = null;
+        });
+      }
+      return syncPromise;
+    };
+
     const scheduleNext = () => {
+      if (timer || !active || document.hidden) return;
       timer = setTimeout(async () => {
-        await sync();
-        if (active && !document.hidden) {
-          scheduleNext();
-        }
+        // This timeout has fired. Clear the handle before awaiting the network
+        // so a visibility resume can restart polling if the page became hidden
+        // while sync was in flight.
+        timer = null;
+        await syncOnce();
+        scheduleNext();
       }, intervalMs);
     };
 
     const startPolling = (skipInitialSync = false) => {
-      if (timer) return;
-      if (!skipInitialSync) void sync();
+      if (!skipInitialSync) void syncOnce();
       scheduleNext();
     };
 
@@ -157,16 +181,19 @@ export function useBootstrapSnapshot(options: UseBootstrapSnapshotOptions = {}) 
         startPolling();
       }
     };
+    const handleInvalidation = () => {
+      void syncOnce();
+    };
 
     startPolling(!!initialData);
     document.addEventListener("visibilitychange", handleVisibility);
-    window.addEventListener(BOOTSTRAP_INVALIDATION_EVENT, sync);
+    window.addEventListener(BOOTSTRAP_INVALIDATION_EVENT, handleInvalidation);
 
     return () => {
       active = false;
       stopPolling();
       document.removeEventListener("visibilitychange", handleVisibility);
-      window.removeEventListener(BOOTSTRAP_INVALIDATION_EVENT, sync);
+      window.removeEventListener(BOOTSTRAP_INVALIDATION_EVENT, handleInvalidation);
     };
   }, [disabled, initialData, intervalMs, refreshKey]);
 

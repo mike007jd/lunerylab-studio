@@ -5,7 +5,7 @@ const root = process.cwd();
 const config = JSON.parse(
   fs.readFileSync(path.join(root, "ui-framework.config.json"), "utf8"),
 );
-const scanRoots = ["app", "components", "lib"].map((dir) => path.join(root, dir));
+const scanRoots = ["app", "components", "hooks", "lib"].map((dir) => path.join(root, dir));
 const frameworkRoot = path.join(root, "components", "design-system");
 const extensions = new Set([".ts", ".tsx", ".css"]);
 const ignoredSegments = new Set([

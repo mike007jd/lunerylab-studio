@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { HttpError } from "@/lib/client/fetch-json";
 import { GenerationActivityRegistry } from "@/components/studio/controllers/generation-activity-registry";
 import { createVideoGenerationController } from "@/components/studio/hooks/use-video-generation";
 import type {
@@ -14,7 +15,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function videoEntry(): GenerationEntry {
+function videoEntry(overrides: Partial<GenerationEntry> = {}): GenerationEntry {
   return {
     id: "video-A",
     mode: "video",
@@ -29,10 +30,12 @@ function videoEntry(): GenerationEntry {
     batchVariants: null,
     generationParameters: {},
     videoDuration: 6,
+    jobId: null,
     assets: [],
     warnings: [],
     error: "retry",
     createdAt: 1,
+    ...overrides,
   };
 }
 
@@ -62,20 +65,24 @@ function videoAsset(id: string) {
   };
 }
 
-function fakeHistory() {
-  let entries = [videoEntry()];
+function fakeHistory(seed: GenerationEntry[] = [videoEntry()]) {
+  let entries = seed;
   return {
     add(input: NewEntryInput) {
       const id = "new-video";
-      entries = [{
-        ...input,
-        id,
-        status: input.status ?? "running",
-        assets: [],
-        warnings: [],
-        error: null,
-        createdAt: 1,
-      }, ...entries];
+      entries = [
+        {
+          ...input,
+          id,
+          status: input.status ?? "running",
+          jobId: input.jobId ?? null,
+          assets: [],
+          warnings: [],
+          error: null,
+          createdAt: 1,
+        },
+        ...entries,
+      ];
       return id;
     },
     update(id: string, patch: Partial<GenerationEntry>) {
@@ -162,5 +169,107 @@ describe("entry-aware video generation controller", () => {
       expect(history.find("video-A")?.assets[0]?.id).toBe("new");
     });
     expect(registry.anyActive()).toBe(false);
+  });
+
+  it("releases after three transient 500s, then retry rejoins the same job", async () => {
+    const history = fakeHistory([videoEntry({ status: "running", error: null })]);
+    const registry = new GenerationActivityRegistry();
+    let createCount = 0;
+    let statusCount = 0;
+    const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/generate/video" && init?.method === "POST") {
+        createCount += 1;
+        return {
+          jobId: "job-rejoin",
+          status: "RUNNING",
+          duration: 6,
+          projectId: null,
+        };
+      }
+      statusCount += 1;
+      if (statusCount <= 3) {
+        throw new HttpError("upstream", { status: 500, statusText: "Internal Server Error" });
+      }
+      return { status: "SUCCEEDED", asset: videoAsset("recovered") };
+    });
+    const controller = createVideoGenerationController({
+      registry,
+      history,
+      t: (key) => key,
+      request,
+      wait: vi.fn(async () => undefined),
+      createRunId: (() => {
+        let id = 0;
+        return () => `video-run-${++id}`;
+      })(),
+      maxPollErrors: 3,
+    });
+
+    await controller.retry("video-A");
+    await vi.waitFor(() => {
+      expect(history.find("video-A")?.status).toBe("interrupted");
+    });
+    expect(registry.anyActive()).toBe(false);
+    expect(history.find("video-A")?.jobId).toBe("job-rejoin");
+
+    await controller.retry("video-A");
+    await vi.waitFor(() => {
+      expect(history.find("video-A")?.status).toBe("succeeded");
+    });
+    expect(createCount).toBe(1);
+    expect(history.find("video-A")?.jobId).toBe("job-rejoin");
+    expect(history.find("video-A")?.assets[0]?.id).toBe("recovered");
+    expect(statusCount).toBe(4);
+    expect(registry.anyActive()).toBe(false);
+  });
+
+  it("retains the same job across rate-limit responses and rejoins without duplicate creation", async () => {
+    const history = fakeHistory([videoEntry({ status: "running", error: null })]);
+    const registry = new GenerationActivityRegistry();
+    let createCount = 0;
+    let statusCount = 0;
+    const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/generate/video" && init?.method === "POST") {
+        createCount += 1;
+        return {
+          jobId: "job-rate-limited",
+          status: "RUNNING",
+          duration: 6,
+          projectId: null,
+        };
+      }
+      statusCount += 1;
+      if (statusCount <= 3) {
+        throw new HttpError("rate limited", {
+          status: 429,
+          statusText: "Too Many Requests",
+        });
+      }
+      return { status: "SUCCEEDED", asset: videoAsset("rate-recovered") };
+    });
+    const controller = createVideoGenerationController({
+      registry,
+      history,
+      t: (key) => key,
+      request,
+      wait: vi.fn(async () => undefined),
+      maxPollErrors: 3,
+    });
+
+    await controller.retry("video-A");
+    await vi.waitFor(() => {
+      expect(history.find("video-A")?.status).toBe("interrupted");
+    });
+    expect(registry.anyActive()).toBe(false);
+    expect(history.find("video-A")?.jobId).toBe("job-rate-limited");
+
+    await controller.retry("video-A");
+    await vi.waitFor(() => {
+      expect(history.find("video-A")?.status).toBe("succeeded");
+    });
+    expect(createCount).toBe(1);
+    expect(history.find("video-A")?.jobId).toBe("job-rate-limited");
+    expect(statusCount).toBe(4);
   });
 });

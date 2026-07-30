@@ -1,7 +1,11 @@
 import "server-only";
 
 import { ApiError } from "@/lib/server/errors";
-import { isImageAssetLike, withAssetWriteTransaction } from "@/lib/server/file-validation";
+import {
+  isImageAssetLike,
+  withAssetWriteTransaction,
+  type PreparedImage,
+} from "@/lib/server/file-validation";
 import { prisma } from "@/lib/server/prisma";
 import {
   deleteStoredFile,
@@ -143,11 +147,12 @@ export async function persistUploadedImageReferenceFiles({
 }: {
   projectId: string | null;
   jobId: string;
-  files: File[];
+  files: PreparedImage[];
   userId: string;
 }): Promise<Array<{ mimeType: string; bytes: Buffer }>> {
   // All-or-nothing writes: if the 2nd of N reference files fails to write, the
-  // already-written ones are deleted instead of orphaned on disk.
+  // already-written ones are deleted instead of orphaned on disk. Prepared
+  // images reuse the already-read Buffer (no second arrayBuffer()).
   const stored = await writeFilesOrCleanup(files.map((file) => () => writeReferenceFile(file)));
 
   if (stored.length === 0) return [];

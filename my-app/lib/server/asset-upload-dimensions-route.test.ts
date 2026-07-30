@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   requireLocalWorkspaceOwner: vi.fn(),
   resolveOwnedProjectId: vi.fn(),
   assertRequestContentLength: vi.fn(),
-  validateFiles: vi.fn(),
+  prepareImageFiles: vi.fn(),
   withAssetWriteTransaction: vi.fn(),
   writeReferenceFile: vi.fn(),
   deleteStoredFile: vi.fn(),
@@ -23,7 +23,7 @@ vi.mock("@/lib/server/project-ownership", () => ({
 }));
 vi.mock("@/lib/server/file-validation", () => ({
   assertRequestContentLength: mocks.assertRequestContentLength,
-  validateFiles: mocks.validateFiles,
+  prepareImageFiles: mocks.prepareImageFiles,
   withAssetWriteTransaction: mocks.withAssetWriteTransaction,
 }));
 vi.mock("@/lib/server/storage", () => ({
@@ -37,6 +37,16 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
   mocks.resolveOwnedProjectId.mockResolvedValue("project-1");
+  mocks.prepareImageFiles.mockResolvedValue([
+    {
+      buffer: Buffer.from("image"),
+      mimeType: "image/webp",
+      width: 1920,
+      height: 1080,
+      sha256: "abc",
+      byteSize: 5,
+    },
+  ]);
   mocks.writeReferenceFile.mockResolvedValue({
     storagePath: "uploads/wide.webp",
     mimeType: "image/webp",

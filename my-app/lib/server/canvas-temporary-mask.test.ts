@@ -35,10 +35,7 @@ describe("canvas temporary masks", () => {
   });
 
   it("stores a PNG under an opaque temporary token without creating an asset", async () => {
-    const file = new File([new Uint8Array([1, 2, 3])], "mask.png", {
-      type: "image/png",
-    });
-    const token = await storeTemporaryCanvasMask(file);
+    const token = await storeTemporaryCanvasMask(Buffer.from([1, 2, 3]));
 
     expect(isTemporaryCanvasMaskToken(token)).toBe(true);
     expect(fs.readFileSync(path.join(runtimeDir, "canvas-masks", `${token}.png`))).toEqual(

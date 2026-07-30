@@ -37,6 +37,8 @@ export const generationEntrySchema = z.strictObject({
   batchVariants: z.array(generationBatchVariantSchema).nullable(),
   generationParameters: generationParametersSchema,
   videoDuration: z.number().int().positive().nullable(),
+  /** Session-lifetime provider job id for video poll rejoin after interrupt. */
+  jobId: z.string().nullable(),
   assets: z.array(assetDTOSchema),
   warnings: z.array(z.string()),
   error: z.string().nullable(),

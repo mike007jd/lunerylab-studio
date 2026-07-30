@@ -236,4 +236,127 @@ describe("/api/chat UIMessage stream", () => {
     expect(response.status).toBe(400);
     expect(mocks.runAgent).not.toHaveBeenCalled();
   });
+
+  it("handles early step-persist rejection without failing the business stream", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.persistAgentTaskStep.mockRejectedValueOnce(new Error("db write rejected"));
+    mocks.runAgent.mockImplementation(async (input) => {
+      input.onStep?.({
+        id: "step-1",
+        index: 0,
+        toolName: "list_reference_sets",
+        category: "brand",
+        summary: "Listed sets",
+        artifacts: {},
+        input: {},
+        output: {},
+        status: "completed",
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+      return {
+        runId: "run-1",
+        assistantMessage: "Done.",
+        steps: [],
+        artifacts: {},
+        backendUsed: { llm: "local", image: "none" },
+        generationBackend: "local",
+        imageBackend: "none",
+        durationMs: 12,
+        stoppedByBudget: false,
+      };
+    });
+
+    const response = await POST(request({ sessionId: "session-1", message: "List sets" }));
+    const text = await readResponse(response);
+
+    expect(response.status).toBe(200);
+    expect(text).toContain('"type":"finish","finishReason":"stop"');
+    expect(mocks.finishAgentTask).toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it("drains pending step writes before terminalizing on exception", async () => {
+    let resolvePersist!: () => void;
+    const persistGate = new Promise<void>((resolve) => {
+      resolvePersist = resolve;
+    });
+    let persistStarted = false;
+    mocks.persistAgentTaskStep.mockImplementation(async () => {
+      persistStarted = true;
+      await persistGate;
+    });
+    mocks.runAgent.mockImplementation(async (input) => {
+      input.onStep?.({
+        id: "step-pending",
+        index: 0,
+        toolName: "generate_image",
+        category: "generate",
+        summary: "Generating",
+        artifacts: {},
+        input: {},
+        output: {},
+        status: "completed",
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+      throw new Error("provider unavailable");
+    });
+
+    const responsePromise = POST(
+      request({ sessionId: "session-1", message: "Generate a product shot." }),
+    );
+    await vi.waitFor(() => expect(persistStarted).toBe(true));
+    expect(mocks.failAgentTask).not.toHaveBeenCalled();
+    resolvePersist();
+    const response = await responsePromise;
+    await readResponse(response);
+
+    expect(mocks.persistAgentTaskStep).toHaveBeenCalled();
+    expect(mocks.failAgentTask).toHaveBeenCalled();
+  });
+
+  it("drains step writes before terminalizing on abort", async () => {
+    const controller = new AbortController();
+    mocks.runAgent.mockImplementation(async (input) => {
+      input.onStep?.({
+        id: "step-abort",
+        index: 0,
+        toolName: "generate_image",
+        category: "generate",
+        summary: "Started",
+        artifacts: {},
+        input: {},
+        output: {},
+        status: "completed",
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+      controller.abort();
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      throw error;
+    });
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost",
+        },
+        body: JSON.stringify({ sessionId: "session-1", message: "Stop soon" }),
+        signal: controller.signal,
+      }),
+    );
+    await readResponse(response);
+
+    expect(mocks.persistAgentTaskStep).toHaveBeenCalled();
+    expect(mocks.failAgentTask).toHaveBeenCalledWith(
+      "task-1",
+      expect.anything(),
+      expect.objectContaining({ cancelled: true }),
+    );
+  });
 });

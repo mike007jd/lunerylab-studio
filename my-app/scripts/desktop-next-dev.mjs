@@ -24,6 +24,19 @@ function absoluteEnvPath(name, fallback) {
   return raw;
 }
 
+function resolveDesktopPort(raw) {
+  const value = raw?.trim() || "3000";
+  if (!/^\d{1,5}$/.test(value)) {
+    throw new Error("PORT must be an integer from 1 to 65535.");
+  }
+  const numeric = Number(value);
+  if (!Number.isInteger(numeric) || numeric < 1 || numeric > 65535) {
+    throw new Error("PORT must be an integer from 1 to 65535.");
+  }
+  return String(numeric);
+}
+
+const desktopPort = resolveDesktopPort(process.env.PORT);
 const profileRoot = absoluteEnvPath("LUNERY_HOME", join(os.homedir(), ".lunerylab", "studio-dev"));
 const configDir = absoluteEnvPath("LUNERY_CONFIG_DIR", join(profileRoot, "config"));
 const dataDir = absoluteEnvPath("LUNERY_DATA_DIR", join(profileRoot, "data"));
@@ -53,13 +66,14 @@ const child = spawn(
     "--hostname",
     "127.0.0.1",
     "--port",
-    process.env.PORT || "3000",
+    desktopPort,
   ],
   {
     stdio: "inherit",
     env: {
       ...process.env,
       PATH: pathWithCurrentNode,
+      PORT: desktopPort,
       LUNERY_DESKTOP: "1",
       LUNERY_HOME: profileRoot,
       LUNERY_CONFIG_DIR: configDir,

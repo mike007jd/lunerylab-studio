@@ -45,8 +45,7 @@ async function cleanupExpiredMasks(): Promise<void> {
   );
 }
 
-export async function storeTemporaryCanvasMask(file: File): Promise<string> {
-  const bytes = Buffer.from(await file.arrayBuffer());
+export async function storeTemporaryCanvasMask(bytes: Buffer): Promise<string> {
   if (sniffImageMime(bytes) !== "image/png") {
     throw new ApiError({
       status: 400,
