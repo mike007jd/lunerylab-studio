@@ -55,6 +55,14 @@ const SAVED_BADGE_HOLD_MS = 1_800;
 
 export type CanvasSaveStatus = "idle" | "saving" | "saved";
 
+export interface LayerDeletionPreparation {
+  ok: boolean;
+  /** Latest locally dirty geometry captured before the queue was drained. */
+  drainedGeometry: LayerGeometryPatch | null;
+  /** Idempotently release the delete barrier after DELETE/recovery settles. */
+  release(): void;
+}
+
 export interface UseCanvasPersistenceCoordinatorArgs {
   sessionId: string;
   ledger: CanvasWriteLedger;
@@ -81,6 +89,15 @@ export interface CanvasPersistenceCoordinator {
    * controller awaits this before persisting a lock.
    */
   flushPendingGeometry: (layerId: string) => Promise<boolean>;
+  /**
+   * Synchronous per-layer deletion barrier, then drain pending/in-flight
+   * geometry. The caller owns the returned barrier until DELETE/recovery
+   * settles. On failure, no DELETE should be issued and the queue remains
+   * recoverable.
+   */
+  prepareLayerDeletion: (layerId: string) => Promise<LayerDeletionPreparation>;
+  /** True while delete preflight owns the layer's geometry channel. */
+  isDeletionBlocked: (layerId: string) => boolean;
   /**
    * Drain every channel for an explicit in-app exit. Resolves true only when
    * navigation is safe; failure notifies the user and releases the flag.
@@ -206,6 +223,13 @@ export function useCanvasPersistenceCoordinator({
   const pendingPatchesRef = useRef<Map<string, LayerGeometryPatch>>(new Map());
   const patchTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const layerPatchQueuesRef = useRef<Map<string, LatestWriteQueue<LayerPatchWrite>>>(new Map());
+  // Latest coalesced geometry per layer — Konva keeps drag state off React, so
+  // delete restore must read what the writer actually drained, not sync.layers.
+  const latestGeometryRef = useRef<Map<string, LayerGeometryPatch>>(new Map());
+  // Synchronous delete-preflight barriers: block new transforms before the first
+  // await of prepareLayerDeletion and remain held through DELETE/recovery.
+  const deletionBarriersRef = useRef<Set<string>>(new Set());
+  const [, setDeletionBarrierEpoch] = useState(0);
   // Holds the latest flush implementation so the stable scheduler can call it
   // without a useCallback dependency cycle.
   const flushLayerPatchRef = useRef<((layerId: string) => void) | undefined>(undefined);
@@ -216,6 +240,7 @@ export function useCanvasPersistenceCoordinator({
       if (timer) clearTimeout(timer);
       patchTimersRef.current.delete(layerId);
       pendingPatchesRef.current.delete(layerId);
+      latestGeometryRef.current.delete(layerId);
       ledger.clearGeometryDirty(layerId);
       if (options?.closeQueue) {
         layerPatchQueuesRef.current.get(layerId)?.close();
@@ -312,6 +337,45 @@ export function useCanvasPersistenceCoordinator({
     return queue ? queue.flush() : true;
   }, []);
 
+  const isDeletionBlocked = useCallback(
+    (layerId: string) => deletionBarriersRef.current.has(layerId),
+    [],
+  );
+
+  const prepareLayerDeletion = useCallback(
+    async (layerId: string): Promise<LayerDeletionPreparation> => {
+      // Synchronous barrier before the first await so a drag cannot race drain.
+      if (deletionBarriersRef.current.has(layerId)) {
+        return {
+          ok: false,
+          drainedGeometry: null,
+          release() {},
+        };
+      }
+      deletionBarriersRef.current.add(layerId);
+      setDeletionBarrierEpoch((epoch) => epoch + 1);
+      const wasDirty = ledger.dirtyGeometryIds().has(layerId);
+      const drainedGeometry = wasDirty
+        ? latestGeometryRef.current.get(layerId) ?? null
+        : null;
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        deletionBarriersRef.current.delete(layerId);
+        setDeletionBarrierEpoch((epoch) => epoch + 1);
+      };
+      try {
+        const ok = await flushPendingGeometry(layerId);
+        return { ok, drainedGeometry, release };
+      } catch (error) {
+        release();
+        throw error;
+      }
+    },
+    [flushPendingGeometry, ledger],
+  );
+
   const flushAllCanvasWrites = useCallback(async (): Promise<{
     ok: boolean;
     notify: "save" | null;
@@ -370,14 +434,21 @@ export function useCanvasPersistenceCoordinator({
   const patchLayerGeometry = useCallback(async (layerId: string, patch: LayerGeometryPatch) => {
     // The lock controller's barrier is the single gate for every mutation path
     // (Konva, keyboard, DOM a11y). Do not admit new geometry once a transition
-    // has started — including during the lock flush window.
+    // has started — including during the lock flush window. Delete preflight
+    // installs its own barrier so transforms cannot race the drain/DELETE.
     if (lockController.isInteractionBlocked(layerId)) return;
+    if (deletionBarriersRef.current.has(layerId)) return;
     if (isLayerLocked(layerId)) return;
     ledger.markGeometryDirty(layerId);
     markSavePending();
-    pendingPatchesRef.current.set(layerId, {
+    const merged = {
       ...pendingPatchesRef.current.get(layerId),
       ...patch,
+    };
+    pendingPatchesRef.current.set(layerId, merged);
+    latestGeometryRef.current.set(layerId, {
+      ...latestGeometryRef.current.get(layerId),
+      ...merged,
     });
     const existing = patchTimersRef.current.get(layerId);
     if (existing) clearTimeout(existing);
@@ -435,6 +506,8 @@ export function useCanvasPersistenceCoordinator({
     handleDrawingStateChange,
     handleDrawingStateDirty,
     flushPendingGeometry,
+    prepareLayerDeletion,
+    isDeletionBlocked,
     flushForExit,
   };
 }

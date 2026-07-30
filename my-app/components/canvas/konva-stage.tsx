@@ -65,6 +65,7 @@ interface KonvaStageProps {
   onDeleteLayer?: (layerId: string) => void;
   onToggleLock?: (layerId: string, locked: boolean) => void;
   isLockPending?: (layerId: string) => boolean;
+  isLayerInteractionBlocked?: (layerId: string) => boolean;
   onDrawingStateChange?: (state: CanvasDrawingState) => Promise<void> | void;
   onDrawingStateDirty?: () => void;
   stageRef?: RefObject<KonvaStageHandle | null>;
@@ -91,6 +92,7 @@ function AssetNode({
   item,
   selected,
   interactive,
+  isInteractionBlocked,
   register,
   onSelect,
   onPatch,
@@ -100,6 +102,7 @@ function AssetNode({
   item: KonvaLayerItem;
   selected: boolean;
   interactive: boolean;
+  isInteractionBlocked: () => boolean;
   register: (id: string, node: Konva.Image | null) => void;
   onSelect: () => void;
   onPatch: (patch: Partial<KonvaLayerItem>) => void;
@@ -117,8 +120,8 @@ function AssetNode({
       width={item.width}
       height={item.height}
       rotation={item.rotation ?? 0}
-      draggable={interactive && !item.locked}
-      listening={interactive}
+      draggable={interactive && !item.locked && !isInteractionBlocked()}
+      listening={interactive && !isInteractionBlocked()}
       opacity={image ? 1 : 0.35}
       stroke={selected ? selectionColor : undefined}
       strokeWidth={selected ? 2 : 0}
@@ -128,7 +131,7 @@ function AssetNode({
       onClick={onSelect}
       onTap={onSelect}
       onDragEnd={(event) => {
-        if (item.locked) {
+        if (item.locked || isInteractionBlocked()) {
           event.target.position({ x: item.x, y: item.y });
           return;
         }
@@ -136,7 +139,7 @@ function AssetNode({
       }}
       onTransformEnd={(event) => {
         const node = event.target;
-        if (item.locked) {
+        if (item.locked || isInteractionBlocked()) {
           node.position({ x: item.x, y: item.y });
           node.rotation(item.rotation ?? 0);
           node.scaleX(1);
@@ -169,6 +172,7 @@ export function KonvaStage({
   onDeleteLayer,
   onToggleLock,
   isLockPending,
+  isLayerInteractionBlocked,
   onDrawingStateChange,
   onDrawingStateDirty,
   stageRef,
@@ -230,6 +234,9 @@ export function KonvaStage({
     () => layers.find((layer) => layer.id === selectedLayerId) ?? null,
     [layers, selectedLayerId],
   );
+  const selectedInteractionBlocked = Boolean(
+    selectedLayerId && isLayerInteractionBlocked?.(selectedLayerId),
+  );
 
   const fitAll = useCallback(() => {
     if (visibleLayers.length === 0) {
@@ -261,9 +268,19 @@ export function KonvaStage({
     const transformer = transformerRef.current;
     if (!transformer) return;
     const node = selectedLayerId ? assetNodesRef.current.get(selectedLayerId) : undefined;
-    transformer.nodes(node && tool === "select" && !selectedLayer?.locked ? [node] : []);
+    transformer.nodes(
+      node && tool === "select" && !selectedLayer?.locked && !selectedInteractionBlocked
+        ? [node]
+        : [],
+    );
     transformer.getLayer()?.batchDraw();
-  }, [selectedLayer?.locked, selectedLayerId, tool, visibleLayers]);
+  }, [
+    selectedInteractionBlocked,
+    selectedLayer?.locked,
+    selectedLayerId,
+    tool,
+    visibleLayers,
+  ]);
 
   const persistDrawing = useCallback((next: CanvasDrawingState) => {
     drawingRef.current = next;
@@ -481,7 +498,12 @@ export function KonvaStage({
               key={item.id}
               item={item}
               selected={selectedLayerId === item.id}
-              interactive={tool === "select"}
+              interactive={
+                tool === "select" && !Boolean(isLayerInteractionBlocked?.(item.id))
+              }
+              isInteractionBlocked={() =>
+                Boolean(isLayerInteractionBlocked?.(item.id))
+              }
               register={(id, node) => {
                 if (node) assetNodesRef.current.set(id, node);
                 else assetNodesRef.current.delete(id);
@@ -528,6 +550,7 @@ export function KonvaStage({
         onDeleteLayer={onDeleteLayer}
         onToggleLock={onToggleLock}
         isLockPending={isLockPending}
+        isInteractionBlocked={isLayerInteractionBlocked}
       />
 
       <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-xl border border-(--border-subtle) bg-(--scrim-strong) p-1.5 shadow-xl backdrop-blur">

@@ -114,11 +114,13 @@ export function createVideoGenerationController({
       history.update(entryId, { status: "failed", error: payload.error, jobId: null });
       return true;
     }
+    // Terminal success also clears jobId: Regenerate must POST a new creation
+    // and must never rejoin/poll the completed job.
     history.update(entryId, {
       status: payload.asset ? "succeeded" : "failed",
       assets: payload.asset ? [payload.asset] : [],
       error: payload.asset ? null : t("studio.videoFailed"),
-      jobId: payload.asset ? history.find(entryId)?.jobId ?? null : null,
+      jobId: null,
     });
     return true;
   };
@@ -334,7 +336,12 @@ export function createVideoGenerationController({
     if (!entry || entry.mode !== "video" || entry.videoDuration == null) {
       return { started: false };
     }
-    const rejoinJobId = entry.jobId;
+    // Rejoin only for running/interrupted recovery. Succeeded / failed /
+    // canceled Regenerate must create a new job via POST.
+    const rejoinJobId =
+      entry.status === "interrupted" || entry.status === "running"
+        ? entry.jobId
+        : null;
     return run(
       {
         entryId,
@@ -351,8 +358,8 @@ export function createVideoGenerationController({
           status: "running",
           error: null,
           assets: [],
-          // Retain jobId across interrupt→retry rejoin; cleared only on
-          // authoritative failure / not-found.
+          // Retain jobId only across interrupt/running rejoin; cleared on
+          // authoritative terminal success/failure / not-found.
           jobId: rejoinJobId ?? null,
         }),
     );

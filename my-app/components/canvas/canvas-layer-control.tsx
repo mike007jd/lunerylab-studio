@@ -22,6 +22,8 @@ export interface CanvasLayerControlProps {
   onToggleLock?: (layerId: string, locked: boolean) => void;
   /** True while a lock/unlock transition is queued or in flight for the layer. */
   isLockPending?: (layerId: string) => boolean;
+  /** True while delete/lock ownership forbids geometry and destructive input. */
+  isInteractionBlocked?: (layerId: string) => boolean;
 }
 
 /**
@@ -44,6 +46,7 @@ export function CanvasLayerControl({
   onDeleteLayer,
   onToggleLock,
   isLockPending,
+  isInteractionBlocked,
 }: CanvasLayerControlProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
@@ -73,7 +76,7 @@ export function CanvasLayerControl({
         event.preventDefault();
         // Keep the stage-level window Delete shortcut from firing a second time.
         event.stopPropagation();
-        if (layer.locked) return;
+        if (layer.locked || isInteractionBlocked?.(layer.id)) return;
         onSelectLayer?.(layer.id);
         onDeleteLayer?.(layer.id);
         return;
@@ -89,7 +92,7 @@ export function CanvasLayerControl({
       // Arrows only act on the artwork once its layer is selected; otherwise
       // they keep their default behavior so focus stays predictable. Locked
       // layers never move or resize.
-      if (!selected || layer.locked) return;
+      if (!selected || layer.locked || isInteractionBlocked?.(layer.id)) return;
       event.preventDefault();
 
       if (event.shiftKey) {
@@ -109,7 +112,13 @@ export function CanvasLayerControl({
         patchLayer(layer, patch);
       }
     },
-    [selectedLayerId, onSelectLayer, onDeleteLayer, patchLayer],
+    [
+      selectedLayerId,
+      onSelectLayer,
+      onDeleteLayer,
+      patchLayer,
+      isInteractionBlocked,
+    ],
   );
 
   if (orderedLayers.length === 0) return null;
@@ -150,6 +159,7 @@ export function CanvasLayerControl({
             {orderedLayers.map((layer, index) => {
               const selected = layer.id === selectedLayerId;
               const lockPending = Boolean(isLockPending?.(layer.id));
+              const interactionBlocked = Boolean(isInteractionBlocked?.(layer.id));
               return (
                 <li key={layer.id} className="flex items-stretch gap-0.5">
                   <Button
@@ -189,7 +199,7 @@ export function CanvasLayerControl({
                         : "canvas.layersPanel.lockLayer",
                     )}
                     onClick={() => {
-                      if (lockPending) return;
+                      if (lockPending || interactionBlocked) return;
                       onToggleLock?.(layer.id, !layer.locked);
                     }}
                     className={cn(

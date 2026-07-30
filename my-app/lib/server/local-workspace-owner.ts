@@ -4,6 +4,7 @@ import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { ApiError } from "@/lib/server/errors";
 import { prisma } from "@/lib/server/prisma";
 import { ensureBuiltInProjectTemplates } from "@/lib/server/sample-projects";
+import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
 
 export interface LocalWorkspaceOwner {
   id: string;
@@ -43,6 +44,10 @@ function assertWorkspaceApiAllowed(): void {
 let ensurePromise: Promise<void> | null = null;
 
 async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
+  // Crash recovery must finish before any owner/bootstrap query so workspace
+  // APIs never observe a split media/config/DB restore.
+  await ensureWorkspaceRestoreReconciled();
+
   const existing = await prisma.user.findUnique({
     where: { id: LOCAL_WORKSPACE_OWNER.id },
     select: { id: true },

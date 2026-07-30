@@ -218,7 +218,8 @@ describe("entry-aware video generation controller", () => {
       expect(history.find("video-A")?.status).toBe("succeeded");
     });
     expect(createCount).toBe(1);
-    expect(history.find("video-A")?.jobId).toBe("job-rejoin");
+    // Authoritative success clears jobId so Regenerate cannot rejoin it.
+    expect(history.find("video-A")?.jobId).toBeNull();
     expect(history.find("video-A")?.assets[0]?.id).toBe("recovered");
     expect(statusCount).toBe(4);
     expect(registry.anyActive()).toBe(false);
@@ -269,7 +270,71 @@ describe("entry-aware video generation controller", () => {
       expect(history.find("video-A")?.status).toBe("succeeded");
     });
     expect(createCount).toBe(1);
-    expect(history.find("video-A")?.jobId).toBe("job-rate-limited");
+    expect(history.find("video-A")?.jobId).toBeNull();
     expect(statusCount).toBe(4);
+  });
+
+  it("after interrupt→successful rejoin, Regenerate POSTs a new job and never polls the old SUCCEEDED id", async () => {
+    const history = fakeHistory([videoEntry({ status: "running", error: null })]);
+    const registry = new GenerationActivityRegistry();
+    let createCount = 0;
+    const statusUrls: string[] = [];
+    const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/generate/video" && init?.method === "POST") {
+        createCount += 1;
+        return {
+          jobId: createCount === 1 ? "job-old" : "job-new",
+          status: "RUNNING",
+          duration: 6,
+          projectId: null,
+        };
+      }
+      statusUrls.push(url);
+      if (url.includes("job-old")) {
+        if (statusUrls.filter((entry) => entry.includes("job-old")).length <= 3) {
+          throw new HttpError("upstream", { status: 500, statusText: "Internal Server Error" });
+        }
+        return { status: "SUCCEEDED", asset: videoAsset("recovered") };
+      }
+      return { status: "SUCCEEDED", asset: videoAsset("regenerated") };
+    });
+    const controller = createVideoGenerationController({
+      registry,
+      history,
+      t: (key) => key,
+      request,
+      wait: vi.fn(async () => undefined),
+      createRunId: (() => {
+        let id = 0;
+        return () => `video-run-${++id}`;
+      })(),
+      maxPollErrors: 3,
+    });
+
+    await controller.retry("video-A");
+    await vi.waitFor(() => {
+      expect(history.find("video-A")?.status).toBe("interrupted");
+    });
+    expect(history.find("video-A")?.jobId).toBe("job-old");
+
+    await controller.retry("video-A");
+    await vi.waitFor(() => {
+      expect(history.find("video-A")?.status).toBe("succeeded");
+    });
+    expect(createCount).toBe(1);
+    expect(history.find("video-A")?.jobId).toBeNull();
+
+    await controller.retry("video-A");
+    await vi.waitFor(() => {
+      expect(history.find("video-A")?.assets[0]?.id).toBe("regenerated");
+    });
+    expect(createCount).toBe(2);
+    expect(statusUrls.some((url) => url.includes("/job-new/"))).toBe(true);
+    expect(
+      statusUrls.filter((url) => url.includes("/job-old/")).length,
+    ).toBe(4);
+    expect(history.find("video-A")?.jobId).toBeNull();
+    expect(registry.anyActive()).toBe(false);
   });
 });

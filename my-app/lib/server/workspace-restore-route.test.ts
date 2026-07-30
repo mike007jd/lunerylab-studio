@@ -9,6 +9,11 @@ const mocks = vi.hoisted(() => ({
   restoreWorkspaceBackup: vi.fn(),
   freeDiskBytes: vi.fn(),
   pgliteDiskBytes: vi.fn(),
+  readdirError: null as NodeJS.ErrnoException | null,
+  statError: null as NodeJS.ErrnoException | null,
+  rootStatError: null as NodeJS.ErrnoException | null,
+  statfsError: null as NodeJS.ErrnoException | null,
+  childStatFailuresRemaining: 0,
 }));
 
 vi.mock("@/lib/server/local-workspace-owner", () => ({
@@ -16,8 +21,8 @@ vi.mock("@/lib/server/local-workspace-owner", () => ({
 }));
 vi.mock("@/lib/server/workspace-backup", () => ({
   BACKUP_FORMAT: "lunery-workspace-backup",
-  BACKUP_VERSION: 2,
-  CURRENT_SCHEMA_VERSION: "20260601000000_initial.reference-set-default-v2",
+  BACKUP_VERSION: 3,
+  CURRENT_SCHEMA_VERSION: "20260601000000_initial.workspace-restore-v3",
   restoreWorkspaceBackup: mocks.restoreWorkspaceBackup,
 }));
 vi.mock("node:fs/promises", async () => {
@@ -25,6 +30,7 @@ vi.mock("node:fs/promises", async () => {
   return {
     ...actual,
     readdir: async () => {
+      if (mocks.readdirError) throw mocks.readdirError;
       const bytes = mocks.pgliteDiskBytes() ?? 0;
       if (bytes <= 0) return [];
       return [{
@@ -33,11 +39,26 @@ vi.mock("node:fs/promises", async () => {
         isFile: () => true,
       }];
     },
-    stat: async () => ({ size: mocks.pgliteDiskBytes() ?? 0 }),
-    statfs: async () => ({
-      bavail: Math.floor((mocks.freeDiskBytes() ?? 10 * 1024 * 1024 * 1024) / 4096),
-      bsize: 4096,
-    }),
+    stat: async (target: string) => {
+      if (!target.endsWith("base.dat") && mocks.rootStatError) {
+        throw mocks.rootStatError;
+      }
+      if (mocks.statError) throw mocks.statError;
+      if (mocks.childStatFailuresRemaining > 0) {
+        mocks.childStatFailuresRemaining -= 1;
+        const error = new Error("ENOENT") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      return { size: mocks.pgliteDiskBytes() ?? 0 };
+    },
+    statfs: async () => {
+      if (mocks.statfsError) throw mocks.statfsError;
+      return {
+        bavail: Math.floor((mocks.freeDiskBytes() ?? 10 * 1024 * 1024 * 1024) / 4096),
+        bsize: 4096,
+      };
+    },
   };
 });
 
@@ -91,9 +112,9 @@ function minimalBackup() {
   return {
     manifest: {
       format: "lunery-workspace-backup",
-      version: 2,
+      version: 3,
       appVersion: "0.2.1",
-      schemaVersion: "20260601000000_initial.reference-set-default-v2",
+      schemaVersion: "20260601000000_initial.workspace-restore-v3",
       createdAt: "2026-07-21T00:00:00.000Z",
       counts: Object.fromEntries(Object.keys(emptyData).map((key) => [key, 0])),
       dataSha256: "x".repeat(64),
@@ -113,6 +134,11 @@ beforeEach(() => {
   mocks.restoreWorkspaceBackup.mockResolvedValue({ projects: 1, assets: 2 });
   mocks.freeDiskBytes.mockReturnValue(10 * 1024 * 1024 * 1024);
   mocks.pgliteDiskBytes.mockReturnValue(0);
+  mocks.readdirError = null;
+  mocks.statError = null;
+  mocks.rootStatError = null;
+  mocks.statfsError = null;
+  mocks.childStatFailuresRemaining = 0;
 });
 
 describe("POST /api/workspace/restore", () => {
@@ -319,5 +345,104 @@ describe("POST /api/workspace/restore", () => {
 
     expect(response.status).toBe(200);
     expect(mocks.restoreWorkspaceBackup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["EACCES", "EIO"] as const)(
+    "fails closed when statfs returns %s",
+    async (code) => {
+      const error = new Error(code) as NodeJS.ErrnoException;
+      error.code = code;
+      mocks.statfsError = error;
+
+      const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "restore_capacity_unavailable",
+      });
+      expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails closed when PGlite root readdir returns EACCES", async () => {
+    const error = new Error("EACCES") as NodeJS.ErrnoException;
+    error.code = "EACCES";
+    mocks.readdirError = error;
+
+    const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "restore_capacity_unavailable",
+    });
+    expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a PGlite child stat returns EIO", async () => {
+    mocks.pgliteDiskBytes.mockReturnValue(1024);
+    const error = new Error("EIO") as NodeJS.ErrnoException;
+    error.code = "EIO";
+    mocks.statError = error;
+
+    const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "restore_capacity_unavailable",
+    });
+    expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+  });
+
+  it("treats a confirmed absent PGlite root as zero current DB size", async () => {
+    const error = new Error("ENOENT") as NodeJS.ErrnoException;
+    error.code = "ENOENT";
+    mocks.readdirError = error;
+    mocks.rootStatError = error;
+    mocks.freeDiskBytes.mockReturnValue(64 * 1024);
+
+    const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+    expect(response.status).toBe(200);
+    expect(mocks.restoreWorkspaceBackup).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when one root readdir ENOENT is not confirmed by stat", async () => {
+    const error = new Error("ENOENT") as NodeJS.ErrnoException;
+    error.code = "ENOENT";
+    mocks.readdirError = error;
+    mocks.pgliteDiskBytes.mockReturnValue(8 * 1024);
+
+    const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "restore_capacity_unavailable",
+    });
+    expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+  });
+
+  it("retries one transient child ENOENT then uses the measured size", async () => {
+    mocks.pgliteDiskBytes.mockReturnValue(5 * 1024);
+    mocks.freeDiskBytes.mockReturnValue(8 * 1024);
+    mocks.childStatFailuresRemaining = 1;
+
+    const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({ code: "request_too_large" });
+    expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when child ENOENT races exceed the retry budget", async () => {
+    mocks.pgliteDiskBytes.mockReturnValue(1024);
+    mocks.childStatFailuresRemaining = 10;
+
+    const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "restore_capacity_unavailable",
+    });
+    expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
   });
 });

@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   userFindUnique: vi.fn(),
   userCreate: vi.fn(),
   ensureBuiltInProjectTemplates: vi.fn(),
+  ensureWorkspaceRestoreReconciled: vi.fn(),
   isDesktopRuntime: vi.fn(),
 }));
 
@@ -25,12 +26,16 @@ vi.mock("@/lib/server/prisma", () => ({
 vi.mock("@/lib/server/sample-projects", () => ({
   ensureBuiltInProjectTemplates: mocks.ensureBuiltInProjectTemplates,
 }));
+vi.mock("@/lib/server/workspace-restore-journal", () => ({
+  ensureWorkspaceRestoreReconciled: mocks.ensureWorkspaceRestoreReconciled,
+}));
 
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   mocks.isDesktopRuntime.mockReturnValue(true);
   mocks.ensureBuiltInProjectTemplates.mockResolvedValue(undefined);
+  mocks.ensureWorkspaceRestoreReconciled.mockResolvedValue(undefined);
   mocks.userCreate.mockResolvedValue({ id: "owner" });
 });
 
@@ -47,6 +52,7 @@ describe("local workspace owner initialization", () => {
 
     await ensureLocalWorkspaceOwner();
 
+    expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
     expect(mocks.userCreate).toHaveBeenCalledTimes(1);
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledWith(LOCAL_WORKSPACE_OWNER.id);
   });
@@ -59,6 +65,7 @@ describe("local workspace owner initialization", () => {
 
     await ensureLocalWorkspaceOwner();
 
+    expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
     expect(mocks.userCreate).not.toHaveBeenCalled();
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledWith(LOCAL_WORKSPACE_OWNER.id);
   });
@@ -73,8 +80,25 @@ describe("local workspace owner initialization", () => {
       ensureLocalWorkspaceOwner(),
     ]);
 
+    expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
     expect(mocks.userFindUnique).toHaveBeenCalledTimes(1);
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles restore state before any owner bootstrap query", async () => {
+    const order: string[] = [];
+    mocks.ensureWorkspaceRestoreReconciled.mockImplementation(async () => {
+      order.push("reconcile");
+    });
+    mocks.userFindUnique.mockImplementation(async () => {
+      order.push("owner-query");
+      return { id: "owner" };
+    });
+    const { ensureLocalWorkspaceOwner } = await import("@/lib/server/local-workspace-owner");
+
+    await ensureLocalWorkspaceOwner();
+
+    expect(order).toEqual(["reconcile", "owner-query"]);
   });
 });
 

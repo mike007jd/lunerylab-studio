@@ -11,7 +11,7 @@
  * itself owns: layer selection and the agent dock.
  */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
@@ -33,10 +33,14 @@ import {
   createCanvasWriteLedger,
   type CanvasWriteLedger,
 } from "@/components/canvas/canvas-write-ledger";
+import type { LayerGeometryPatch } from "@/components/canvas/canvas-types";
 import { useCanvasAuthoritativeSync } from "@/components/canvas/use-canvas-authoritative-sync";
 import { useCanvasExport } from "@/components/canvas/use-canvas-export";
 import { useCanvasLayerLockBinding } from "@/components/canvas/use-canvas-layer-lock-binding";
-import { useCanvasPersistenceCoordinator } from "@/components/canvas/use-canvas-persistence-coordinator";
+import {
+  useCanvasPersistenceCoordinator,
+  type LayerDeletionPreparation,
+} from "@/components/canvas/use-canvas-persistence-coordinator";
 import { AgentChatPanel } from "@/components/studio/agent-chat-panel";
 import { useAgentChat } from "@/components/studio/agent-chat/use-agent-chat";
 import { Button } from "@/components/ui/button";
@@ -119,6 +123,24 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
     );
   }, []);
 
+  // Break the sync↔persistence hook cycle: sync needs delete preflight from
+  // persistence, but persistence is created after sync. The page owns the ref
+  // bridge so neither hook lists the other in its dependency graph.
+  const persistenceApiRef = useRef<{
+    prepareLayerDeletion: (layerId: string) => Promise<LayerDeletionPreparation>;
+    patchLayerGeometry: (layerId: string, patch: LayerGeometryPatch) => Promise<void>;
+  } | null>(null);
+
+  const prepareLayerDeletion = useCallback(
+    (layerId: string) =>
+      persistenceApiRef.current?.prepareLayerDeletion(layerId) ??
+      Promise.resolve({ ok: false, drainedGeometry: null, release() {} }),
+    [],
+  );
+  const requeueDrainedGeometry = useCallback((layerId: string, patch: LayerGeometryPatch) => {
+    void persistenceApiRef.current?.patchLayerGeometry(layerId, patch);
+  }, []);
+
   const sync = useCanvasAuthoritativeSync({
     sessionId,
     ledger: writeLedger,
@@ -128,6 +150,8 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
     pollWhenActive: chatOpen || chat.isRunning,
     pollIntervalMs: chat.isRunning ? 3000 : 8000,
     onLayersRemoved: handleLayersRemoved,
+    prepareLayerDeletion,
+    requeueDrainedGeometry,
   });
   const { layers, drawingState, loading, error } = sync;
 
@@ -141,6 +165,16 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
     applyLocalDrawingState: sync.applyLocalDrawingState,
     requestAuthoritativeResync: sync.resyncLayers,
   });
+  useEffect(() => {
+    const bridge = {
+      prepareLayerDeletion: persistence.prepareLayerDeletion,
+      patchLayerGeometry: persistence.patchLayerGeometry,
+    };
+    persistenceApiRef.current = bridge;
+    return () => {
+      if (persistenceApiRef.current === bridge) persistenceApiRef.current = null;
+    };
+  }, [persistence.prepareLayerDeletion, persistence.patchLayerGeometry]);
 
   const layerLock = useCanvasLayerLockBinding({
     sessionId,
@@ -320,6 +354,10 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
         onDeleteLayer={sync.deleteLayer}
         onToggleLock={layerLock.toggleLayerLock}
         isLockPending={layerLock.isLayerLockPending}
+        isLayerInteractionBlocked={(layerId) =>
+          layerLock.isLayerLockPending(layerId) ||
+          persistence.isDeletionBlocked(layerId)
+        }
         onDrawingStateDirty={persistence.handleDrawingStateDirty}
         onDrawingStateChange={persistence.handleDrawingStateChange}
       />

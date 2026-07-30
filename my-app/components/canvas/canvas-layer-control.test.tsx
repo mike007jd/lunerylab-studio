@@ -51,6 +51,7 @@ function mountControl({
   onDeleteLayer = vi.fn<(layerId: string) => void>(),
   onToggleLock = vi.fn<(layerId: string, locked: boolean) => void>(),
   isLockPending,
+  isInteractionBlocked,
 }: {
   layers?: KonvaLayerItem[];
   selectedLayerId?: string | null;
@@ -59,6 +60,7 @@ function mountControl({
   onDeleteLayer?: CanvasLayerControlProps["onDeleteLayer"];
   onToggleLock?: CanvasLayerControlProps["onToggleLock"];
   isLockPending?: CanvasLayerControlProps["isLockPending"];
+  isInteractionBlocked?: CanvasLayerControlProps["isInteractionBlocked"];
 } = {}) {
   act(() => {
     root.render(
@@ -71,6 +73,7 @@ function mountControl({
           onDeleteLayer={onDeleteLayer}
           onToggleLock={onToggleLock}
           isLockPending={isLockPending}
+          isInteractionBlocked={isInteractionBlocked}
         />
       </I18nProvider>,
     );
@@ -231,6 +234,31 @@ describe("CanvasLayerControl", () => {
     // The hint does not claim unavailable operations; it explains the lock.
     const hint = document.getElementById("canvas-layer-control-hint")!.textContent!;
     expect(hint).toContain(en.canvas.layersPanel.lockedSelected);
+  });
+
+  it("rejects move, resize, delete, and lock input while deletion owns the layer", () => {
+    const onPatchLayer = vi.fn<NonNullable<CanvasLayerControlProps["onPatchLayer"]>>();
+    const onDeleteLayer = vi.fn<(layerId: string) => void>();
+    const onToggleLock = vi.fn<(layerId: string, locked: boolean) => void>();
+    renderControl({
+      selectedLayerId: "a",
+      onPatchLayer,
+      onDeleteLayer,
+      onToggleLock,
+      isInteractionBlocked: (layerId) => layerId === "a",
+    });
+
+    const layer = layerButtons()[0]!;
+    keydown(layer, "ArrowRight");
+    keydown(layer, "ArrowDown", { shiftKey: true });
+    keydown(layer, "Delete");
+    act(() => {
+      lockButtons()[0]!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onPatchLayer).not.toHaveBeenCalled();
+    expect(onDeleteLayer).not.toHaveBeenCalled();
+    expect(onToggleLock).not.toHaveBeenCalled();
   });
 
   it("does not show the locked notice for unlocked selections", () => {

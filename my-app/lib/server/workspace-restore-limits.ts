@@ -33,6 +33,8 @@ const RESTORE_MODELS = [
 ] as const;
 
 const ESTIMATED_DB_ROW_OVERHEAD_BYTES = 256;
+/** Bound child ENOENT races from PGlite checkpoints before failing closed. */
+const PGLITE_SIZE_ENOENT_RETRIES = 3;
 
 function tooLarge(message: string): never {
   throw new ApiError({
@@ -43,42 +45,97 @@ function tooLarge(message: string): never {
   });
 }
 
+function capacityUnavailable(message: string): never {
+  throw new ApiError({
+    status: 503,
+    code: "restore_capacity_unavailable",
+    message,
+    retryable: true,
+  });
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === code;
+}
+
 function estimatedDecodedBytes(base64: string): number {
   const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
   return Math.floor((base64.length * 3) / 4) - padding;
 }
 
-async function freeDiskBytes(): Promise<number | null> {
+async function freeDiskBytes(): Promise<number> {
   try {
     const stats = await statfs(luneryProfileRoot());
     return stats.bavail * stats.bsize;
   } catch {
-    return null;
+    capacityUnavailable("Unable to determine free disk space for workspace restore.");
   }
 }
 
-async function directorySizeBytes(directory: string): Promise<number> {
+async function confirmedDirectoryAbsent(directory: string): Promise<boolean> {
+  try {
+    await stat(directory);
+    return false;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return true;
+    throw error;
+  }
+}
+
+async function directorySizeBytesOnce(
+  directory: string,
+  options: { topLevel?: boolean } = {},
+): Promise<number> {
   let entries: Dirent[];
   try {
     entries = await readdir(directory, { withFileTypes: true });
-  } catch {
-    return 0;
+  } catch (error) {
+    // A single root readdir ENOENT can be a transient probe/checkpoint race.
+    // Treat the database as absent only after an independent stat confirms it.
+    if (
+      options.topLevel &&
+      isErrno(error, "ENOENT") &&
+      (await confirmedDirectoryAbsent(directory))
+    ) {
+      return 0;
+    }
+    throw error;
   }
 
   let total = 0;
   for (const entry of entries) {
     const entryPath = path.join(directory, entry.name);
     if (entry.isDirectory()) {
-      total += await directorySizeBytes(entryPath);
+      total += await directorySizeBytesOnce(entryPath);
     } else if (entry.isFile()) {
       try {
         total += (await stat(entryPath)).size;
-      } catch {
-        // Files may disappear while PGlite checkpoints; skip transient entries.
+      } catch (error) {
+        // Child disappearance is retried at the outer level; every other
+        // probe failure (EACCES/EIO/…) fails closed.
+        throw error;
       }
     }
   }
   return total;
+}
+
+async function directorySizeBytes(directory: string): Promise<number> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < PGLITE_SIZE_ENOENT_RETRIES; attempt += 1) {
+    try {
+      return await directorySizeBytesOnce(directory, { topLevel: true });
+    } catch (error) {
+      lastError = error;
+      if (isErrno(error, "ENOENT") && attempt + 1 < PGLITE_SIZE_ENOENT_RETRIES) {
+        continue;
+      }
+      capacityUnavailable(
+        "Unable to determine the current PGlite database size for workspace restore.",
+      );
+    }
+  }
+  throw lastError;
 }
 
 /**
@@ -247,7 +304,7 @@ export async function assertRestoreDiskHeadroom(
   // theoretical maximum file allowance would incorrectly block tiny restores.
   const required = needed * 2;
   const free = await freeDiskBytes();
-  if (free !== null && free < required) {
+  if (free < required) {
     tooLarge("Insufficient disk space to stage the workspace restore.");
   }
 }

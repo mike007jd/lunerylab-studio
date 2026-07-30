@@ -41,6 +41,15 @@ CREATE TABLE "AppState" (
 );
 
 -- CreateTable
+CREATE TABLE "WorkspaceRestoreCommit" (
+    "id" TEXT NOT NULL DEFAULT 'singleton',
+    "token" TEXT NOT NULL,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "WorkspaceRestoreCommit_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL,
     "email" TEXT NOT NULL,

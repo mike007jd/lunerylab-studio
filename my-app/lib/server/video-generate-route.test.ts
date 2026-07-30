@@ -2,6 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
+import {
+  acquireWorkspaceExclusive,
+  getWorkspaceOperationGateStateForTests,
+  isDetachedVideoAdmission,
+  resetWorkspaceOperationGateForTests,
+} from "@/lib/server/workspace-operation-gate";
+
 const mocks = vi.hoisted(() => ({
   requireLocalWorkspaceOwner: vi.fn(),
   assertVideoGenerationPrismaSupport: vi.fn(),
@@ -102,6 +109,7 @@ function formRequest(fields: Record<string, string>): Request {
 describe("POST /api/generate/video", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetWorkspaceOperationGateForTests();
     mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
     mocks.assertVideoGenerationPrismaSupport.mockReturnValue(undefined);
     mocks.parseFormData.mockImplementation(async (request: Request) => request.formData());
@@ -124,7 +132,9 @@ describe("POST /api/generate/video", () => {
       kind: "created",
       job: { id: "job-1", status: "RUNNING", videoDuration: 6, projectId: null },
     });
-    mocks.runVideoJob.mockResolvedValue(undefined);
+    mocks.runVideoJob.mockImplementation(async (input: { workspaceAdmission: { release: () => void } }) => {
+      input.workspaceAdmission.release();
+    });
   });
 
   it("rejects unknown model ids as invalid_model", async () => {
@@ -138,14 +148,71 @@ describe("POST /api/generate/video", () => {
     expect(response.status).toBe(400);
     expect(body.code).toBe("invalid_model");
     expect(mocks.runVideoJob).not.toHaveBeenCalled();
+    expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(0);
   });
 
-  it("returns RUNNING immediately and observes the started job promise", async () => {
+  it("returns stable 409 and creates no job while backup owns exclusivity", async () => {
+    const release = acquireWorkspaceExclusive("backup");
+    try {
+      const response = await POST(
+        formRequest({
+          prompt: "a clip",
+          modelId: "byok:fal:bytedance/seedance",
+          duration: "6",
+        }) as never,
+      );
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({ code: "workspace_busy" });
+      expect(mocks.createOrReplayGenerationJob).not.toHaveBeenCalled();
+      expect(mocks.runVideoJob).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+  });
+
+  it("releases admission on cached replay without starting a job", async () => {
+    mocks.createOrReplayGenerationJob.mockResolvedValue({
+      kind: "cached",
+      job: { id: "job-cached", status: "SUCCEEDED", videoDuration: 6, projectId: null },
+    });
+
+    const response = await POST(
+      formRequest({
+        prompt: "a clip",
+        modelId: "byok:fal:bytedance/seedance",
+        duration: "6",
+      }) as never,
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.runVideoJob).not.toHaveBeenCalled();
+    expect(getWorkspaceOperationGateStateForTests()).toEqual({
+      exclusive: null,
+      activeVideoCount: 0,
+    });
+  });
+
+  it("acquires admission before job creation and transfers an unforgeable handle", async () => {
     let resolveJob!: () => void;
     const jobPromise = new Promise<void>((resolve) => {
       resolveJob = resolve;
     });
-    mocks.runVideoJob.mockReturnValue(jobPromise);
+    mocks.runVideoJob.mockImplementation(async (input: { workspaceAdmission: { release: () => void } }) => {
+      expect(isDetachedVideoAdmission(input.workspaceAdmission)).toBe(true);
+      await jobPromise;
+      input.workspaceAdmission.release();
+    });
+
+    const createOrder: string[] = [];
+    mocks.createOrReplayGenerationJob.mockImplementation(async () => {
+      createOrder.push("create");
+      expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(1);
+      return {
+        kind: "created",
+        job: { id: "job-1", status: "RUNNING", videoDuration: 6, projectId: null },
+      };
+    });
+
     const response = await POST(
       formRequest({
         prompt: "a clip",
@@ -161,9 +228,20 @@ describe("POST /api/generate/video", () => {
       status: "RUNNING",
       duration: 6,
     });
+    expect(createOrder).toEqual(["create"]);
     expect(mocks.runVideoJob).toHaveBeenCalledOnce();
+    expect(mocks.runVideoJob.mock.calls[0]![0]).toEqual(
+      expect.objectContaining({
+        workspaceAdmission: expect.any(Object),
+      }),
+    );
+    expect(mocks.runVideoJob.mock.calls[0]![0]).not.toHaveProperty("workspaceAdmissionHeld");
+    expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(1);
     resolveJob();
     await jobPromise;
+    await vi.waitFor(() => {
+      expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(0);
+    });
   });
 
   it("observes and logs a background job rejection after returning RUNNING", async () => {
@@ -171,7 +249,13 @@ describe("POST /api/generate/video", () => {
     const jobPromise = new Promise<void>((_resolve, reject) => {
       rejectJob = reject;
     });
-    mocks.runVideoJob.mockReturnValue(jobPromise);
+    mocks.runVideoJob.mockImplementation(async (input: { workspaceAdmission: { release: () => void } }) => {
+      try {
+        await jobPromise;
+      } finally {
+        input.workspaceAdmission.release();
+      }
+    });
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     try {
@@ -190,6 +274,9 @@ describe("POST /api/generate/video", () => {
           "[video_job_background_failed]",
           expect.objectContaining({ message: "background boom" }),
         );
+      });
+      await vi.waitFor(() => {
+        expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(0);
       });
     } finally {
       consoleError.mockRestore();

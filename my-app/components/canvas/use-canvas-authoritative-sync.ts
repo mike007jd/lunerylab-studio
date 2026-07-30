@@ -22,9 +22,14 @@ import {
 import type { CanvasCopy } from "@/components/canvas/canvas-copy";
 import type { CanvasLayerLockController } from "@/components/canvas/canvas-layer-lock";
 import { mapLayers } from "@/components/canvas/canvas-types";
-import type { RawLayer, SessionResponse } from "@/components/canvas/canvas-types";
+import type {
+  LayerGeometryPatch,
+  RawLayer,
+  SessionResponse,
+} from "@/components/canvas/canvas-types";
 import type { CanvasWriteLedger } from "@/components/canvas/canvas-write-ledger";
 import type { KonvaLayerItem } from "@/components/canvas/konva-stage";
+import type { LayerDeletionPreparation } from "@/components/canvas/use-canvas-persistence-coordinator";
 import { useCanvasSessionRefresh } from "@/components/canvas/use-canvas-session-refresh";
 import type { CanvasDrawingState } from "@/lib/canvas/drawing-state";
 import { deleteCanvasLayer, fetchCanvasSession } from "@/lib/client/canvas-sessions";
@@ -39,6 +44,16 @@ export interface UseCanvasAuthoritativeSyncArgs {
   pollIntervalMs: number;
   /** Selection lives on the page surface; it must release removed layers. */
   onLayersRemoved: (layerIds: readonly string[]) => void;
+  /**
+   * Persistence-owned delete preflight. Wired from the page via a ref so this
+   * owner does not depend on the persistence hook's render identity.
+   */
+  prepareLayerDeletion: (layerId: string) => Promise<LayerDeletionPreparation>;
+  /**
+   * Re-queue drained geometry after a failed DELETE leaves the layer present.
+   * Same page-boundary ref wiring as prepareLayerDeletion.
+   */
+  requeueDrainedGeometry: (layerId: string, patch: LayerGeometryPatch) => void;
 }
 
 export interface CanvasAuthoritativeSync {
@@ -65,6 +80,8 @@ export function useCanvasAuthoritativeSync({
   pollWhenActive,
   pollIntervalMs,
   onLayersRemoved,
+  prepareLayerDeletion,
+  requeueDrainedGeometry,
 }: UseCanvasAuthoritativeSyncArgs): CanvasAuthoritativeSync {
   const [layers, setLayers] = useState<KonvaLayerItem[]>([]);
   const layersRef = useRef<KonvaLayerItem[]>([]);
@@ -92,6 +109,14 @@ export function useCanvasAuthoritativeSync({
   useEffect(() => {
     onLayersRemovedRef.current = onLayersRemoved;
   }, [onLayersRemoved]);
+  const prepareLayerDeletionRef = useRef(prepareLayerDeletion);
+  useEffect(() => {
+    prepareLayerDeletionRef.current = prepareLayerDeletion;
+  }, [prepareLayerDeletion]);
+  const requeueDrainedGeometryRef = useRef(requeueDrainedGeometry);
+  useEffect(() => {
+    requeueDrainedGeometryRef.current = requeueDrainedGeometry;
+  }, [requeueDrainedGeometry]);
 
   const applyAuthoritativeLayers = useCallback(
     (incomingRaw: RawLayer[]) => {
@@ -128,11 +153,13 @@ export function useCanvasAuthoritativeSync({
     const orderToken = authoritativeResponseOrder.beginRecovery();
     try {
       const json = await fetchCanvasSession(sessionId, request.signal);
-      if (!request.isCurrent() || !orderToken.isCurrent()) return;
+      if (!request.isCurrent() || !orderToken.isCurrent()) return null;
       applyAuthoritativeLayers(json.session.layers);
+      return json.session.layers;
     } catch {
-      if (request.signal.aborted) return;
+      if (request.signal.aborted) return null;
       // Network still down — the save-failed toast already told the user.
+      return null;
     } finally {
       orderToken.finish();
     }
@@ -199,36 +226,119 @@ export function useCanvasAuthoritativeSync({
     }, [ledger]),
   });
 
+  const restoreAfterFailedDelete = useCallback(
+    async (
+      layerId: string,
+      localLayer: KonvaLayerItem,
+      drainedGeometry: LayerGeometryPatch | null,
+    ): Promise<{ confirmedAbsent: boolean; requeue: LayerGeometryPatch | null }> => {
+      ledger.rollbackLayerDeleted(layerId);
+      const authoritativeLayers = await runResync();
+      if (!authoritativeLayers) {
+        // The DELETE result is ambiguous and current server truth is
+        // unavailable. Restore the local layer instead of interpreting the
+        // optimistic absence as authoritative deletion.
+        const restored = drainedGeometry
+          ? { ...localLayer, ...drainedGeometry }
+          : localLayer;
+        setLayers((prev) => {
+          const withoutDuplicate = prev.filter((layer) => layer.id !== layerId);
+          const next = [...withoutDuplicate, restored].sort((left, right) => left.zIndex - right.zIndex);
+          layersRef.current = next;
+          return next;
+        });
+        return { confirmedAbsent: false, requeue: drainedGeometry };
+      }
+      const present = authoritativeLayers.some((layer) => layer.id === layerId);
+      if (!present) {
+        // Authoritative absence: retire writers only after the server proved
+        // the layer is gone — never before DELETE / resync.
+        ledger.retireLayers([layerId]);
+        return { confirmedAbsent: true, requeue: null };
+      }
+      if (!drainedGeometry || Object.keys(drainedGeometry).length === 0) {
+        return { confirmedAbsent: false, requeue: null };
+      }
+      setLayers((prev) => {
+        const next = prev.map((layer) =>
+          layer.id === layerId ? { ...layer, ...drainedGeometry } : layer,
+        );
+        layersRef.current = next;
+        return next;
+      });
+      return { confirmedAbsent: false, requeue: drainedGeometry };
+    },
+    [ledger, runResync],
+  );
+
   // User deleted an image layer inside the canvas — persist it so it doesn't
-  // resurrect on reload. Optimistic: local state updates immediately, a
-  // failed DELETE re-syncs from the server and tells the user.
+  // resurrect on reload. Optimistic after geometry drain: local state updates
+  // immediately, a failed DELETE re-syncs and restores drained geometry.
   const deleteLayer = useCallback(
     (layerId: string) => {
       if (lockController.isInteractionBlocked(layerId)) return;
       if (layersRef.current.find((layer) => layer.id === layerId)?.locked) return;
-      ledger.markLayerDeleted(layerId);
-      ledger.retireLayers([layerId]);
-      setLayers((prev) => prev.filter((layer) => layer.id !== layerId));
-      onLayersRemovedRef.current([layerId]);
       void (async () => {
+        let preparation: LayerDeletionPreparation;
+        try {
+          preparation = await prepareLayerDeletionRef.current(layerId);
+        } catch {
+          toast.error(copyRef.current.toastSaveFailed);
+          return;
+        }
+        if (!preparation.ok) {
+          // Drain failed: do not DELETE; persistence queues stay recoverable.
+          preparation.release();
+          return;
+        }
+        const drainedGeometry = preparation.drainedGeometry;
+        const localLayer = layersRef.current.find((layer) => layer.id === layerId);
+        if (!localLayer) {
+          preparation.release();
+          return;
+        }
+        let requeue: LayerGeometryPatch | null = null;
+        let notifyFailure = false;
+        ledger.markLayerDeleted(layerId);
+        // Do not retire writers here — only after DELETE success or a resync
+        // that proves the layer absent.
+        setLayers((prev) => prev.filter((layer) => layer.id !== layerId));
+        onLayersRemovedRef.current([layerId]);
         try {
           const resp = await deleteCanvasLayer(sessionId, layerId);
           if (resp.status === 404) {
             // Confirm current server truth instead of treating every 404 as proof
             // the layer stayed absent; a concurrent undo may have re-created it.
-            ledger.rollbackLayerDeleted(layerId);
-            await runResync();
-            return;
+            const recovery = await restoreAfterFailedDelete(
+              layerId,
+              localLayer,
+              drainedGeometry,
+            );
+            requeue = recovery.requeue;
+            notifyFailure = !recovery.confirmedAbsent;
+          } else if (!resp.ok) {
+            throw new Error(`status ${resp.status}`);
+          } else {
+            ledger.retireLayers([layerId]);
           }
-          if (!resp.ok) throw new Error(`status ${resp.status}`);
         } catch {
-          ledger.rollbackLayerDeleted(layerId);
-          toast.error(copyRef.current.toastDeleteLayerFailed);
-          void runResync();
+          const recovery = await restoreAfterFailedDelete(
+            layerId,
+            localLayer,
+            drainedGeometry,
+          );
+          requeue = recovery.requeue;
+          notifyFailure = !recovery.confirmedAbsent;
+        } finally {
+          preparation.release();
+        }
+        if (notifyFailure) toast.error(copyRef.current.toastDeleteLayerFailed);
+        if (requeue && Object.keys(requeue).length > 0) {
+          requeueDrainedGeometryRef.current(layerId, requeue);
         }
       })();
     },
-    [sessionId, ledger, lockController, runResync],
+    [sessionId, ledger, lockController, restoreAfterFailedDelete],
   );
 
   const isLayerLocked = useCallback(

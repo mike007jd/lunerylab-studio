@@ -7,12 +7,26 @@ import { APP_VERSION } from "@/lib/app-version";
 import { prisma } from "@/lib/server/prisma";
 import {
   getStoredFileMetadata,
-  listStoredRelativePaths,
   readStoredFile,
 } from "@/lib/server/storage";
 import { ApiError } from "@/lib/server/errors";
-import { luneryConfigDir, luneryMediaDir } from "@/lib/server/lunery-profile";
+import { luneryConfigDir } from "@/lib/server/lunery-profile";
 import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
+import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
+import {
+  RESTORE_JOURNAL_FORMAT,
+  RESTORE_JOURNAL_VERSION,
+  WORKSPACE_RESTORE_COMMIT_ID,
+  buildExpectedRestoreSwaps,
+  fsyncDirectory,
+  fsyncTree,
+  pathExists,
+  reconcileWorkspaceRestoreState,
+  removeRestoreJournal,
+  writeRestoreCommitMarker,
+  writeRestoreJournal,
+  type RestoreJournalSwap,
+} from "@/lib/server/workspace-restore-journal";
 
 /**
  * Workspace backup / restore.
@@ -21,24 +35,34 @@ import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
  * object with a manifest (app + schema version, per-file checksums, row counts).
  * Restore validates that manifest and refuses a partial or mismatched restore.
  *
- * Deliberately excluded: OS-keychain provider secrets. They live in the system
- * keychain, never in the DB, so a backup can be shared/moved without leaking
- * API keys. `manifest.excluded` records this.
+ * Deliberately excluded: OS-keychain provider secrets, and the internal restore
+ * journal / commit marker. Secrets live in the system keychain; the restore
+ * durability state is process-local recovery metadata, never user data.
  *
- * Restore replaces the current workspace after explicit confirmation. Incoming
- * media/config are fully staged and directory-swapped before the database
- * transaction; any database failure swaps the old directories back.
+ * Restore stages media/config, fsyncs staged trees, persists a durable journal
+ * before the first rename, fsyncs promoted parent metadata before the DB commit,
+ * then swaps directories and commits PGlite rows plus an internal commit marker
+ * in one transaction. Startup reconciliation yields old+old or new+new after
+ * process death.
  */
 
 export const BACKUP_FORMAT = "lunery-workspace-backup";
-export const BACKUP_VERSION = 2;
+export const BACKUP_VERSION = 3;
 /** Bump alongside any prisma/migrations change so a stale backup can't restore. */
 export const CURRENT_SCHEMA_VERSION =
-  "20260601000000_initial.reference-set-default-v2";
+  "20260601000000_initial.workspace-restore-v3";
+
+/**
+ * Prisma interactive transactions default to 5s. Restore/export near the row
+ * ceiling need a bounded but far larger window; keep one explicit timeout for
+ * both sides of the exclusive workspace boundary.
+ */
+export const WORKSPACE_DB_TRANSACTION_TIMEOUT_MS = 600_000;
 
 // Prisma model delegates, listed so a parent is always created before its
 // children on restore. Circular / self nullable FKs are stripped on first insert
-// and set in a second pass (see STRIP_ON_INSERT).
+// and set in a second pass (see STRIP_ON_INSERT). Internal restore durability
+// state is intentionally absent.
 const RESTORE_ORDER = [
   "appState",
   "user",
@@ -67,6 +91,14 @@ const STRIP_ON_INSERT: Partial<Record<ModelName, string[]>> = {
   agentTask: ["beforeSnapshotId"],
 };
 
+const BACKUP_EXCLUDED = [
+  "keychain-secrets",
+  "models",
+  "logs",
+  "runtime-temp",
+  "restore-journal",
+] as const;
+
 export interface WorkspaceBackup {
   manifest: {
     format: string;
@@ -83,6 +115,38 @@ export interface WorkspaceBackup {
   data: Record<string, Record<string, unknown>[]>;
   media: Array<{ path: string; base64: string }>;
   config: Array<{ path: string; base64: string }>;
+}
+
+/**
+ * Crash-injection boundaries for subprocess termination tests. Production
+ * callers leave the hook unset.
+ */
+export type RestorePromotionBoundary =
+  | "after-journal-before-staging"
+  | "after-media-stage-files"
+  | "after-media-stage-fsync"
+  | "after-config-stage-files"
+  | "after-config-stage-fsync"
+  | "before-media-root-to-previous"
+  | "after-media-root-to-previous"
+  | "after-media-staged-to-root"
+  | "before-config-root-to-previous"
+  | "after-config-root-to-previous"
+  | "after-config-staged-to-root"
+  | "after-commit-marker";
+
+type RestorePromotionHook = (boundary: RestorePromotionBoundary) => void | Promise<void>;
+
+let restorePromotionHook: RestorePromotionHook | null = null;
+
+export function setRestorePromotionHookForTests(hook: RestorePromotionHook | null): void {
+  restorePromotionHook = hook;
+}
+
+async function hitRestoreBoundary(boundary: RestorePromotionBoundary): Promise<void> {
+  if (restorePromotionHook) {
+    await restorePromotionHook(boundary);
+  }
 }
 
 function sha256(buffer: Buffer): string {
@@ -177,164 +241,175 @@ function assertBackupFileBudget(
   }
 }
 
-function delegate(model: ModelName) {
-  // The prisma client exposes each model as a delegate keyed by its camelCase
-  // name; the RESTORE_ORDER union keeps this access type-safe at the call sites.
-  return (prisma as unknown as Record<ModelName, {
-    findMany: (args?: unknown) => Promise<Record<string, unknown>[]>;
-    createMany: (args: { data: Record<string, unknown>[] }) => Promise<unknown>;
-    update: (args: { where: { id: string }; data: Record<string, unknown> }) => Promise<unknown>;
-    count: () => Promise<number>;
-  }>)[model];
+type ModelDelegate = {
+  findMany: (args?: unknown) => Promise<Record<string, unknown>[]>;
+  createMany: (args: { data: Record<string, unknown>[] }) => Promise<unknown>;
+  update: (args: { where: { id: string }; data: Record<string, unknown> }) => Promise<unknown>;
+  updateMany: (args: { data: Record<string, unknown> }) => Promise<unknown>;
+  deleteMany: () => Promise<unknown>;
+  count: () => Promise<number>;
+};
+
+function delegateFrom(client: unknown, model: ModelName): ModelDelegate {
+  return (client as Record<ModelName, ModelDelegate>)[model];
+}
+
+function mediaPathsFromAssetSnapshot(rows: Record<string, unknown>[]): string[] {
+  const paths = new Set<string>();
+  for (const row of rows) {
+    const storagePath = row.storagePath;
+    if (typeof storagePath !== "string" || !storagePath) continue;
+    paths.add(assertRelativeBackupPath(storagePath, new Set(["generated", "uploads"])));
+  }
+  return [...paths].sort((a, b) => a.localeCompare(b));
 }
 
 /**
  * Build a full workspace backup. Read-only. `createdAt` is injected by the caller
- * so this stays deterministic/testable.
+ * so this stays deterministic/testable. Holds exclusive ownership and keeps one
+ * RepeatableRead transaction open through media enumeration/reads so export only
+ * includes storage paths referenced by the transaction's Asset snapshot.
  */
 export async function exportWorkspaceBackup(createdAt: string): Promise<WorkspaceBackup> {
-  const data: WorkspaceBackup["data"] = {};
-  const counts: Record<string, number> = {};
-  let totalRows = 0;
-  for (const model of RESTORE_ORDER) {
-    const count = await delegate(model).count();
-    if (count > WORKSPACE_RESTORE_LIMITS.maxPerModelRows) {
-      backupTooLarge(
-        `${model} exceeds the ${WORKSPACE_RESTORE_LIMITS.maxPerModelRows} row JSON backup limit.`,
-      );
-    }
-    totalRows += count;
-    if (totalRows > WORKSPACE_RESTORE_LIMITS.maxTotalRows) {
-      backupTooLarge(
-        `Workspace exceeds the ${WORKSPACE_RESTORE_LIMITS.maxTotalRows} row JSON backup limit.`,
-      );
-    }
-    counts[model] = count;
-  }
+  return withWorkspaceExclusive("backup", async () => {
+    // Retry any committed cleanup retained after a prior recoverable failure
+    // before publishing another backup or overwriting its journal.
+    await reconcileWorkspaceRestoreState();
+    return prisma.$transaction(
+      async (tx) => {
+        const data: WorkspaceBackup["data"] = {};
+        const counts: Record<string, number> = {};
+        let totalRows = 0;
+        for (const model of RESTORE_ORDER) {
+          const rows = await delegateFrom(tx, model).findMany();
+          if (rows.length > WORKSPACE_RESTORE_LIMITS.maxPerModelRows) {
+            backupTooLarge(
+              `${model} exceeds the ${WORKSPACE_RESTORE_LIMITS.maxPerModelRows} row JSON backup limit.`,
+            );
+          }
+          totalRows += rows.length;
+          if (totalRows > WORKSPACE_RESTORE_LIMITS.maxTotalRows) {
+            backupTooLarge(
+              `Workspace exceeds the ${WORKSPACE_RESTORE_LIMITS.maxTotalRows} row JSON backup limit.`,
+            );
+          }
+          data[model] = rows;
+          counts[model] = rows.length;
+        }
 
-  totalRows = 0;
-  for (const model of RESTORE_ORDER) {
-    const rows = await delegate(model).findMany();
-    if (rows.length > WORKSPACE_RESTORE_LIMITS.maxPerModelRows) {
-      backupTooLarge(
-        `${model} changed beyond the ${WORKSPACE_RESTORE_LIMITS.maxPerModelRows} row JSON backup limit.`,
-      );
-    }
-    totalRows += rows.length;
-    if (totalRows > WORKSPACE_RESTORE_LIMITS.maxTotalRows) {
-      backupTooLarge(
-        `Workspace changed beyond the ${WORKSPACE_RESTORE_LIMITS.maxTotalRows} row JSON backup limit.`,
-      );
-    }
-    data[model] = rows;
-    counts[model] = rows.length;
-  }
+        const mediaPaths = mediaPathsFromAssetSnapshot(data.asset ?? []);
+        const mediaCandidates: Array<{ path: string; bytes: number }> = [];
+        for (const storagePath of mediaPaths) {
+          const metadata = await getStoredFileMetadata(storagePath);
+          mediaCandidates.push({
+            path: storagePath,
+            bytes: metadata.byteSize,
+          });
+        }
+        const configCandidates = await listDirectoryFileCandidates(luneryConfigDir());
+        const fileCandidates = [...mediaCandidates, ...configCandidates];
+        assertBackupFileBudget(fileCandidates);
 
-  const mediaPaths = await listStoredRelativePaths();
-  const mediaCandidates: Array<{ path: string; bytes: number }> = [];
-  for (const storagePath of mediaPaths) {
-    const metadata = await getStoredFileMetadata(storagePath);
-    mediaCandidates.push({
-      path: storagePath,
-      bytes: metadata.byteSize,
-    });
-  }
-  const configCandidates = await listDirectoryFileCandidates(luneryConfigDir());
-  const fileCandidates = [...mediaCandidates, ...configCandidates];
-  assertBackupFileBudget(fileCandidates);
+        const dataSha256 = dataChecksum(data);
+        const placeholderSha = "0".repeat(64);
+        const backupSkeleton: WorkspaceBackup = {
+          manifest: {
+            format: BACKUP_FORMAT,
+            version: BACKUP_VERSION,
+            appVersion: APP_VERSION,
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            createdAt,
+            counts,
+            dataSha256,
+            media: mediaCandidates.map((entry) => ({
+              path: entry.path,
+              sha256: placeholderSha,
+              bytes: entry.bytes,
+            })),
+            config: configCandidates.map((entry) => ({
+              path: entry.path,
+              sha256: placeholderSha,
+              bytes: entry.bytes,
+            })),
+            excluded: [...BACKUP_EXCLUDED],
+          },
+          data,
+          media: mediaCandidates.map((entry) => ({ path: entry.path, base64: "" })),
+          config: configCandidates.map((entry) => ({ path: entry.path, base64: "" })),
+        };
+        const predictedWireBytes =
+          Buffer.byteLength(JSON.stringify({ backup: backupSkeleton, confirm: true })) +
+          fileCandidates.reduce((sum, entry) => sum + base64EncodedLength(entry.bytes), 0);
+        if (predictedWireBytes > WORKSPACE_RESTORE_LIMITS.maxEncodedBytes) {
+          backupTooLarge(
+            `Workspace exceeds the ${WORKSPACE_RESTORE_LIMITS.maxEncodedBytes} byte JSON restore envelope.`,
+          );
+        }
 
-  const dataSha256 = dataChecksum(data);
-  const placeholderSha = "0".repeat(64);
-  const backupSkeleton: WorkspaceBackup = {
-    manifest: {
-      format: BACKUP_FORMAT,
-      version: BACKUP_VERSION,
-      appVersion: APP_VERSION,
-      schemaVersion: CURRENT_SCHEMA_VERSION,
-      createdAt,
-      counts,
-      dataSha256,
-      media: mediaCandidates.map((entry) => ({
-        path: entry.path,
-        sha256: placeholderSha,
-        bytes: entry.bytes,
-      })),
-      config: configCandidates.map((entry) => ({
-        path: entry.path,
-        sha256: placeholderSha,
-        bytes: entry.bytes,
-      })),
-      excluded: ["keychain-secrets", "models", "logs", "runtime-temp"],
-    },
-    data,
-    media: mediaCandidates.map((entry) => ({ path: entry.path, base64: "" })),
-    config: configCandidates.map((entry) => ({ path: entry.path, base64: "" })),
-  };
-  const predictedWireBytes =
-    Buffer.byteLength(JSON.stringify({ backup: backupSkeleton, confirm: true })) +
-    fileCandidates.reduce((sum, entry) => sum + base64EncodedLength(entry.bytes), 0);
-  if (predictedWireBytes > WORKSPACE_RESTORE_LIMITS.maxEncodedBytes) {
-    backupTooLarge(
-      `Workspace exceeds the ${WORKSPACE_RESTORE_LIMITS.maxEncodedBytes} byte JSON restore envelope.`,
+        const media: WorkspaceBackup["media"] = [];
+        const mediaManifest: WorkspaceBackup["manifest"]["media"] = [];
+        for (const candidate of mediaCandidates) {
+          const { file } = await readStoredFile(candidate.path);
+          if (file.byteLength !== candidate.bytes) {
+            backupTooLarge(`Workspace file changed while backup was being prepared: ${candidate.path}.`);
+          }
+          media.push({ path: candidate.path, base64: file.toString("base64") });
+          mediaManifest.push({
+            path: candidate.path,
+            sha256: sha256(file),
+            bytes: file.byteLength,
+          });
+        }
+
+        const config: WorkspaceBackup["config"] = [];
+        const configManifest: WorkspaceBackup["manifest"]["config"] = [];
+        for (const candidate of configCandidates) {
+          const bytes = await fs.readFile(candidate.absolutePath);
+          if (bytes.byteLength !== candidate.bytes) {
+            backupTooLarge(`Workspace config changed while backup was being prepared: ${candidate.path}.`);
+          }
+          config.push({ path: candidate.path, base64: bytes.toString("base64") });
+          configManifest.push({
+            path: candidate.path,
+            sha256: sha256(bytes),
+            bytes: bytes.byteLength,
+          });
+        }
+
+        const backup: WorkspaceBackup = {
+          manifest: {
+            format: BACKUP_FORMAT,
+            version: BACKUP_VERSION,
+            appVersion: APP_VERSION,
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            createdAt,
+            counts,
+            dataSha256,
+            media: mediaManifest,
+            config: configManifest,
+            excluded: [...BACKUP_EXCLUDED],
+          },
+          data,
+          media,
+          config,
+        };
+        if (
+          Buffer.byteLength(JSON.stringify({ backup, confirm: true })) >
+          WORKSPACE_RESTORE_LIMITS.maxEncodedBytes
+        ) {
+          backupTooLarge(
+            `Workspace changed beyond the ${WORKSPACE_RESTORE_LIMITS.maxEncodedBytes} byte JSON restore envelope.`,
+          );
+        }
+        return backup;
+      },
+      {
+        timeout: WORKSPACE_DB_TRANSACTION_TIMEOUT_MS,
+        maxWait: WORKSPACE_DB_TRANSACTION_TIMEOUT_MS,
+        isolationLevel: "RepeatableRead",
+      },
     );
-  }
-
-  const media: WorkspaceBackup["media"] = [];
-  const mediaManifest: WorkspaceBackup["manifest"]["media"] = [];
-  for (const candidate of mediaCandidates) {
-    const { file } = await readStoredFile(candidate.path);
-    if (file.byteLength !== candidate.bytes) {
-      backupTooLarge(`Workspace file changed while backup was being prepared: ${candidate.path}.`);
-    }
-    media.push({ path: candidate.path, base64: file.toString("base64") });
-    mediaManifest.push({
-      path: candidate.path,
-      sha256: sha256(file),
-      bytes: file.byteLength,
-    });
-  }
-
-  const config: WorkspaceBackup["config"] = [];
-  const configManifest: WorkspaceBackup["manifest"]["config"] = [];
-  for (const candidate of configCandidates) {
-    const bytes = await fs.readFile(candidate.absolutePath);
-    if (bytes.byteLength !== candidate.bytes) {
-      backupTooLarge(`Workspace config changed while backup was being prepared: ${candidate.path}.`);
-    }
-    config.push({ path: candidate.path, base64: bytes.toString("base64") });
-    configManifest.push({
-      path: candidate.path,
-      sha256: sha256(bytes),
-      bytes: bytes.byteLength,
-    });
-  }
-
-  const backup: WorkspaceBackup = {
-    manifest: {
-      format: BACKUP_FORMAT,
-      version: BACKUP_VERSION,
-      appVersion: APP_VERSION,
-      schemaVersion: CURRENT_SCHEMA_VERSION,
-      createdAt,
-      counts,
-      dataSha256,
-      media: mediaManifest,
-      config: configManifest,
-      excluded: ["keychain-secrets", "models", "logs", "runtime-temp"],
-    },
-    data,
-    media,
-    config,
-  };
-  if (
-    Buffer.byteLength(JSON.stringify({ backup, confirm: true })) >
-    WORKSPACE_RESTORE_LIMITS.maxEncodedBytes
-  ) {
-    backupTooLarge(
-      `Workspace changed beyond the ${WORKSPACE_RESTORE_LIMITS.maxEncodedBytes} byte JSON restore envelope.`,
-    );
-  }
-  return backup;
+  });
 }
 
 function integrityError(code: string, message: string): never {
@@ -437,9 +512,26 @@ function reviveDates(row: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+async function removeStagedSwaps(swaps: RestoreJournalSwap[]): Promise<void> {
+  const failures: unknown[] = [];
+  for (const swap of swaps) {
+    try {
+      if (await pathExists(swap.staged)) {
+        await fs.rm(swap.staged, { recursive: true, force: true });
+      }
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw failures[0];
+  }
+}
+
 /**
- * Replace the current workspace with a verified backup. Incoming files are
- * staged first; directory swaps are rolled back if the DB transaction fails.
+ * Replace the current workspace with a verified backup. A durable journal is
+ * published before staging begins; staged trees and promoted parent metadata
+ * are fsynced before the DB replacement transaction can commit.
  */
 export async function restoreWorkspaceBackup(
   backup: WorkspaceBackup,
@@ -455,140 +547,209 @@ export async function restoreWorkspaceBackup(
   }
   verifyBackupIntegrity(backup);
 
-  const counts: Record<string, number> = {};
-  const deferredUpdates: Array<{ model: ModelName; id: string; data: Record<string, unknown> }> = [];
-
-  const stageDirectory = async (
-    root: string,
-    entries: Array<{ path: string; base64: string }>,
-    allowedRoots?: ReadonlySet<string>,
-  ) => {
+  return withWorkspaceExclusive("restore", async () => {
+    // A previous committed cleanup may have intentionally retained its journal
+    // for retry. Resolve it before a new token can replace that durable plan.
+    await reconcileWorkspaceRestoreState();
+    const counts: Record<string, number> = {};
+    const deferredUpdates: Array<{ model: ModelName; id: string; data: Record<string, unknown> }> = [];
     const token = randomUUID();
-    const staged = path.join(path.dirname(root), `.${path.basename(root)}.restore-stage-${token}`);
-    const previous = path.join(path.dirname(root), `.${path.basename(root)}.restore-previous-${token}`);
-    try {
-      await fs.mkdir(staged, { recursive: true });
-      for (const entry of entries) {
-        const relative = assertRelativeBackupPath(entry.path, allowedRoots);
-        const target = path.join(staged, ...relative.split("/"));
-        await fs.mkdir(path.dirname(target), { recursive: true });
-        await fs.writeFile(target, Buffer.from(entry.base64, "base64"), { flag: "wx" });
+    const expected = buildExpectedRestoreSwaps(token);
+
+    const stageDirectory = async (
+      plan: RestoreJournalSwap,
+      entries: Array<{ path: string; base64: string }>,
+      boundaryPrefix: "media" | "config",
+      allowedRoots?: ReadonlySet<string>,
+    ): Promise<void> => {
+      try {
+        await fs.mkdir(plan.staged, { recursive: true });
+        for (const entry of entries) {
+          const relative = assertRelativeBackupPath(entry.path, allowedRoots);
+          const target = path.join(plan.staged, ...relative.split("/"));
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          await fs.writeFile(target, Buffer.from(entry.base64, "base64"), { flag: "wx" });
+        }
+        await hitRestoreBoundary(`after-${boundaryPrefix}-stage-files`);
+        await fsyncTree(plan.staged);
+        await hitRestoreBoundary(`after-${boundaryPrefix}-stage-fsync`);
+      } catch (error) {
+        await fs.rm(plan.staged, { recursive: true, force: true });
+        throw error;
       }
+    };
+
+    const swaps: RestoreJournalSwap[] = [];
+    for (const plan of expected) {
+      await fs.mkdir(path.dirname(plan.root), { recursive: true });
+      swaps.push({
+        ...plan,
+        previousExisted: await pathExists(plan.root),
+      });
+    }
+
+    let journalWritten = false;
+    try {
+      // Publish the durable plan before even staging payload bytes. A kill
+      // during file writes/fsync can then remove every partial stage tree.
+      await writeRestoreJournal({
+        format: RESTORE_JOURNAL_FORMAT,
+        version: RESTORE_JOURNAL_VERSION,
+        token,
+        swaps,
+      });
+      journalWritten = true;
+      await hitRestoreBoundary("after-journal-before-staging");
+
+      const mediaSwap = swaps[0]!;
+      const configSwap = swaps[1]!;
+      await stageDirectory(
+        mediaSwap,
+        backup.media,
+        "media",
+        new Set(["generated", "uploads"]),
+      );
+      await stageDirectory(configSwap, backup.config, "config");
+
+      await hitRestoreBoundary("before-media-root-to-previous");
+      if (mediaSwap.previousExisted) await fs.rename(mediaSwap.root, mediaSwap.previous);
+      await hitRestoreBoundary("after-media-root-to-previous");
+      await fs.rename(mediaSwap.staged, mediaSwap.root);
+      await hitRestoreBoundary("after-media-staged-to-root");
+
+      await hitRestoreBoundary("before-config-root-to-previous");
+      if (configSwap.previousExisted) await fs.rename(configSwap.root, configSwap.previous);
+      await hitRestoreBoundary("after-config-root-to-previous");
+      await fs.rename(configSwap.staged, configSwap.root);
+      await hitRestoreBoundary("after-config-staged-to-root");
+
+      // Parent-directory metadata for the promoted roots must be durable before
+      // the DB commit marker lands.
+      await fsyncDirectory(path.dirname(mediaSwap.root));
+      await fsyncDirectory(path.dirname(configSwap.root));
+      await fsyncDirectory(mediaSwap.root).catch((error) => {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
+        throw error;
+      });
+      await fsyncDirectory(configSwap.root).catch((error) => {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
+        throw error;
+      });
+
+      await prisma.$transaction(
+        async (tx) => {
+          const txDelegate = (model: ModelName) => delegateFrom(tx, model);
+
+          await txDelegate("generationJob").updateMany({ data: { agentTaskId: null } });
+          await txDelegate("asset").updateMany({ data: { agentTaskId: null, parentAssetId: null } });
+          await txDelegate("canvasSession").updateMany({ data: { selectedAssetId: null } });
+          await txDelegate("agentTask").updateMany({ data: { beforeSnapshotId: null } });
+          for (const model of [...RESTORE_ORDER].reverse()) await txDelegate(model).deleteMany();
+
+          for (const model of RESTORE_ORDER) {
+            const rows = (backup.data[model] ?? []).map(reviveDates);
+            if (rows.length === 0) {
+              counts[model] = 0;
+              continue;
+            }
+            const strip = STRIP_ON_INSERT[model];
+            const insertRows = rows.map((row) => {
+              if (!strip) return row;
+              const copy = { ...row };
+              const carried: Record<string, unknown> = {};
+              for (const field of strip) {
+                if (copy[field] != null) carried[field] = copy[field];
+                copy[field] = null;
+              }
+              // Prisma refreshes @updatedAt on the deferred FK update. Carry the
+              // original timestamp through the second pass so restore is lossless.
+              if (Object.keys(carried).length > 0 && copy.updatedAt != null) {
+                carried.updatedAt = copy.updatedAt;
+              }
+              if (Object.keys(carried).length > 0) {
+                deferredUpdates.push({ model, id: String(copy.id), data: carried });
+              }
+              return copy;
+            });
+            await txDelegate(model).createMany({ data: insertRows });
+            counts[model] = insertRows.length;
+          }
+
+          // Second pass: set the stripped circular / self FKs now that every row exists.
+          for (const update of deferredUpdates) {
+            await txDelegate(update.model).update({ where: { id: update.id }, data: update.data });
+          }
+
+          await writeRestoreCommitMarker(token, tx as never);
+        },
+        {
+          timeout: WORKSPACE_DB_TRANSACTION_TIMEOUT_MS,
+          maxWait: WORKSPACE_DB_TRANSACTION_TIMEOUT_MS,
+        },
+      );
+      await hitRestoreBoundary("after-commit-marker");
     } catch (error) {
-      await fs.rm(staged, { recursive: true, force: true });
+      if (journalWritten) {
+        // Never swallow rollback failure and never delete the journal unless
+        // deterministic reconciliation completed.
+        try {
+          await reconcileWorkspaceRestoreState();
+        } catch (reconcileError) {
+          throw new ApiError({
+            status: 500,
+            code: "restore_rollback_failed",
+            message: "Restore failed and crash-safe reconciliation could not finish.",
+            retryable: false,
+            details: {
+              cause: error instanceof Error ? error.message : String(error),
+              reconcile:
+                reconcileError instanceof Error ? reconcileError.message : String(reconcileError),
+            },
+          });
+        }
+      } else {
+        await removeStagedSwaps(swaps);
+      }
       throw error;
     }
-    return { root, staged, previous, previousExists: false, active: false };
-  };
 
-  const swaps: Awaited<ReturnType<typeof stageDirectory>>[] = [];
-  try {
-    swaps.push(await stageDirectory(luneryMediaDir(), backup.media, new Set(["generated", "uploads"])));
-    swaps.push(await stageDirectory(luneryConfigDir(), backup.config));
-  } catch (error) {
-    await Promise.allSettled(swaps.map((swap) => fs.rm(swap.staged, { recursive: true, force: true })));
-    throw error;
-  }
-
-  const pathExists = async (value: string) => fs.access(value).then(() => true, () => false);
-  const rollbackSwaps = async () => {
-    const failures: unknown[] = [];
-    for (const swap of [...swaps].reverse()) {
-      try {
-        if (swap.active) await fs.rm(swap.root, { recursive: true, force: true });
-        if (swap.previousExists) await fs.rename(swap.previous, swap.root);
-        await fs.rm(swap.staged, { recursive: true, force: true });
-      } catch (error) {
-        failures.push(error);
-      }
-    }
-    if (failures.length > 0) {
-      throw new ApiError({
-        status: 500,
-        code: "restore_rollback_failed",
-        message: "Restore failed and the previous local files could not be fully restored.",
-        retryable: false,
-      });
-    }
-  };
-
-  try {
+    const warnings: string[] = [];
     for (const swap of swaps) {
-      await fs.mkdir(path.dirname(swap.root), { recursive: true });
-      swap.previousExists = await pathExists(swap.root);
-      if (swap.previousExists) await fs.rename(swap.root, swap.previous);
-      await fs.rename(swap.staged, swap.root);
-      swap.active = true;
-    }
-
-    await prisma.$transaction(async (tx) => {
-    const txDelegate = (model: ModelName) =>
-      (tx as unknown as Record<ModelName, {
-        createMany: (args: { data: Record<string, unknown>[] }) => Promise<unknown>;
-        update: (args: { where: { id: string }; data: Record<string, unknown> }) => Promise<unknown>;
-        updateMany: (args: { data: Record<string, unknown> }) => Promise<unknown>;
-        deleteMany: () => Promise<unknown>;
-      }>)[model];
-
-    await txDelegate("generationJob").updateMany({ data: { agentTaskId: null } });
-    await txDelegate("asset").updateMany({ data: { agentTaskId: null, parentAssetId: null } });
-    await txDelegate("canvasSession").updateMany({ data: { selectedAssetId: null } });
-    await txDelegate("agentTask").updateMany({ data: { beforeSnapshotId: null } });
-    for (const model of [...RESTORE_ORDER].reverse()) await txDelegate(model).deleteMany();
-
-    for (const model of RESTORE_ORDER) {
-      const rows = (backup.data[model] ?? []).map(reviveDates);
-      if (rows.length === 0) {
-        counts[model] = 0;
-        continue;
+      if (!(await pathExists(swap.root))) {
+        // The DB commit is durable, so absence of a promoted tree is not a
+        // cleanup warning. Keep journal + previous trees and fail closed.
+        throw new ApiError({
+          status: 500,
+          code: "restore_committed_root_missing",
+          message: `Committed restore root is missing: ${path.basename(swap.root)}.`,
+          retryable: false,
+        });
       }
-      const strip = STRIP_ON_INSERT[model];
-      const insertRows = rows.map((row) => {
-        if (!strip) return row;
-        const copy = { ...row };
-        const carried: Record<string, unknown> = {};
-        for (const field of strip) {
-          if (copy[field] != null) carried[field] = copy[field];
-          copy[field] = null;
-        }
-        // Prisma refreshes @updatedAt on the deferred FK update. Carry the
-        // original timestamp through the second pass so restore is lossless.
-        if (Object.keys(carried).length > 0 && copy.updatedAt != null) {
-          carried.updatedAt = copy.updatedAt;
-        }
-        if (Object.keys(carried).length > 0) {
-          deferredUpdates.push({ model, id: String(copy.id), data: carried });
-        }
-        return copy;
+    }
+    for (const swap of swaps) {
+      if (!swap.previousExisted) continue;
+      try {
+        await fs.rm(swap.previous, { recursive: true, force: true });
+      } catch {
+        warnings.push(
+          `Previous ${path.basename(swap.root)} directory cleanup is pending and will retry on restart.`,
+        );
+      }
+    }
+
+    if (warnings.length === 0) {
+      // Journal first, then DB marker — preserves the recovery ordering contract.
+      await removeRestoreJournal();
+      await prisma.workspaceRestoreCommit.deleteMany({
+        where: { id: WORKSPACE_RESTORE_COMMIT_ID },
       });
-      await txDelegate(model).createMany({ data: insertRows });
-      counts[model] = insertRows.length;
     }
 
-    // Second pass: set the stripped circular / self FKs now that every row exists.
-    for (const update of deferredUpdates) {
-      await txDelegate(update.model).update({ where: { id: update.id }, data: update.data });
-    }
-    });
-  } catch (error) {
-    await rollbackSwaps();
-    throw error;
-  }
-
-  const warnings: string[] = [];
-  for (const swap of swaps) {
-    if (!swap.previousExists) continue;
-    try {
-      await fs.rm(swap.previous, { recursive: true, force: true });
-    } catch {
-      warnings.push(`Previous ${path.basename(swap.root)} directory could not be removed.`);
-    }
-  }
-
-  return {
-    counts,
-    mediaRestored: backup.media.length,
-    configRestored: backup.config.length,
-    warnings,
-  };
+    return {
+      counts,
+      mediaRestored: backup.media.length,
+      configRestored: backup.config.length,
+      warnings,
+    };
+  });
 }

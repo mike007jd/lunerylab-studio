@@ -134,6 +134,84 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+describe("canvas persistence coordinator delete preflight", () => {
+  it("installs a synchronous barrier, drains pending geometry, and releases once", async () => {
+    let resolvePatch!: (response: Response) => void;
+    const patchGate = new Promise<Response>((resolve) => {
+      resolvePatch = resolve;
+    });
+    fetchMock.mockImplementation(() => patchGate);
+    await mountCoordinator();
+
+    await act(async () => {
+      await coordinator.patchLayerGeometry("layer-1", { x: 77 });
+    });
+
+    let preparation!: Awaited<ReturnType<typeof coordinator.prepareLayerDeletion>>;
+    let prepareDone = false;
+    await act(async () => {
+      const pending = coordinator.prepareLayerDeletion("layer-1");
+      // Barrier is synchronous — held before the first await yields.
+      expect(coordinator.isDeletionBlocked("layer-1")).toBe(true);
+      // New transforms cannot race the drain/delete preflight.
+      await coordinator.patchLayerGeometry("layer-1", { x: 99 });
+      resolvePatch(jsonResponse(200, {}));
+      preparation = await pending;
+      prepareDone = true;
+    });
+
+    expect(prepareDone).toBe(true);
+    expect(preparation.ok).toBe(true);
+    expect(preparation.drainedGeometry).toEqual({ x: 77 });
+    // The caller owns the barrier through DELETE/recovery.
+    expect(coordinator.isDeletionBlocked("layer-1")).toBe(true);
+    preparation.release();
+    preparation.release();
+    expect(coordinator.isDeletionBlocked("layer-1")).toBe(false);
+    expect(patchRequests()).toEqual([
+      { url: "/api/canvas/sessions/sess-1/layers/layer-1", body: { x: 77 } },
+    ]);
+    // The racing x=99 was rejected while the barrier was held.
+    expect(patchRequests()).toHaveLength(1);
+  });
+
+  it("returns ok=false when drain fails and leaves the queue recoverable", async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(500, {})));
+    await mountCoordinator();
+
+    await act(async () => {
+      await coordinator.patchLayerGeometry("layer-1", { x: 77 });
+    });
+
+    let preparation!: Awaited<ReturnType<typeof coordinator.prepareLayerDeletion>>;
+    await act(async () => {
+      const pending = coordinator.prepareLayerDeletion("layer-1");
+      await vi.advanceTimersByTimeAsync(10_000);
+      preparation = await pending;
+    });
+
+    expect(preparation.ok).toBe(false);
+    expect(preparation.drainedGeometry).toEqual({ x: 77 });
+    expect(coordinator.isDeletionBlocked("layer-1")).toBe(true);
+    preparation.release();
+    expect(coordinator.isDeletionBlocked("layer-1")).toBe(false);
+    // Queue remains dirty/recoverable — a later flush can still persist.
+    expect(ledger.dirtyGeometryIds().has("layer-1")).toBe(true);
+
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, {})));
+    let recovered: boolean | undefined;
+    await act(async () => {
+      await coordinator.patchLayerGeometry("layer-1", { x: 88 });
+      recovered = await coordinator.flushPendingGeometry("layer-1");
+    });
+    expect(recovered).toBe(true);
+    expect(patchRequests().at(-1)).toEqual({
+      url: "/api/canvas/sessions/sess-1/layers/layer-1",
+      body: { x: 88 },
+    });
+  });
+});
+
 describe("canvas persistence coordinator geometry writes", () => {
   it("coalesces a drag burst into one PATCH and only then reports saved", async () => {
     await mountCoordinator();

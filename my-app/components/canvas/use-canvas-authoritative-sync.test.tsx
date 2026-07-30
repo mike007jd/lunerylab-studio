@@ -18,6 +18,13 @@ import {
   useCanvasAuthoritativeSync,
   type CanvasAuthoritativeSync,
 } from "@/components/canvas/use-canvas-authoritative-sync";
+import {
+  useCanvasPersistenceCoordinator,
+  type CanvasPersistenceCoordinator,
+  type LayerDeletionPreparation,
+} from "@/components/canvas/use-canvas-persistence-coordinator";
+import type { LayerGeometryPatch } from "@/components/canvas/canvas-types";
+import type { KonvaStageHandle } from "@/components/canvas/konva-stage";
 import type { CanvasDrawingState } from "@/lib/canvas/drawing-state";
 
 vi.mock("sonner", () => ({
@@ -98,6 +105,13 @@ let revision: string;
 let deleteResponse: Response;
 let deleteCalls: string[];
 let sessionGetQueue: Array<() => Promise<Response>>;
+let prepareLayerDeletion: ReturnType<
+  typeof vi.fn<(layerId: string) => Promise<LayerDeletionPreparation>>
+>;
+let requeueDrainedGeometry: ReturnType<
+  typeof vi.fn<(layerId: string, patch: LayerGeometryPatch) => void>
+>;
+let retiredLayerIds: string[][];
 
 function sessionResponse(): Response {
   return jsonResponse(200, { session: { id: "sess-1", ...session } });
@@ -120,6 +134,8 @@ function Harness({
     onLayersRemoved: (layerIds) => {
       removedLayerIds.push(...layerIds);
     },
+    prepareLayerDeletion,
+    requeueDrainedGeometry,
   });
   // Publish the committed API for assertions; never during render.
   useEffect(() => {
@@ -148,6 +164,11 @@ beforeEach(() => {
   deleteResponse = jsonResponse(200, {});
   deleteCalls = [];
   sessionGetQueue = [];
+  prepareLayerDeletion = vi.fn<(layerId: string) => Promise<LayerDeletionPreparation>>(
+    async () => ({ ok: true, drainedGeometry: null, release() {} }),
+  );
+  requeueDrainedGeometry = vi.fn<(layerId: string, patch: LayerGeometryPatch) => void>();
+  retiredLayerIds = [];
   fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = (init?.method ?? "GET").toUpperCase();
@@ -279,9 +300,17 @@ describe("canvas authoritative sync response ordering", () => {
 });
 
 describe("canvas authoritative sync layer deletion", () => {
-  it("removes the layer optimistically and restores it from storage on failure", async () => {
+  it("removes the layer optimistically and restores drained geometry on failure", async () => {
+    const release = vi.fn();
+    prepareLayerDeletion.mockResolvedValue({
+      ok: true,
+      drainedGeometry: { x: 77 },
+      release,
+    });
     await mountSync();
     deleteResponse = jsonResponse(500, {});
+    // Stale server snapshot — drained geometry must still win after resync.
+    session = { layers: [rawLayer("l1", { x: 0 }), rawLayer("l2")], updatedAt: "2" };
 
     await act(async () => {
       sync.deleteLayer("l1");
@@ -293,12 +322,83 @@ describe("canvas authoritative sync layer deletion", () => {
     expect(ledger.pendingDeletedIds().has("l1")).toBe(false);
     expect(removedLayerIds).toEqual(["l1"]);
     expect(sync.layers.map((layer) => layer.id)).toEqual(["l1", "l2"]);
+    expect(sync.layers.find((layer) => layer.id === "l1")?.x).toBe(77);
+    expect(requeueDrainedGeometry).toHaveBeenCalledWith("l1", { x: 77 });
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
-  it("confirms server truth instead of trusting a 404", async () => {
+  it("does not send DELETE when geometry drain fails and keeps retirement idle", async () => {
+    const release = vi.fn();
+    prepareLayerDeletion.mockResolvedValue({
+      ok: false,
+      drainedGeometry: { x: 77 },
+      release,
+    });
+    await mountSync();
+    const retireSpy = vi.fn((ids: readonly string[]) => {
+      retiredLayerIds.push([...ids]);
+    });
+    ledger.onRetireLayers(retireSpy);
+
+    await act(async () => {
+      sync.deleteLayer("l1");
+    });
+
+    expect(deleteCalls).toEqual([]);
+    expect(retireSpy).not.toHaveBeenCalled();
+    expect(sync.layers.map((layer) => layer.id)).toEqual(["l1", "l2"]);
+    expect(ledger.pendingDeletedIds().has("l1")).toBe(false);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the local layer and drained geometry when DELETE and recovery GET both fail", async () => {
+    const release = vi.fn();
+    prepareLayerDeletion.mockResolvedValue({
+      ok: true,
+      drainedGeometry: { x: 77 },
+      release,
+    });
+    await mountSync();
+    deleteResponse = jsonResponse(500, {});
+    sessionGetQueue.push(() => Promise.reject(new Error("still offline")));
+    const retireSpy = vi.fn();
+    ledger.onRetireLayers(retireSpy);
+
+    await act(async () => {
+      sync.deleteLayer("l1");
+    });
+
+    expect(sync.layers.find((layer) => layer.id === "l1")?.x).toBe(77);
+    expect(retireSpy).not.toHaveBeenCalled();
+    expect(requeueDrainedGeometry).toHaveBeenCalledWith("l1", { x: 77 });
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(copy.toastDeleteLayerFailed);
+  });
+
+  it("retires persistence only after DELETE succeeds", async () => {
+    await mountSync();
+    const retireSpy = vi.fn((ids: readonly string[]) => {
+      retiredLayerIds.push([...ids]);
+    });
+    ledger.onRetireLayers(retireSpy);
+
+    await act(async () => {
+      sync.deleteLayer("l1");
+    });
+
+    expect(deleteCalls).toEqual(["/api/canvas/sessions/sess-1/layers/l1"]);
+    expect(retireSpy).toHaveBeenCalledWith(["l1"]);
+    expect(sync.layers.map((layer) => layer.id)).toEqual(["l2"]);
+  });
+
+  it("confirms server truth instead of trusting a 404 and retires when absent", async () => {
     await mountSync();
     deleteResponse = jsonResponse(404, {});
     session = { layers: [rawLayer("l2")], updatedAt: "2" };
+    const retireSpy = vi.fn((ids: readonly string[]) => {
+      retiredLayerIds.push([...ids]);
+    });
+    ledger.onRetireLayers(retireSpy);
 
     await act(async () => {
       sync.deleteLayer("l1");
@@ -307,6 +407,7 @@ describe("canvas authoritative sync layer deletion", () => {
     expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
     expect(ledger.pendingDeletedIds().has("l1")).toBe(false);
     expect(sync.layers.map((layer) => layer.id)).toEqual(["l2"]);
+    expect(retireSpy).toHaveBeenCalledWith(["l1"]);
   });
 
   it("refuses to delete a locked layer", async () => {
@@ -319,6 +420,131 @@ describe("canvas authoritative sync layer deletion", () => {
 
     expect(deleteCalls).toEqual([]);
     expect(sync.layers.map((layer) => layer.id)).toEqual(["l1"]);
+  });
+});
+
+describe("canvas delete cross-owner integrity", () => {
+  it("drains pending x=77 before DELETE, restores it after failed DELETE + resync", async () => {
+    let crossSync!: CanvasAuthoritativeSync;
+    let crossPersistence!: CanvasPersistenceCoordinator;
+    const persistenceApiRef: {
+      current: {
+        prepareLayerDeletion: CanvasPersistenceCoordinator["prepareLayerDeletion"];
+        patchLayerGeometry: CanvasPersistenceCoordinator["patchLayerGeometry"];
+      } | null;
+    } = { current: null };
+
+    function CrossHarness() {
+      const syncApi = useCanvasAuthoritativeSync({
+        sessionId: "sess-1",
+        ledger,
+        lockController,
+        copy,
+        pollWhenActive: false,
+        pollIntervalMs: 8_000,
+        onLayersRemoved: (layerIds) => {
+          removedLayerIds.push(...layerIds);
+        },
+        prepareLayerDeletion: (layerId) =>
+          persistenceApiRef.current?.prepareLayerDeletion(layerId) ??
+          Promise.resolve({ ok: false, drainedGeometry: null, release() {} }),
+        requeueDrainedGeometry: (layerId, patch) => {
+          void persistenceApiRef.current?.patchLayerGeometry(layerId, patch);
+        },
+      });
+      const persistenceApi = useCanvasPersistenceCoordinator({
+        sessionId: "sess-1",
+        ledger,
+        lockController,
+        stageRef: { current: { flushDrawingState: () => undefined } as KonvaStageHandle },
+        copy,
+        isLayerLocked: syncApi.isLayerLocked,
+        applyLocalDrawingState: syncApi.applyLocalDrawingState,
+        requestAuthoritativeResync: syncApi.resyncLayers,
+      });
+      useEffect(() => {
+        const bridge = {
+          prepareLayerDeletion: persistenceApi.prepareLayerDeletion,
+          patchLayerGeometry: persistenceApi.patchLayerGeometry,
+        };
+        persistenceApiRef.current = bridge;
+        crossSync = syncApi;
+        crossPersistence = persistenceApi;
+        return () => {
+          if (persistenceApiRef.current === bridge) persistenceApiRef.current = null;
+        };
+      }, [syncApi, persistenceApi]);
+      return null;
+    }
+
+    vi.useFakeTimers();
+    const requestOrder: string[] = [];
+    let resolvePatch!: (response: Response) => void;
+    const patchGate = new Promise<Response>((resolve) => {
+      resolvePatch = resolve;
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "PATCH" && url.includes("/layers/")) {
+        requestOrder.push("PATCH");
+        const body = JSON.parse(String(init?.body ?? "{}")) as { x?: number };
+        session = {
+          layers: [
+            rawLayer("l1", { x: body.x ?? 0 }),
+            rawLayer("l2"),
+          ],
+          updatedAt: "2",
+        };
+        return patchGate;
+      }
+      if (method === "DELETE") {
+        requestOrder.push("DELETE");
+        return Promise.resolve(jsonResponse(500, {}));
+      }
+      requestOrder.push("GET");
+      return Promise.resolve(sessionResponse());
+    });
+
+    await act(async () => {
+      root.render(<CrossHarness />);
+    });
+
+    await act(async () => {
+      await crossPersistence.patchLayerGeometry("l1", { x: 77 });
+    });
+
+    let deleteStarted = false;
+    await act(async () => {
+      crossSync.deleteLayer("l1");
+      deleteStarted = true;
+    });
+    expect(deleteStarted).toBe(true);
+    // Barrier is held during drain — new transforms must not race preflight.
+    expect(crossPersistence.isDeletionBlocked("l1")).toBe(true);
+    expect(requestOrder).toContain("PATCH");
+    expect(requestOrder).not.toContain("DELETE");
+
+    await act(async () => {
+      resolvePatch(jsonResponse(200, {}));
+      await patchGate;
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(requestOrder.filter((entry) => entry === "PATCH").length).toBeGreaterThanOrEqual(1);
+    expect(requestOrder).toContain("DELETE");
+    const patchIndex = requestOrder.indexOf("PATCH");
+    const deleteIndex = requestOrder.indexOf("DELETE");
+    expect(patchIndex).toBeGreaterThanOrEqual(0);
+    expect(deleteIndex).toBeGreaterThan(patchIndex);
+
+    await vi.waitFor(() => {
+      expect(crossSync.layers.find((layer) => layer.id === "l1")?.x).toBe(77);
+    });
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(copy.toastDeleteLayerFailed);
+    expect(crossPersistence.isDeletionBlocked("l1")).toBe(false);
   });
 });
 

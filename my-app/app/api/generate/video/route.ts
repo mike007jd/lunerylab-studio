@@ -28,6 +28,10 @@ import {
   loadRequiredImageReferenceFile,
   persistUploadedImageReferenceFiles,
 } from "@/lib/server/reference-assets";
+import {
+  beginDetachedVideoWork,
+  type DetachedVideoAdmission,
+} from "@/lib/server/workspace-operation-gate";
 
 // Desktop-local video generation: POST returns RUNNING immediately and the
 // started promise continues on the Node event loop. Terminal failures are
@@ -58,6 +62,9 @@ export async function POST(request: NextRequest) {
   const telemetry = createRouteTelemetry("/api/generate/video", request);
   telemetry.start();
   let jobId: string | null = null;
+  // Admission is acquired only once a new detached job is about to be created.
+  // Cached / rejected paths must not leave a lease behind.
+  let videoAdmission: DetachedVideoAdmission | null = null;
 
   try {
     const user = await requireLocalWorkspaceOwner();
@@ -129,6 +136,9 @@ export async function POST(request: NextRequest) {
       referenceImage: preparedImageFingerprint(referenceImage),
     });
 
+    // Reject before any job mutation when backup/restore owns exclusivity.
+    videoAdmission = beginDetachedVideoWork();
+
     const created = await createOrReplayGenerationJob({
       input: {
         userId: user.id,
@@ -148,6 +158,8 @@ export async function POST(request: NextRequest) {
       requestFingerprint,
     });
     if (created.kind === "cached") {
+      videoAdmission.release();
+      videoAdmission = null;
       const cachedJob = created.job;
       const response = generationResponse({
         jobId: cachedJob.id,
@@ -181,6 +193,8 @@ export async function POST(request: NextRequest) {
       });
     }
 
+    const admission = videoAdmission;
+    videoAdmission = null;
     observeVideoJob(
       runVideoJob({
         jobId: job.id,
@@ -194,6 +208,7 @@ export async function POST(request: NextRequest) {
         // Freeze the backend/model resolved above so the background runner
         // can't drift if Settings change mid-flight.
         runtime: videoTarget,
+        workspaceAdmission: admission,
       }),
     );
 
@@ -216,6 +231,8 @@ export async function POST(request: NextRequest) {
     telemetry.done(response.status);
     return response;
   } catch (error) {
+    videoAdmission?.release();
+    videoAdmission = null;
     if (jobId) {
       await failRunningGenerationJob({ jobId, error, fallbackCode: "video_generation_failed" });
     }
