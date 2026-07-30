@@ -54,7 +54,7 @@ describe("buildDiagnosticsBundle", () => {
     expect(bundle.excluded).toEqual(["api-keys", "prompts", "reference-images", "generated-media"]);
     expect(bundle.runtime?.configuredProviders).toEqual(["openai"]); // fal not configured
     expect(bundle.runtime?.localRuntimes).toEqual([{ id: "sd-cpp", status: "ready" }]);
-    expect(bundle.app.version).toBe("0.2.1");
+    expect(bundle.app.version).toBe("0.2.2");
     expect(bundle.app.platform).toBe(process.platform);
     expect(mocks.jobFindMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { userId: "user-1", origin: "USER" } }),
