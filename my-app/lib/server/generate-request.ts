@@ -135,15 +135,22 @@ export function buildRequestFingerprint(value: Record<string, unknown>): string 
   return JSON.stringify(value);
 }
 
-export function uploadedFileFingerprint(
-  file: Pick<File, "name" | "type" | "size" | "lastModified"> | null | undefined,
+/** Content-hash fingerprint for prepared images (idempotency + conflict detection). */
+export function preparedImageFingerprint(
+  image:
+    | {
+        sha256: string;
+        mimeType: string;
+        byteSize: number;
+      }
+    | null
+    | undefined,
 ) {
-  if (!file) return null;
+  if (!image) return null;
   return {
-    name: file.name,
-    type: file.type,
-    size: file.size,
-    lastModified: file.lastModified,
+    sha256: image.sha256,
+    mimeType: image.mimeType,
+    byteSize: image.byteSize,
   };
 }
 

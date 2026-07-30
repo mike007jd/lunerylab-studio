@@ -20,6 +20,8 @@ export interface LatestWriteQueue<T> {
   enqueue: (value: T) => void;
   /** Resolve after pending writes and bounded retries settle. */
   flush: () => Promise<boolean>;
+  /** Void this owner: drop pending values and settle an active write as retired. */
+  retire: () => void;
   /** Stop accepting edits, cancel retries, and detach UI callbacks after unmount. */
   close: () => void;
 }
@@ -47,6 +49,7 @@ export function createLatestWriteQueue<T>({
   let failedAttempts = 0;
   let pausedAfterFailure = false;
   let closed = false;
+  let retired = false;
   let terminalFailure = false;
   let idleWaiters: Array<(succeeded: boolean) => void> = [];
 
@@ -64,7 +67,8 @@ export function createLatestWriteQueue<T>({
       while (pending) {
         const current: T = pending;
         pending = null;
-        if (!closed) onStart?.();
+        const notifiedStart = !closed;
+        if (notifiedStart) onStart?.();
         let succeeded = false;
         let shouldAttemptNewerAfterClose = false;
         const abortController = new AbortController();
@@ -123,7 +127,14 @@ export function createLatestWriteQueue<T>({
           }
         } finally {
           if (timeoutId) clearTimeout(timeoutId);
-          if (!closed) onSettled?.(succeeded);
+          if (
+            notifiedStart &&
+            (!closed || retired)
+          ) {
+            // Authoritative retirement voids the client write even if its
+            // already-issued request eventually returns 2xx.
+            onSettled?.(retired ? false : succeeded);
+          }
         }
 
         if (!succeeded && !shouldAttemptNewerAfterClose) break;
@@ -162,6 +173,18 @@ export function createLatestWriteQueue<T>({
         return Promise.resolve(!terminalFailure);
       }
       return new Promise((resolve) => idleWaiters.push(resolve));
+    },
+    retire() {
+      if (closed) return;
+      closed = true;
+      retired = true;
+      pending = null;
+      pausedAfterFailure = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      resolveIdleWaiters();
     },
     close() {
       if (closed) return;

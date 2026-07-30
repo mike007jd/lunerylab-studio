@@ -28,12 +28,16 @@ export function configureSharpRuntime(): void {
  */
 export function safeSharp(
   input: Buffer,
-  options?: { failOn?: "none" | "truncated" | "error" | "warning" },
+  options?: {
+    failOn?: "none" | "truncated" | "error" | "warning";
+    animated?: boolean;
+  },
 ): Sharp {
   configureSharpRuntime();
   return sharp(input, {
     limitInputPixels: MAX_INPUT_PIXELS,
     failOn: options?.failOn ?? "error",
+    animated: options?.animated,
   });
 }
 

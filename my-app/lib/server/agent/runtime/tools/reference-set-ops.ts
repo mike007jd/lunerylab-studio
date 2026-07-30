@@ -55,7 +55,37 @@ export function buildListReferenceSetsTool(ctx: AgentToolContext): Tool {
         });
         return { ok: true, sets: [] };
       }
-      const sets = await listReferenceSets(ctx.projectId, ctx.userId).catch(() => []);
+
+      let sets: ReferenceSetSnapshot[];
+      try {
+        sets = await listReferenceSets(ctx.projectId, ctx.userId);
+      } catch (error) {
+        const message = "Failed to read project reference sets.";
+        console.error(
+          JSON.stringify({
+            level: "error",
+            event: "reference_sets_read_failed",
+            projectId: ctx.projectId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        ctx.recordStep({
+          id: stepId,
+          index: ctx.nextStepIndex(),
+          toolName: "list_reference_sets",
+          category: "brand",
+          summary: "Failed to read project reference sets.",
+          artifacts: {},
+          input: {},
+          output: { error: message },
+          status: "failed",
+          startedAt,
+          completedAt: new Date().toISOString(),
+          errorMessage: message,
+        });
+        return { ok: false, status: "failed", error: message, sets: [] };
+      }
+
       ctx.recordStep({
         id: stepId,
         index: ctx.nextStepIndex(),

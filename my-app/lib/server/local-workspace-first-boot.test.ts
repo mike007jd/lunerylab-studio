@@ -41,7 +41,15 @@ vi.mock("@/lib/server/prisma", () => ({
     project: {
       findMany: mocks.projectFindMany,
     },
+    workspaceRestoreCommit: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
   },
+}));
+
+vi.mock("@/lib/server/workspace-restore-journal", () => ({
+  ensureWorkspaceRestoreReconciled: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { ensureLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";

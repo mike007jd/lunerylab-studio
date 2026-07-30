@@ -43,6 +43,7 @@ const entry = {
   batchVariants: null,
   generationParameters: {},
   videoDuration: null,
+  jobId: null,
   assets: [asset],
   warnings: [],
   error: null,

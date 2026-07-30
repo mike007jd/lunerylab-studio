@@ -9,6 +9,11 @@ export default defineConfig({
   test: {
     // Component tests opt into happy-dom via a per-file `@vitest-environment` docblock.
     environment: "node",
-    include: ["lib/**/*.test.ts", "components/**/*.test.tsx"],
+    include: [
+      "lib/**/*.test.ts",
+      "lib/**/*.test.tsx",
+      "components/**/*.test.ts",
+      "components/**/*.test.tsx",
+    ],
   },
 });

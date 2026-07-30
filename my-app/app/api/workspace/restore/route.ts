@@ -1,29 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
-import { ApiError, jsonError } from "@/lib/server/errors";
+import { jsonError } from "@/lib/server/errors";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
-import { restoreWorkspaceBackup, type WorkspaceBackup } from "@/lib/server/workspace-backup";
+import { restoreWorkspaceBackup } from "@/lib/server/workspace-backup";
+import { readBoundedRestoreBody } from "@/lib/server/workspace-restore-limits";
 
 /**
  * Replace the local workspace with a verified backup. Body:
  *   { backup: WorkspaceBackup, confirm: true }
- * Integrity- and confirmation-gated. This route deliberately does not bootstrap
- * the sample workspace before restore; the backup owns the replacement rows.
+ * Integrity- and confirmation-gated. Encoded/decoded size limits and disk
+ * headroom are enforced before staging. This route deliberately does not
+ * bootstrap the sample workspace before restore; the backup owns the
+ * replacement rows.
  */
 export async function POST(request: NextRequest) {
   try {
     await requireLocalWorkspaceOwner();
-    const body = (await request.json().catch(() => null)) as
-      | { backup?: WorkspaceBackup; confirm?: unknown }
-      | null;
-    if (!body?.backup) {
-      throw new ApiError({
-        status: 400,
-        code: "invalid_request",
-        message: "Request must include a backup payload.",
-        retryable: false,
-      });
-    }
-    const result = await restoreWorkspaceBackup(body.backup, { confirm: body.confirm === true });
+    const { backup, confirm } = await readBoundedRestoreBody(request);
+    const result = await restoreWorkspaceBackup(backup, { confirm });
     return NextResponse.json({ restored: result });
   } catch (error) {
     return jsonError(error);

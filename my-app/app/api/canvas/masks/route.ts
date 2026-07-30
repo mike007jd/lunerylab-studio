@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { ApiError, jsonError } from "@/lib/server/errors";
 import {
   assertRequestContentLength,
-  validateFiles,
+  prepareImageFiles,
 } from "@/lib/server/file-validation";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { parseFormData } from "@/lib/server/http-validation";
@@ -25,8 +25,19 @@ export async function POST(request: NextRequest) {
         retryable: false,
       });
     }
-    await validateFiles([file], { maxFiles: 1, allowedMimeTypes: PNG_ONLY });
-    const token = await storeTemporaryCanvasMask(file);
+    const [prepared] = await prepareImageFiles([file], {
+      maxFiles: 1,
+      allowedMimeTypes: PNG_ONLY,
+    });
+    if (!prepared) {
+      throw new ApiError({
+        status: 400,
+        code: "invalid_request",
+        message: "A non-empty PNG mask is required.",
+        retryable: false,
+      });
+    }
+    const token = await storeTemporaryCanvasMask(prepared.buffer);
     return NextResponse.json({ mask: { token } });
   } catch (error) {
     return jsonError(error);

@@ -17,6 +17,10 @@ import { readStoredFile } from "@/lib/server/storage";
 import { createGenerationJob, failRunningGenerationJob } from "@/lib/server/generation-job";
 import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
 import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
+import {
+  beginDetachedVideoWork,
+  type DetachedVideoAdmission,
+} from "@/lib/server/workspace-operation-gate";
 
 export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
   return tool({
@@ -42,6 +46,7 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
       const startedAt = new Date().toISOString();
       const stepId = randomUUID();
       let jobId: string | null = null;
+      let videoAdmission: DetachedVideoAdmission | null = null;
 
       try {
         // No default video model — the user must explicitly choose one. The
@@ -78,6 +83,9 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
         // stranded it as permanently RUNNING).
         const videoRuntime = await resolveVideoRuntime(model.id);
 
+        // Acquire admission before any generation-job mutation.
+        videoAdmission = beginDetachedVideoWork();
+
         const job = await createGenerationJob({
           userId: ctx.userId,
           projectId: ctx.projectId,
@@ -92,7 +100,10 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
         });
         jobId = job.id;
 
-        // Fire-and-forget; runVideoJob owns its own DB updates.
+        const admission = videoAdmission;
+        videoAdmission = null;
+
+        // Fire-and-forget; runVideoJob owns terminal admission release.
         runVideoJob({
           jobId: job.id,
           userId: ctx.userId,
@@ -104,6 +115,7 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
           referenceImage: referenceBuffer,
           runtime: videoRuntime,
           agentTaskId: ctx.taskId,
+          workspaceAdmission: admission,
         }).catch((error) => {
           console.error("[agent:video_job_failed]", error);
         });
@@ -131,6 +143,8 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
           note: "Video runs async. The user can keep working; result lands in Library when done.",
         };
       } catch (error) {
+        videoAdmission?.release();
+        videoAdmission = null;
         // If a job was already created before the failure, mark it FAILED so it
         // never lingers as a permanently RUNNING job.
         if (jobId) {

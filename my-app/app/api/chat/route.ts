@@ -237,9 +237,31 @@ export async function POST(request: Request) {
           id: "agent-status",
           data: { status: "running" },
         });
+        // Immediately rejection-handled persistence queue. Drain before any
+        // task terminalization so success / exception / abort never leave
+        // unhandled step-write rejections.
+        const stepWrites: Array<Promise<void>> = [];
+        const enqueueStepWrite = (step: Parameters<typeof persistAgentTaskStep>[1]) => {
+          const write = persistAgentTaskStep(task.id, step).catch((error) => {
+            // Telemetry/persistence failures must not rewrite the business result.
+            console.error(
+              JSON.stringify({
+                level: "error",
+                event: "agent_step_persist_failed",
+                taskId: task.id,
+                stepId: step.id,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            );
+          });
+          stepWrites.push(write);
+        };
+        const drainStepWrites = async () => {
+          await Promise.all(stepWrites);
+        };
+
+        let textStarted = false;
         try {
-          const stepWrites: Array<Promise<void>> = [];
-          let textStarted = false;
           const agentResult = await runAgent({
             taskId: task.id,
             userId: user.id,
@@ -253,7 +275,7 @@ export async function POST(request: Request) {
             action,
             abortSignal: request.signal,
             onStep: (step) => {
-              stepWrites.push(persistAgentTaskStep(task.id, step));
+              enqueueStepWrite(step);
               writer.write({
                 type: "data-agent-step",
                 id: step.id,
@@ -274,7 +296,7 @@ export async function POST(request: Request) {
             },
           });
           if (textStarted) writer.write({ type: "text-end", id: "agent-final" });
-          await Promise.all(stepWrites);
+          await drainStepWrites();
           const assistantParts = writeResultParts(writer, agentResult, textStarted, task.id);
           await finishAgentTask({
             taskId: task.id,
@@ -292,6 +314,7 @@ export async function POST(request: Request) {
             finishReason: agentResult.error ? "error" : "stop",
           });
         } catch (err) {
+          await drainStepWrites();
           const apiErr = toApiError(err);
           const errorParts = [
             { type: "data-agent-error", id: "agent-error", data: { code: apiErr.code, message: apiErr.message } },
@@ -322,10 +345,34 @@ export async function POST(request: Request) {
       stream,
       headers: { "cache-control": "no-cache, no-transform" },
     });
-    telemetry.done(response.status);
+    try {
+      telemetry.done(response.status);
+    } catch (telemetryError) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "route_telemetry_failed",
+          route: "/api/chat",
+          error:
+            telemetryError instanceof Error ? telemetryError.message : String(telemetryError),
+        }),
+      );
+    }
     return response;
   } catch (error) {
-    telemetry.failed(error);
+    try {
+      telemetry.failed(error);
+    } catch (telemetryError) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "route_telemetry_failed",
+          route: "/api/chat",
+          error:
+            telemetryError instanceof Error ? telemetryError.message : String(telemetryError),
+        }),
+      );
+    }
     return jsonError(error);
   }
 }

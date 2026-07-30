@@ -41,6 +41,15 @@ CREATE TABLE "AppState" (
 );
 
 -- CreateTable
+CREATE TABLE "WorkspaceRestoreCommit" (
+    "id" TEXT NOT NULL DEFAULT 'singleton',
+    "token" TEXT NOT NULL,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "WorkspaceRestoreCommit_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL,
     "email" TEXT NOT NULL,
@@ -295,6 +304,9 @@ CREATE INDEX "ReferenceSet_projectId_createdAt_idx" ON "ReferenceSet"("projectId
 
 -- CreateIndex
 CREATE INDEX "ReferenceSet_projectId_isDefault_idx" ON "ReferenceSet"("projectId", "isDefault");
+
+-- At most one default Reference Set per project (prelaunch baseline).
+CREATE UNIQUE INDEX "ReferenceSet_projectId_default_uidx" ON "ReferenceSet"("projectId") WHERE "isDefault" = true;
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ReferenceSetAsset_referenceSetId_assetId_key" ON "ReferenceSetAsset"("referenceSetId", "assetId");

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { ApiError, jsonError } from "@/lib/server/errors";
 import {
   assertRequestContentLength,
-  validateFiles,
+  prepareImageFiles,
   withAssetWriteTransaction,
 } from "@/lib/server/file-validation";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
@@ -48,7 +48,18 @@ export async function POST(request: NextRequest, { params }: Params) {
         retryable: false,
       });
     }
-    await validateFiles([source], { maxFiles: 1, allowedMimeTypes: PNG_ONLY });
+    const [preparedSource] = await prepareImageFiles([source], {
+      maxFiles: 1,
+      allowedMimeTypes: PNG_ONLY,
+    });
+    if (!preparedSource) {
+      throw new ApiError({
+        status: 400,
+        code: "invalid_request",
+        message: "A non-empty canvas PNG is required.",
+        retryable: false,
+      });
+    }
 
     const mode = formData.get("mode") === "platforms" ? "platforms" : "original";
     const presetIds = [...new Set(
@@ -76,7 +87,7 @@ export async function POST(request: NextRequest, { params }: Params) {
       });
     }
 
-    const sourceBytes = Buffer.from(await source.arrayBuffer());
+    const sourceBytes = preparedSource.buffer;
     const outputs = mode === "original"
       ? [{
           presetId: "original",

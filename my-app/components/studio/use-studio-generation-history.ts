@@ -24,9 +24,13 @@ export type {
 };
 
 export interface NewEntryInput
-  extends Omit<GenerationEntry, "id" | "status" | "assets" | "warnings" | "error" | "createdAt"> {
+  extends Omit<
+    GenerationEntry,
+    "id" | "status" | "assets" | "warnings" | "error" | "createdAt" | "jobId"
+  > {
   /** Optional initial status — defaults to "running". */
   status?: GenerationEntryStatus;
+  jobId?: string | null;
 }
 
 export interface UseStudioGenerationHistoryResult {
@@ -86,6 +90,7 @@ export function StudioGenerationHistoryProvider({ children }: { children: ReactN
       batchVariants: input.batchVariants,
       generationParameters: input.generationParameters,
       videoDuration: input.videoDuration,
+      jobId: input.jobId ?? null,
       assets: [],
       warnings: [],
       error: null,

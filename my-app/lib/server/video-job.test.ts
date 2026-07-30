@@ -2,6 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
+import {
+  beginDetachedVideoWork,
+  getWorkspaceOperationGateStateForTests,
+  resetWorkspaceOperationGateForTests,
+} from "@/lib/server/workspace-operation-gate";
+
 const mocks = vi.hoisted(() => ({
   generateVideoByok: vi.fn(),
   writeGeneratedVideo: vi.fn(),
@@ -33,6 +39,7 @@ import { runVideoJob } from "@/lib/server/video-job";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetWorkspaceOperationGateForTests();
   mocks.generateVideoByok.mockResolvedValue({
     provider: "byok:fal",
     model: "frozen-model",
@@ -66,9 +73,11 @@ const baseInput = {
 
 describe("runVideoJob model freeze (#8)", () => {
   it("uses the provider/model frozen at submission, not a re-resolved one", async () => {
+    const admission = beginDetachedVideoWork();
     await runVideoJob({
       ...baseInput,
       runtime: { backend: "byok", providerId: "fal", modelId: "frozen-model", warnings: [] },
+      workspaceAdmission: admission,
     });
 
     // The runner dispatched to the FROZEN provider + model id, ignoring any
@@ -81,15 +90,75 @@ describe("runVideoJob model freeze (#8)", () => {
       expect.objectContaining({ jobId: "job-1", model: "frozen-model" }),
     );
     expect(mocks.failRunningGenerationJob).not.toHaveBeenCalled();
+    expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(0);
   });
 
   it("fails the job (no provider call) when the frozen backend is none", async () => {
+    const admission = beginDetachedVideoWork();
     await runVideoJob({
       ...baseInput,
       runtime: { backend: "none", warnings: [] },
+      workspaceAdmission: admission,
     });
 
     expect(mocks.generateVideoByok).not.toHaveBeenCalled();
     expect(mocks.failRunningGenerationJob).toHaveBeenCalled();
+    expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(0);
+  });
+
+  it("releases the transferred admission after terminal success and failure paths", async () => {
+    const successAdmission = beginDetachedVideoWork();
+    await runVideoJob({
+      ...baseInput,
+      runtime: { backend: "byok", providerId: "fal", modelId: "frozen-model", warnings: [] },
+      workspaceAdmission: successAdmission,
+    });
+    expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(0);
+
+    const failureAdmission = beginDetachedVideoWork();
+    mocks.generateVideoByok.mockRejectedValueOnce(new Error("provider down"));
+    await runVideoJob({
+      ...baseInput,
+      runtime: { backend: "byok", providerId: "fal", modelId: "frozen-model", warnings: [] },
+      workspaceAdmission: failureAdmission,
+    });
+    expect(mocks.failRunningGenerationJob).toHaveBeenCalled();
+    expect(getWorkspaceOperationGateStateForTests().activeVideoCount).toBe(0);
+  });
+
+  it("rejects a forgeable boolean stand-in and does not call the provider", async () => {
+    await runVideoJob({
+      ...baseInput,
+      runtime: { backend: "byok", providerId: "fal", modelId: "frozen-model", warnings: [] },
+      // @ts-expect-error — forgeable boolean must not satisfy admission.
+      workspaceAdmission: true,
+    });
+    expect(mocks.generateVideoByok).not.toHaveBeenCalled();
+    expect(mocks.failRunningGenerationJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({ code: "video_admission_invalid" }),
+      }),
+    );
+  });
+
+  it("rejects an object forged with the old global-symbol shape", async () => {
+    const forgedAdmission = {
+      [Symbol.for("lunery.detachedVideoAdmission")]: true,
+      release: vi.fn(),
+    };
+    await runVideoJob({
+      ...baseInput,
+      runtime: { backend: "byok", providerId: "fal", modelId: "frozen-model", warnings: [] },
+      // @ts-expect-error — only beginDetachedVideoWork can mint an admission.
+      workspaceAdmission: forgedAdmission,
+    });
+
+    expect(mocks.generateVideoByok).not.toHaveBeenCalled();
+    expect(forgedAdmission.release).not.toHaveBeenCalled();
+    expect(mocks.failRunningGenerationJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({ code: "video_admission_invalid" }),
+      }),
+    );
   });
 });

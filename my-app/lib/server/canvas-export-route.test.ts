@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   requireLocalWorkspaceOwner: vi.fn(),
   requireWritableCanvasSession: vi.fn(),
   assertRequestContentLength: vi.fn(),
-  validateFiles: vi.fn(),
+  prepareImageFiles: vi.fn(),
   withAssetWriteTransaction: vi.fn(),
   exportForPlatforms: vi.fn(),
   writeGeneratedImage: vi.fn(),
@@ -27,7 +27,7 @@ vi.mock("@/lib/server/canvas-session-access", () => ({
 }));
 vi.mock("@/lib/server/file-validation", () => ({
   assertRequestContentLength: mocks.assertRequestContentLength,
-  validateFiles: mocks.validateFiles,
+  prepareImageFiles: mocks.prepareImageFiles,
   withAssetWriteTransaction: mocks.withAssetWriteTransaction,
 }));
 vi.mock("@/lib/server/platform-export", () => ({
@@ -76,6 +76,16 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
   mocks.requireWritableCanvasSession.mockResolvedValue({ id: "session-1", projectId: "project-1" });
+  mocks.prepareImageFiles.mockResolvedValue([
+    {
+      buffer: Buffer.from([1, 2, 3]),
+      mimeType: "image/png",
+      width: 1200,
+      height: 800,
+      sha256: "sha",
+      byteSize: 3,
+    },
+  ]);
   mocks.createGenerationJob.mockResolvedValue({ id: "job-1" });
   mocks.writeGeneratedImage.mockResolvedValue(storedPng);
   mocks.writeFilesOrCleanup.mockImplementation(async (writers: Array<() => Promise<unknown>>) =>

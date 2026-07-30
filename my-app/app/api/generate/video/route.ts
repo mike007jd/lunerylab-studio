@@ -6,7 +6,7 @@ import { ensureAppState } from "@/lib/server/app-state";
 import { normalizeDuration } from "@/lib/video-models";
 import {
   assertRequestContentLength,
-  validateFiles,
+  prepareImageFiles,
 } from "@/lib/server/file-validation";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
@@ -18,16 +18,20 @@ import { resolveVideoRuntime } from "@/lib/server/video-runtime";
 import {
   buildRequestFingerprint,
   getUploadedFiles,
+  preparedImageFingerprint,
   resolveOwnedProjectId,
   trimFormString,
   trimFormStringOrNull,
-  uploadedFileFingerprint,
 } from "@/lib/server/generate-request";
 import { failRunningGenerationJob } from "@/lib/server/generation-job";
 import {
   loadRequiredImageReferenceFile,
   persistUploadedImageReferenceFiles,
 } from "@/lib/server/reference-assets";
+import {
+  beginDetachedVideoWork,
+  type DetachedVideoAdmission,
+} from "@/lib/server/workspace-operation-gate";
 
 // Desktop-local video generation: POST returns RUNNING immediately and the
 // started promise continues on the Node event loop. Terminal failures are
@@ -58,6 +62,9 @@ export async function POST(request: NextRequest) {
   const telemetry = createRouteTelemetry("/api/generate/video", request);
   telemetry.start();
   let jobId: string | null = null;
+  // Admission is acquired only once a new detached job is about to be created.
+  // Cached / rejected paths must not leave a lease behind.
+  let videoAdmission: DetachedVideoAdmission | null = null;
 
   try {
     const user = await requireLocalWorkspaceOwner();
@@ -72,8 +79,8 @@ export async function POST(request: NextRequest) {
     const providedProjectId = trimFormString(formData, "projectId");
     const referenceAssetId = trimFormStringOrNull(formData, "referenceAssetId");
     const referenceImageFiles = getUploadedFiles(formData, "referenceImage");
-    await validateFiles(referenceImageFiles, { maxFiles: 1 });
-    const referenceImage = referenceImageFiles[0] ?? null;
+    const preparedReferenceImages = await prepareImageFiles(referenceImageFiles, { maxFiles: 1 });
+    const referenceImage = preparedReferenceImages[0] ?? null;
     const aspectRatio = trimFormString(formData, "aspectRatio") || undefined;
     const idempotencyKey = trimFormStringOrNull(formData, "idempotencyKey");
 
@@ -126,8 +133,11 @@ export async function POST(request: NextRequest) {
       aspectRatio: aspectRatio ?? null,
       projectId: resolvedProjectId,
       referenceAssetId,
-      referenceImage: uploadedFileFingerprint(referenceImage),
+      referenceImage: preparedImageFingerprint(referenceImage),
     });
+
+    // Reject before any job mutation when backup/restore owns exclusivity.
+    videoAdmission = beginDetachedVideoWork();
 
     const created = await createOrReplayGenerationJob({
       input: {
@@ -148,6 +158,8 @@ export async function POST(request: NextRequest) {
       requestFingerprint,
     });
     if (created.kind === "cached") {
+      videoAdmission.release();
+      videoAdmission = null;
       const cachedJob = created.job;
       const response = generationResponse({
         jobId: cachedJob.id,
@@ -181,6 +193,8 @@ export async function POST(request: NextRequest) {
       });
     }
 
+    const admission = videoAdmission;
+    videoAdmission = null;
     observeVideoJob(
       runVideoJob({
         jobId: job.id,
@@ -194,6 +208,7 @@ export async function POST(request: NextRequest) {
         // Freeze the backend/model resolved above so the background runner
         // can't drift if Settings change mid-flight.
         runtime: videoTarget,
+        workspaceAdmission: admission,
       }),
     );
 
@@ -216,6 +231,8 @@ export async function POST(request: NextRequest) {
     telemetry.done(response.status);
     return response;
   } catch (error) {
+    videoAdmission?.release();
+    videoAdmission = null;
     if (jobId) {
       await failRunningGenerationJob({ jobId, error, fallbackCode: "video_generation_failed" });
     }

@@ -32,6 +32,8 @@ const eslintConfig = defineConfig([
       "components/**/*.tsx",
       "app/**/*.ts",
       "app/**/*.tsx",
+      "hooks/**/*.ts",
+      "hooks/**/*.tsx",
       "lib/client/**/*.ts",
       "lib/client/**/*.tsx",
       "lib/presets/**/*.ts",
@@ -58,11 +60,19 @@ const eslintConfig = defineConfig([
       ],
     },
   },
-  // Client components must not import server-only AI SDK provider packages —
-  // they would force the secret to leak into the client bundle. The provider
-  // wiring lives in lib/server/* where the keychain bridge runs.
+  // Client surfaces must not import server-only AI SDK provider packages —
+  // they would force the secret to leak into the client bundle. App server
+  // routes may import `ai`; use-client modules under app/ are covered by
+  // scripts/check-client-ai-imports.mjs (allows @ai-sdk/react only).
   {
-    files: ["components/**/*.ts", "components/**/*.tsx", "lib/client/**/*.ts", "lib/client/**/*.tsx"],
+    files: [
+      "components/**/*.ts",
+      "components/**/*.tsx",
+      "hooks/**/*.ts",
+      "hooks/**/*.tsx",
+      "lib/client/**/*.ts",
+      "lib/client/**/*.tsx",
+    ],
     rules: {
       "no-restricted-imports": [
         "error",
@@ -72,6 +82,8 @@ const eslintConfig = defineConfig([
             { name: "@ai-sdk/anthropic", message: "Server-only — use via lib/server/byok-llm.ts." },
             { name: "@ai-sdk/google", message: "Server-only — use via lib/server/byok-llm.ts." },
             { name: "@ai-sdk/openai-compatible", message: "Server-only — use via lib/server/byok-llm.ts." },
+            { name: "@fal-ai/client", message: "Server-only — use via lib/server/byok-image.ts." },
+            { name: "replicate", message: "Server-only — use via lib/server/byok-image.ts." },
             { name: "ai", message: "Server-only — use via lib/server/byok-llm.ts or generation helpers." },
           ],
         },

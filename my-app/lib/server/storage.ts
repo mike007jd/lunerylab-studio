@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import { lookup as lookupMime } from "mime-types";
 import { ApiError } from "@/lib/server/errors";
 import { sniffImageMime } from "@/lib/server/byok-shared";
+import type { PreparedImage } from "@/lib/server/file-validation";
 import { assertImageByteSize, safeSharp } from "@/lib/server/image-safety";
 import { extensionFromMime } from "@/lib/mime";
 import { sniff3dModelMime, sniffVideoMime } from "@/lib/media-sniff";
@@ -164,12 +165,18 @@ export interface WrittenReference extends StoredImageFile {
 async function readImageDimensions(
   bytes: Buffer,
   error: { status: number; code: string; message: string; retryable: boolean },
+  options?: { decodePixels?: boolean },
 ): Promise<{ width: number; height: number }> {
   try {
     // autoOrient reports the EXIF-corrected size — phone photos carry rotation
     // flags, and browsers render the rotated result, so the raw encoded
     // width/height would swap the aspect ratio for orientations 5-8.
-    const metadata = await safeSharp(bytes).metadata();
+    const metadata = await safeSharp(bytes, { failOn: "warning" }).metadata();
+    if (options?.decodePixels) {
+      // metadata() does not decode compressed pixels. Force a full-frame decode
+      // (including later animated WebP pages) before persisting provider bytes.
+      await safeSharp(bytes, { failOn: "warning", animated: true }).stats();
+    }
     const width = metadata.autoOrient?.width ?? metadata.width;
     const height = metadata.autoOrient?.height ?? metadata.height;
     if (
@@ -183,28 +190,20 @@ async function readImageDimensions(
       throw new Error("Image dimensions are missing or invalid.");
     }
     return { width, height };
-  } catch {
+  } catch (caught) {
+    if (caught instanceof ApiError) throw caught;
     throw new ApiError(error);
   }
 }
 
-export async function writeReferenceFile(file: File): Promise<WrittenReference> {
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const mimeType = sniffImageMime(buffer);
-  if (!mimeType) {
-    throw new ApiError({
-      status: 400,
-      code: "unsupported_file_type",
-      message: "Unsupported image file type.",
-      retryable: false,
-    });
-  }
-  const dimensions = await readImageDimensions(buffer, {
-    status: 400,
-    code: "unsupported_file_type",
-    message: "Unsupported image file type.",
-    retryable: false,
-  });
+/**
+ * Persist a reference image. Prefer a PreparedImage from prepareImageFiles so
+ * storage reuses the already-validated bytes (one-read path).
+ */
+export async function writeReferenceFile(
+  file: PreparedImage,
+): Promise<WrittenReference> {
+  const { buffer, mimeType, width, height } = file;
   const ext = extensionFromMime(mimeType);
   const storagePath = path.posix.join("uploads", `${Date.now()}-${randomUUID()}.${ext}`);
 
@@ -219,7 +218,8 @@ export async function writeReferenceFile(file: File): Promise<WrittenReference> 
     absolutePath,
     byteSize: buffer.byteLength,
     mimeType,
-    ...dimensions,
+    width,
+    height,
     buffer,
   };
 }
@@ -306,12 +306,16 @@ async function assertGeneratedImage(
     });
   }
 
-  const dimensions = await readImageDimensions(bytes, {
-    status: 502,
-    code: "invalid_generated_image",
-    message: "Provider returned an image that could not be decoded.",
-    retryable: true,
-  });
+  const dimensions = await readImageDimensions(
+    bytes,
+    {
+      status: 502,
+      code: "invalid_generated_image",
+      message: "Provider returned an image that could not be decoded.",
+      retryable: true,
+    },
+    { decodePixels: true },
+  );
 
   return { mimeType: sniffedMime, ...dimensions };
 }

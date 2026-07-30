@@ -31,6 +31,7 @@ function entry(id: string): GenerationEntry {
     batchVariants: null,
     generationParameters: {},
     videoDuration: null,
+    jobId: null,
     assets: [],
     warnings: [],
     error: null,

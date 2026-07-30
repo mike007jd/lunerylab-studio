@@ -69,6 +69,15 @@ model AppState {
   updatedAt DateTime @updatedAt
 }
 
+/// Internal restore durability marker. Never exported in workspace backups and
+/// never included in RESTORE_ORDER — crash recovery compares it to the
+/// filesystem journal under data/recovery/.
+model WorkspaceRestoreCommit {
+  id        String   @id @default("singleton")
+  token     String
+  updatedAt DateTime @updatedAt
+}
+
 // ---------------------------------------------------------------------------
 // Single implicit local owner.
 // ---------------------------------------------------------------------------
