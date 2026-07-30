@@ -154,8 +154,9 @@ describe("desktop API origin boundary", () => {
     expect(response.status).toBe(403);
   });
 
-  it("rejects the configured public site from the private desktop API", async () => {
+  it("does not expand trusted desktop origins from a legacy public-site env value", async () => {
     desktopEnv();
+    // Stub proves a leftover NEXT_PUBLIC_SITE_URL cannot widen the desktop trust set.
     vi.stubEnv("NEXT_PUBLIC_SITE_URL", "https://www.lunerylab.com");
     const response = await proxy(
       request("/api/settings", {

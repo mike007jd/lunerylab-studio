@@ -53,7 +53,7 @@ interface LayerPatchWrite {
 const CANVAS_WRITE_TIMEOUT_MS = 5_000;
 const SAVED_BADGE_HOLD_MS = 1_800;
 
-export type CanvasSaveStatus = "idle" | "saving" | "saved";
+type CanvasSaveStatus = "idle" | "saving" | "saved";
 
 export interface LayerDeletionPreparation {
   ok: boolean;
