@@ -10,7 +10,7 @@ another repository-root directory.
 
 | Feature | User value | Main files |
 | --- | --- | --- |
-| Tauri shell | Runs Studio as a desktop app with a private local server. | `src-tauri/*`, `tauri.conf.json` |
+| Tauri shell | Runs Studio as a desktop app with a private local server. | `src-tauri/*`, `src-tauri/tauri.conf.json` |
 | Runtime bridge | Lets Next API routes control local engines and secret storage. | `lib/server/desktop-bridge.ts`, `app/api/desktop-runtime/*` |
 | Desktop route gate | Redirects browser users to the standalone website. | `proxy.ts`, `lib/desktop-runtime.ts`, `lib/public-site.ts` |
 | Build resources | Embeds standalone Next app and engine sidecars. | `scripts/desktop-clean.mjs`, `scripts/desktop-bundle-assets.mjs`, `scripts/fetch-*.mjs` |
@@ -82,6 +82,7 @@ media history.
 | Local model catalog | Shows install/import/run state for local models. | `components/settings/local-models-panel.tsx`, `lib/hf-model-catalog.ts` |
 | HF download/import | Downloads model artifacts and imports local files. | `app/api/desktop-runtime/hf-download/*`, `app/api/desktop-runtime/models/import/route.ts` |
 | Language/default settings | Persists locale and selected default model. | `components/settings/settings-language-card.tsx`, `components/settings/settings-default-model-card.tsx` |
+| Workspace Data backup/restore | Exports and restores the local workspace database, media, and config. | `components/settings/workspace-data-panel.tsx`, `app/api/workspace/backup/route.ts`, `app/api/workspace/restore/route.ts`, `lib/server/workspace-backup.ts` |
 
 Settings owns model/runtime setup. Studio should consume readiness, not become a
 model-management screen.

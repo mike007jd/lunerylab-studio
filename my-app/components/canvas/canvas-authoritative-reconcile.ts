@@ -34,8 +34,6 @@ export function createAuthoritativeFetchOwner() {
   };
 }
 
-export type AuthoritativeFetchOwner = ReturnType<typeof createAuthoritativeFetchOwner>;
-
 /**
  * Session-generation-scoped response order shared by every authoritative poll
  * and recovery resync. Ordering is a plain monotonic sequence per epoch — no

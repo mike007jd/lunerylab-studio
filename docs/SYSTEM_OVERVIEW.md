@@ -56,6 +56,17 @@ Prisma models:
 - `CanvasSession`, `CanvasLayer`, `CanvasSnapshot`: persistent canvas state and
   rollback points.
 - `AppState`: singleton platform config placeholder.
+- `WorkspaceRestoreCommit`: internal restore durability marker; never exported
+  in workspace backups.
+
+### Workspace backup and restore durability
+
+Settings Workspace Data backup/restore uses a process-wide workspace operation
+gate, a repeatable-read DB snapshot plus media/config enumeration, a durable
+restore journal, a same-transaction commit marker, and startup reconciliation.
+Source of truth: [workspace-operation-gate.ts](../my-app/lib/server/workspace-operation-gate.ts),
+[workspace-backup.ts](../my-app/lib/server/workspace-backup.ts), and
+[workspace-restore-journal.ts](../my-app/lib/server/workspace-restore-journal.ts).
 
 ### Storage
 

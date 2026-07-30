@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   web:
-    name: Web product gates
+    name: Next runtime gates
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -36,7 +36,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Generate Prisma client
         run: pnpm prisma:generate
-      - name: Run Web product gates
+      - name: Run Next runtime gates
         run: pnpm verify
       - name: Audit production dependencies
         run: corepack pnpm@11.13.1 --pm-on-fail=ignore audit --prod --audit-level moderate

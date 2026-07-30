@@ -1,6 +1,6 @@
 # Cleanup Exemptions
 
-Reviewed 2026-07-28. Static unused-code tools and filename scans generate
+Reviewed 2026-07-30. Static unused-code tools and filename scans generate
 candidates; they do not prove that a file is dead.
 
 ## Always Preserve
@@ -34,6 +34,9 @@ Recoverable from Git history:
   `spec/DESIGN_RULES.md` and `spec/UX_RULES.md`.
 - Retired repo-local and opaque OS profile paths; the visible Lunery profile is
   the only runtime contract.
+- Removed post-PR17 type-only candidates proven unused by static, dynamic,
+  package, history, and gate searches; executable surfaces and existing
+  exemptions remain unchanged.
 
 Reopen an exemption only when new call-graph, build, runtime, or product evidence
 shows its status changed.

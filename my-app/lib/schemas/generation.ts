@@ -65,5 +65,4 @@ export const videoStatusResponseSchema = z.discriminatedUnion("status", [
 
 export type AssetDTO = z.infer<typeof assetDTOSchema>;
 export type GenerationResponse = z.infer<typeof generationResponseSchema>;
-export type VideoCreateResponse = z.infer<typeof videoCreateResponseSchema>;
 export type VideoStatusResponse = z.infer<typeof videoStatusResponseSchema>;
