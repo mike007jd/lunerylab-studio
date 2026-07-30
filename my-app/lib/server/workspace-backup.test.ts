@@ -175,9 +175,11 @@ describe("exportWorkspaceBackup", () => {
     expect(backup.media.map((entry) => entry.path)).toEqual(["generated/a.png", "uploads/ref.jpg"]);
     expect(mocks.readStoredFile).toHaveBeenCalledTimes(2);
     expect(() => assertRestorePayloadLimits(backup)).not.toThrow();
+    // Compact wire form (no pretty-print) is what the client download/restore path uses.
     expect(
       Buffer.byteLength(JSON.stringify({ backup, confirm: true })),
     ).toBeLessThanOrEqual(WORKSPACE_RESTORE_LIMITS.maxEncodedBytes);
+    expect(JSON.stringify(backup).includes("\n")).toBe(false);
   });
 
   it("rejects one oversized file from metadata before reading bytes", async () => {

@@ -9,6 +9,12 @@ import { Download, RefreshCw, RotateCcw, Trash2 } from "@/components/ui/icons";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
 import { useT } from "@/lib/i18n/useT";
 import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
+import {
+  buildConfirmedRestoreBody,
+  confirmedRestoreBodySize,
+  normalizeWorkspaceBackupBlob,
+  serializeWorkspaceDownload,
+} from "@/components/settings/workspace-data-download";
 
 interface StorageBreakdown {
   activeBytes: number;
@@ -42,8 +48,8 @@ function formatBytes(value: number): string {
   return `${amount >= 10 || index === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[index]}`;
 }
 
-function downloadJson(value: unknown, fileName: string): void {
-  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+function downloadText(text: string, fileName: string): void {
+  const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = fileName;
@@ -59,7 +65,8 @@ export function WorkspaceDataPanel() {
   const restoreInputRef = useRef<HTMLInputElement | null>(null);
   const [storage, setStorage] = useState<StorageBreakdown | null>(null);
   const [reconcile, setReconcile] = useState<ReconcileResult | null>(null);
-  const [restoreBackup, setRestoreBackup] = useState<Record<string, unknown> | null>(null);
+  // Retain the browser-managed file, not parsed JSON or a second large string.
+  const [restoreBackupBlob, setRestoreBackupBlob] = useState<Blob | null>(null);
   const [pending, setPending] = useState<PendingAction>(null);
   const [confirm, setConfirm] = useState<PendingAction>(null);
   const [feedback, setFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
@@ -93,7 +100,10 @@ export function WorkspaceDataPanel() {
   async function handleBackup() {
     await runAction("backup", async () => {
       const backup = await fetchJson<Record<string, unknown>>("/api/workspace/backup", { cache: "no-store" });
-      downloadJson(backup, `lunery-workspace-${new Date().toISOString().slice(0, 10)}.json`);
+      downloadText(
+        serializeWorkspaceDownload(backup, "compact"),
+        `lunery-workspace-${new Date().toISOString().slice(0, 10)}.json`,
+      );
       setFeedback({ tone: "success", text: t("settings.data.backupReady") });
     });
   }
@@ -101,7 +111,7 @@ export function WorkspaceDataPanel() {
   async function handleDiagnostics() {
     await runAction("diagnostics", async () => {
       const diagnostics = await fetchJson<Record<string, unknown>>("/api/diagnostics", { cache: "no-store" });
-      downloadJson(diagnostics, "lunery-diagnostics.json");
+      downloadText(serializeWorkspaceDownload(diagnostics, "pretty"), "lunery-diagnostics.json");
       setFeedback({ tone: "success", text: t("settings.data.diagnosticsReady") });
     });
   }
@@ -113,12 +123,21 @@ export function WorkspaceDataPanel() {
       if (file.size > WORKSPACE_RESTORE_LIMITS.maxEncodedBytes) {
         throw new Error("backup too large");
       }
-      const parsed = JSON.parse(await file.text()) as unknown;
+      const backupBlob = await normalizeWorkspaceBackupBlob(file);
+      if (
+        confirmedRestoreBodySize(backupBlob)
+        > WORKSPACE_RESTORE_LIMITS.maxEncodedBytes
+      ) {
+        throw new Error("backup envelope too large");
+      }
+      const text = await backupBlob.text();
+      const parsed = JSON.parse(text) as unknown;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid backup");
-      setRestoreBackup(parsed as Record<string, unknown>);
+      // Drop the parsed graph; keep only the validated browser-managed Blob.
+      setRestoreBackupBlob(backupBlob);
       setConfirm("restore");
     } catch {
-      setRestoreBackup(null);
+      setRestoreBackupBlob(null);
       setFeedback({ tone: "error", text: t("settings.data.invalidBackup") });
     } finally {
       if (restoreInputRef.current) restoreInputRef.current.value = "";
@@ -126,15 +145,19 @@ export function WorkspaceDataPanel() {
   }
 
   async function handleRestore() {
-    if (!restoreBackup) return;
-    await runAction("restore", async () => {
-      await fetchJson("/api/workspace/restore", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ backup: restoreBackup, confirm: true }),
+    if (!restoreBackupBlob) return;
+    try {
+      await runAction("restore", async () => {
+        await fetchJson("/api/workspace/restore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: buildConfirmedRestoreBody(restoreBackupBlob),
+        });
+        window.location.assign("/settings?panel=general");
       });
-      window.location.assign("/settings?panel=general");
-    });
+    } finally {
+      setRestoreBackupBlob(null);
+    }
   }
 
   async function handleEmptyTrash() {
@@ -286,7 +309,7 @@ export function WorkspaceDataPanel() {
         onOpenChange={(open) => {
           if (!open && pending !== "restore") {
             setConfirm(null);
-            setRestoreBackup(null);
+            setRestoreBackupBlob(null);
           }
         }}
         title={t("settings.data.restoreTitle")}

@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import type { Prisma } from "@prisma/client";
-import sharp, { type Metadata } from "sharp";
+import type { Metadata } from "sharp";
 import { prisma } from "@/lib/server/prisma";
 import { ApiError } from "@/lib/server/errors";
 import { getMaxUploadBytesPerFile } from "@/lib/server/env";
 import { sniffImageMime } from "@/lib/server/byok-shared";
+import { safeSharp } from "@/lib/server/image-safety";
 
 const MAX_IMAGE_DIMENSION = 8192;
 
@@ -89,7 +90,10 @@ async function prepareImageFile(
 
   let metadata: Metadata;
   try {
-    metadata = await sharp(buffer).metadata();
+    // metadata() does not decode compressed pixels (sharp 0.35). stats() does;
+    // animated mode makes the validation pipeline decode every frame.
+    metadata = await safeSharp(buffer, { failOn: "warning" }).metadata();
+    await safeSharp(buffer, { failOn: "warning", animated: true }).stats();
   } catch {
     throw new ApiError({
       status: 400,

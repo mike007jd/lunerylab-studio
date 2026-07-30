@@ -1,8 +1,10 @@
 import "server-only";
 
-import { statfs } from "node:fs/promises";
+import { readdir, stat, statfs } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import path from "node:path";
 import { ApiError } from "@/lib/server/errors";
-import { luneryProfileRoot } from "@/lib/server/lunery-profile";
+import { luneryPgliteDir, luneryProfileRoot } from "@/lib/server/lunery-profile";
 import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
 import {
   BACKUP_FORMAT,
@@ -30,6 +32,8 @@ const RESTORE_MODELS = [
   "referenceSetAsset",
 ] as const;
 
+const ESTIMATED_DB_ROW_OVERHEAD_BYTES = 256;
+
 function tooLarge(message: string): never {
   throw new ApiError({
     status: 413,
@@ -51,6 +55,30 @@ async function freeDiskBytes(): Promise<number | null> {
   } catch {
     return null;
   }
+}
+
+async function directorySizeBytes(directory: string): Promise<number> {
+  let entries: Dirent[];
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+
+  let total = 0;
+  for (const entry of entries) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      total += await directorySizeBytes(entryPath);
+    } else if (entry.isFile()) {
+      try {
+        total += (await stat(entryPath)).size;
+      } catch {
+        // Files may disappear while PGlite checkpoints; skip transient entries.
+      }
+    }
+  }
+  return total;
 }
 
 /**
@@ -101,7 +129,8 @@ export async function readBoundedRestoreBody(
 
   let parsed: unknown;
   try {
-    const text = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+    // Chunks are already Uint8Array views; avoid per-chunk Buffer copies.
+    const text = Buffer.concat(chunks).toString("utf8");
     parsed = JSON.parse(text);
   } catch {
     throw new ApiError({
@@ -132,7 +161,7 @@ export async function readBoundedRestoreBody(
   }
 
   assertRestorePayloadLimits(body.backup, limits);
-  await assertRestoreDiskHeadroom(body.backup);
+  await assertRestoreDiskHeadroom(body.backup, total);
 
   return { backup: body.backup, confirm: body.confirm === true };
 }
@@ -193,17 +222,29 @@ export function assertRestorePayloadLimits(
 
 export async function assertRestoreDiskHeadroom(
   backup: WorkspaceBackup,
+  encodedBodyBytes: number,
 ): Promise<void> {
   const media = Array.isArray(backup.media) ? backup.media : [];
   const config = Array.isArray(backup.config) ? backup.config : [];
-  let needed = 0;
+  const data = backup.data && typeof backup.data === "object" ? backup.data : {};
+  let rowCount = 0;
+  for (const model of RESTORE_MODELS) {
+    const rows = data[model];
+    if (Array.isArray(rows)) rowCount += rows.length;
+  }
+  // The wire size covers every serialized row byte without re-stringifying the
+  // parsed graph. Add a fixed tuple/page/index allowance per row.
+  let needed = encodedBodyBytes;
+  needed += rowCount * ESTIMATED_DB_ROW_OVERHEAD_BYTES;
   for (const entry of [...media, ...config]) {
     if (!entry || typeof entry.base64 !== "string") continue;
     needed += estimatedDecodedBytes(entry.base64);
   }
-  // Stage + rollback headroom: size this from the payload actually supplied.
-  // Requiring the theoretical maximum single-file allowance even for a tiny
-  // backup would incorrectly block restores on otherwise healthy machines.
+  // Replacing rows in one PGlite transaction can retain pages for the current
+  // database and its WAL until commit, even when the incoming backup is tiny.
+  needed += await directorySizeBytes(luneryPgliteDir());
+  // Keep room for staging plus transaction/rollback growth. Requiring the
+  // theoretical maximum file allowance would incorrectly block tiny restores.
   const required = needed * 2;
   const free = await freeDiskBytes();
   if (free !== null && free < required) {

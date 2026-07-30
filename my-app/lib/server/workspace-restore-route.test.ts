@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   requireLocalWorkspaceOwner: vi.fn(),
   restoreWorkspaceBackup: vi.fn(),
   freeDiskBytes: vi.fn(),
+  pgliteDiskBytes: vi.fn(),
 }));
 
 vi.mock("@/lib/server/local-workspace-owner", () => ({
@@ -23,6 +24,16 @@ vi.mock("node:fs/promises", async () => {
   const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
   return {
     ...actual,
+    readdir: async () => {
+      const bytes = mocks.pgliteDiskBytes() ?? 0;
+      if (bytes <= 0) return [];
+      return [{
+        name: "base.dat",
+        isDirectory: () => false,
+        isFile: () => true,
+      }];
+    },
+    stat: async () => ({ size: mocks.pgliteDiskBytes() ?? 0 }),
     statfs: async () => ({
       bavail: Math.floor((mocks.freeDiskBytes() ?? 10 * 1024 * 1024 * 1024) / 4096),
       bsize: 4096,
@@ -32,6 +43,7 @@ vi.mock("node:fs/promises", async () => {
 
 import { POST } from "@/app/api/workspace/restore/route";
 import {
+  assertRestoreDiskHeadroom,
   assertRestorePayloadLimits,
   RESTORE_LIMITS,
 } from "@/lib/server/workspace-restore-limits";
@@ -100,6 +112,7 @@ beforeEach(() => {
   mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
   mocks.restoreWorkspaceBackup.mockResolvedValue({ projects: 1, assets: 2 });
   mocks.freeDiskBytes.mockReturnValue(10 * 1024 * 1024 * 1024);
+  mocks.pgliteDiskBytes.mockReturnValue(0);
 });
 
 describe("POST /api/workspace/restore", () => {
@@ -234,5 +247,77 @@ describe("POST /api/workspace/restore", () => {
     expect(response.status).toBe(413);
     await expect(response.json()).resolves.toMatchObject({ code: "request_too_large" });
     expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+  });
+
+  it("accounts for database row data in disk headroom and rejects DB-heavy restores", async () => {
+    // Media/config empty; serialized agentMessage rows alone need ~2x headroom.
+    mocks.freeDiskBytes.mockReturnValue(8 * 1024);
+    const backup = {
+      ...minimalBackup(),
+      data: {
+        ...minimalBackup().data,
+        agentMessage: Array.from({ length: 40 }, (_, index) => ({
+          id: `msg-${index}`,
+          content: "x".repeat(120),
+        })),
+      },
+    };
+
+    const response = await restoreRequest({ backup, confirm: true });
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({ code: "request_too_large" });
+    expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+  });
+
+  it("uses encoded bytes for DB headroom without reserializing parsed rows", async () => {
+    const row = Object.defineProperty(
+      { id: "large-message", content: "x".repeat(1024) },
+      "toJSON",
+      {
+        get() {
+          throw new Error("restore headroom must not stringify rows");
+        },
+      },
+    );
+    const backup = {
+      ...minimalBackup(),
+      data: {
+        ...minimalBackup().data,
+        agentMessage: [row],
+      },
+    };
+
+    await expect(
+      assertRestoreDiskHeadroom(backup as never, 2 * 1024),
+    ).resolves.toBeUndefined();
+  });
+
+  it("accounts for the current PGlite database retained by the restore transaction", async () => {
+    mocks.freeDiskBytes.mockReturnValue(8 * 1024);
+    mocks.pgliteDiskBytes.mockReturnValue(5 * 1024);
+
+    const response = await restoreRequest({ backup: minimalBackup(), confirm: true });
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({ code: "request_too_large" });
+    expect(mocks.restoreWorkspaceBackup).not.toHaveBeenCalled();
+  });
+
+  it("does not impose the theoretical per-file maximum on tiny database-only backups", async () => {
+    mocks.freeDiskBytes.mockReturnValue(64 * 1024);
+    mocks.pgliteDiskBytes.mockReturnValue(8 * 1024);
+    const backup = {
+      ...minimalBackup(),
+      data: {
+        ...minimalBackup().data,
+        project: [{ id: "p1", name: "Tiny" }],
+      },
+    };
+
+    const response = await restoreRequest({ backup, confirm: true });
+
+    expect(response.status).toBe(200);
+    expect(mocks.restoreWorkspaceBackup).toHaveBeenCalledTimes(1);
   });
 });
