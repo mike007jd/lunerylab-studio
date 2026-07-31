@@ -1,6 +1,9 @@
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model-delete";
+import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { findHfModelEntry, type HfModelEntry } from "@/lib/hf-model-catalog";
 import {
   bridgeFetch,
@@ -48,6 +51,21 @@ function catalogModelPaths(entry: HfModelEntry): string[] {
 function importedModelPaths(record: ImportedModelRecord): string[] {
   if (record.source !== "huggingface-url") return [];
   return [record.modelPath, `${record.modelPath}.part`];
+}
+
+async function removeImportedExternalFile(record: ImportedModelRecord): Promise<number> {
+  try {
+    await fs.unlink(record.modelPath);
+    return 1;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw new ApiError({
+      status: 503,
+      code: "external_model_file_delete_failed",
+      message: "Could not delete the imported model file. Please try again.",
+      retryable: true,
+    });
+  }
 }
 
 async function cancelActiveImport(bridge: DesktopBridge, record: ImportedModelRecord): Promise<void> {
@@ -142,13 +160,16 @@ async function clearDeletedModelDefaults(ownerId: string, modelId: string): Prom
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ modelId: string }> },
 ) {
-  const bridge = requireDesktopBridge();
-  if (bridge instanceof NextResponse) return bridge;
-
   try {
+    if (!isDesktopRuntime()) {
+      return NextResponse.json(
+        { error: "Desktop runtime bridge is not available" },
+        { status: 404 },
+      );
+    }
     const owner = await requireLocalWorkspaceOwner();
     const rawModelId = (await params).modelId;
     const parsed = MODEL_ID.safeParse(rawModelId);
@@ -172,16 +193,49 @@ export async function DELETE(
       });
     }
 
+    const requestBody = await request.json().catch(() => null) as {
+      deleteExternalFile?: unknown;
+      confirmation?: unknown;
+    } | null;
+    const deleteExternalFile = imported?.source === "local-path"
+      && requestBody?.deleteExternalFile === true
+      && requestBody.confirmation === EXTERNAL_MODEL_DELETE_CONFIRMATION;
+
+    const bridgeResult = requireDesktopBridge();
+    const bridge = bridgeResult instanceof NextResponse ? null : bridgeResult;
+    const warnings: string[] = [];
+
     const modelPath = catalogEntry
       ? modelCachePath(catalogEntry.runtimeTarget, catalogEntry.fileName || catalogEntry.id)
       : imported?.modelPath ?? null;
-    if (imported) await cancelActiveImport(bridge, imported);
+    if (imported?.jobId) {
+      if (bridge) {
+        try {
+          await cancelActiveImport(bridge, imported);
+        } catch {
+          warnings.push("download_not_stopped");
+        }
+      } else {
+        warnings.push("download_not_stopped");
+      }
+    }
     if (catalogEntry?.runtimeTarget === "llama-cpp" || imported?.runtimeTarget === "llama-cpp") {
-      await stopActiveLlama(bridge, modelId, modelPath);
+      if (bridge) {
+        try {
+          await stopActiveLlama(bridge, modelId, modelPath);
+        } catch {
+          warnings.push("runtime_not_stopped");
+        }
+      } else {
+        warnings.push("runtime_not_stopped");
+      }
     }
 
     const paths = catalogEntry ? catalogModelPaths(catalogEntry) : importedModelPaths(imported!);
-    const removedFiles = await removeManagedModelFiles(paths);
+    let removedFiles = await removeManagedModelFiles(paths);
+    if (imported?.source === "local-path" && deleteExternalFile) {
+      removedFiles += await removeImportedExternalFile(imported);
+    }
     if (imported) await removeImportedModel(modelId);
     const clearedDefaults = await clearDeletedModelDefaults(owner.id, modelId);
     invalidateLocalModelInstallStatusCache();
@@ -191,8 +245,9 @@ export async function DELETE(
       modelId,
       removedFiles,
       unregistered: Boolean(imported),
-      preservedExternalFile: imported?.source === "local-path",
+      preservedExternalFile: imported?.source === "local-path" && !deleteExternalFile,
       clearedDefaults,
+      warnings,
     });
   } catch (error) {
     return jsonError(error);

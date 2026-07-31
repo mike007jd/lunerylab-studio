@@ -265,7 +265,6 @@ export function ProviderConnectionsPanel({
                     disabled={
                       secretFromEnv ||
                       providerRemovalPending ||
-                      !invokeCommand ||
                       (!connections[draftProvider] && !activeProviderHasSecret)
                     }
                   >

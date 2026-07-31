@@ -77,6 +77,9 @@ function DesktopRuntimeCardContent({
       bootstrap?.providers ?? {},
     ),
   );
+  const [residualSecretProviders, setResidualSecretProviders] = useState<Set<string>>(
+    () => new Set(),
+  );
   const initialProvider = useMemo(() => {
     if (!capability) return "openai";
     return PROVIDER_ORDER.find((id) => {
@@ -189,10 +192,11 @@ function DesktopRuntimeCardContent({
   );
 
   const activeProviderHasSecret = useMemo(() => {
+    if (residualSecretProviders.has(draftProvider)) return true;
     const runtime = runtimeProviderById.get(draftProvider);
     if (runtime) return runtime.configured;
     return status ? false : Boolean(connections[draftProvider]?.hasSecret);
-  }, [connections, draftProvider, runtimeProviderById, status]);
+  }, [connections, draftProvider, residualSecretProviders, runtimeProviderById, status]);
 
   function markProviderSecretStatus(providerId: string, configured: boolean) {
     setStatus((current) => {
@@ -350,6 +354,12 @@ function DesktopRuntimeCardContent({
     }
 
     if (hasNewKey) markProviderSecretStatus(requestProvider, true);
+    setResidualSecretProviders((current) => {
+      if (!current.has(requestProvider)) return current;
+      const next = new Set(current);
+      next.delete(requestProvider);
+      return next;
+    });
 
     setConnections((current) => ({
       ...current,
@@ -366,19 +376,15 @@ function DesktopRuntimeCardContent({
     }
   }
 
-  async function removeProvider(providerId: string): Promise<boolean> {
-    const result = await removeProviderCredentials({ providerId, invoke: invokeCommand });
-    if (!result.ok) {
-      if (result.secretRemoved) markProviderSecretStatus(providerId, false);
-      setSecretFeedback({ text: copy.removeFailed, tone: "error" });
-      return false;
-    }
-    markProviderSecretStatus(providerId, false);
-    const next = { ...connections };
-    delete next[providerId];
-    setConnections(next);
+  function unlinkProviderMetadata(providerId: string) {
+    setConnections((current) => {
+      if (!current[providerId]) return current;
+      const next = { ...current };
+      delete next[providerId];
+      return next;
+    });
     invalidateBootstrapSnapshot();
-    if (providerId === draftProvider) {
+    if (providerId === activeProviderRef.current) {
       setDraftKey("");
       const meta = providerMeta(providerId);
       setDraftEndpoint(meta.defaultEndpoint || "");
@@ -386,6 +392,44 @@ function DesktopRuntimeCardContent({
       setDraftModels({});
       setTestState(null);
     }
+  }
+
+  async function removeProvider(providerId: string): Promise<boolean> {
+    setSecretFeedback(null);
+    const result = await removeProviderCredentials({
+      providerId,
+      // The status probe can be stale or temporarily unavailable. The direct
+      // command remains retryable and will reach the bridge if it has recovered.
+      invoke: invokeCommand ?? bridgeInvoke,
+    });
+    if (result.status === "metadata-removal-failed") {
+      if (result.secretRemoved) {
+        markProviderSecretStatus(providerId, false);
+        setResidualSecretProviders((current) => {
+          if (!current.has(providerId)) return current;
+          const next = new Set(current);
+          next.delete(providerId);
+          return next;
+        });
+      }
+      setSecretFeedback({ text: copy.removeFailed, tone: "error" });
+      return false;
+    }
+
+    unlinkProviderMetadata(providerId);
+
+    if (result.status === "removed-with-residual-secret") {
+      setResidualSecretProviders((current) => new Set(current).add(providerId));
+      return true;
+    }
+
+    markProviderSecretStatus(providerId, false);
+    setResidualSecretProviders((current) => {
+      if (!current.has(providerId)) return current;
+      const next = new Set(current);
+      next.delete(providerId);
+      return next;
+    });
     return true;
   }
 
@@ -478,7 +522,10 @@ function DesktopRuntimeCardContent({
   // then the latest test-connection outcome. Tone drives the text colour so
   // errors are visually distinct from success/status (UX rule: error states
   // must not look like neutral copy).
-  const feedback = secretFeedback ?? testFeedback;
+  const residualSecretFeedback: ProviderFeedback | null = residualSecretProviders.has(draftProvider)
+    ? { text: copy.removeResidual, tone: "error" }
+    : null;
+  const feedback = secretFeedback ?? residualSecretFeedback ?? testFeedback;
   const unavailable = bridgePhase === "unavailable";
   const bridgeBlockedReason = desktopBridgeDisabledReason(bridgePhase, {
     checking: copy.bridgeChecking,

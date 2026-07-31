@@ -176,30 +176,42 @@ export async function removeProviderCredentials({
   providerId: string;
   invoke: DesktopInvoke | null;
   fetcher?: typeof fetch;
-}): Promise<{ ok: true } | { ok: false; secretRemoved: boolean }> {
-  if (!invoke) {
-    return { ok: false, secretRemoved: false };
-  }
-
-  // Metadata is the canonical record that lets the app find a keychain secret.
-  // Delete it only after the secret endpoint confirms deletion; otherwise a
-  // bridge outage would strand an undiscoverable keychain entry.
-  try {
-    await invoke("delete_provider_secret", { payload: { providerId } });
-  } catch {
-    return { ok: false, secretRemoved: false };
-  }
-
+}): Promise<
+  | { status: "removed" }
+  | { status: "removed-with-residual-secret" }
+  | { status: "metadata-removal-failed"; secretRemoved: boolean }
+> {
+  // Product unlinking is profile-owned and must not be blocked by a temporary
+  // native bridge or keychain outage. Remove that metadata first, then treat
+  // keychain cleanup as best-effort follow-up work.
+  let metadataRemoved = false;
   try {
     const response = await fetcher("/api/desktop-runtime/provider-connections", {
       method: "DELETE",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ providerId }),
     });
-    return response.ok ? { ok: true } : { ok: false, secretRemoved: true };
+    metadataRemoved = response.ok;
   } catch {
-    return { ok: false, secretRemoved: true };
+    metadataRemoved = false;
   }
+
+  let secretRemoved = false;
+  if (invoke) {
+    try {
+      await invoke("delete_provider_secret", { payload: { providerId } });
+      secretRemoved = true;
+    } catch {
+      secretRemoved = false;
+    }
+  }
+
+  if (!metadataRemoved) {
+    return { status: "metadata-removal-failed", secretRemoved };
+  }
+  return secretRemoved
+    ? { status: "removed" }
+    : { status: "removed-with-residual-secret" };
 }
 
 export function providerMeta(id: string): ByokProviderMeta {

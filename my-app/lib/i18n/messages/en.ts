@@ -545,6 +545,7 @@ const en = {
       "backupReady": "Backup saved.",
       "restoreTitle": "Replace this workspace?",
       "restoreDescription": "The backup replaces current projects, images, canvases, and settings. The app reloads when finished.",
+      "restoreCleanupPending": "The workspace was restored, but old files could not be removed. You can delete workspace data below if you want a clean start.",
       "invalidBackup": "Choose a valid Lunery backup file.",
       "healthTitle": "File Check",
       "healthDescription": "Find missing or unlinked local files.",
@@ -556,6 +557,12 @@ const en = {
       "looseFilesRemoved": "Removed {count} unlinked files.",
       "diagnostics": "Export Diagnostics",
       "diagnosticsReady": "Diagnostics saved.",
+      "resetTitle": "Start Fresh",
+      "resetDescription": "Delete every project, canvas, and media file, then restart Studio. Local models and service connections stay.",
+      "reset": "Delete Workspace Data",
+      "resetConfirmTitle": "Delete all workspace data?",
+      "resetConfirmDescription": "This permanently deletes every project, canvas, generated or imported media file, Trash item, and recovery copy. Local models and service connections stay on this computer.",
+      "resettingWorkspace": "Deleting local data and restarting Studio…",
       "loadFailed": "Could not load local data details.",
       "actionFailed": "The local data action failed."
     }

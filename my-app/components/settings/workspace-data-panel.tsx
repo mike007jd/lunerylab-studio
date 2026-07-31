@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { ConfirmActionDialog } from "@/components/ui/confirm-action-dialog";
 import { Download, RefreshCw, RotateCcw, Trash2 } from "@/components/ui/icons";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
+import { DESKTOP_WORKSPACE_RESET_CONFIRMATION } from "@/lib/desktop-workspace-reset";
 import { useT } from "@/lib/i18n/useT";
 import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
 import {
@@ -37,6 +38,7 @@ type PendingAction =
   | "check-files"
   | "empty-trash"
   | "remove-loose-files"
+  | "reset-workspace"
   | "restore"
   | null;
 
@@ -148,11 +150,18 @@ export function WorkspaceDataPanel() {
     if (!restoreBackupBlob) return;
     try {
       await runAction("restore", async () => {
-        await fetchJson("/api/workspace/restore", {
+        const response = await fetchJson<{ restored: { warnings?: string[] } }>("/api/workspace/restore", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: buildConfirmedRestoreBody(restoreBackupBlob),
         });
+        if (response.restored.warnings?.length) {
+          setFeedback({
+            tone: "error",
+            text: `${t("settings.data.restoreCleanupPending")} ${response.restored.warnings.join(" ")}`,
+          });
+          return;
+        }
         window.location.assign("/settings?panel=general");
       });
     } finally {
@@ -185,6 +194,19 @@ export function WorkspaceDataPanel() {
       setReconcile(response.reconcile);
       await refreshStorage();
       setFeedback({ tone: "success", text: t("settings.data.looseFilesRemoved", { count: response.reconcile.orphansDeleted }) });
+    });
+  }
+
+  async function handleResetWorkspace() {
+    await runAction("reset-workspace", async () => {
+      await fetchJson("/api/desktop-runtime/reset-workspace", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmation: DESKTOP_WORKSPACE_RESET_CONFIRMATION,
+        }),
+      });
+      setFeedback({ tone: "success", text: t("settings.data.resettingWorkspace") });
     });
   }
 
@@ -281,6 +303,21 @@ export function WorkspaceDataPanel() {
               </div>
             ) : null}
           </div>
+
+          <div className="space-y-2 py-4">
+            <p className="text-xs font-semibold text-destructive">{t("settings.data.resetTitle")}</p>
+            <p className="text-xs text-(--text-muted)">{t("settings.data.resetDescription")}</p>
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              disabled={pending !== null}
+              onClick={() => setConfirm("reset-workspace")}
+            >
+              <Trash2 className="h-4 w-4" />
+              {t("settings.data.reset")}
+            </Button>
+          </div>
         </div>
       </CardContent>
 
@@ -303,6 +340,16 @@ export function WorkspaceDataPanel() {
         cancelLabel={t("common.cancel")}
         pending={pending === "remove-loose-files"}
         onConfirm={handleRemoveLooseFiles}
+      />
+      <ConfirmActionDialog
+        open={confirm === "reset-workspace"}
+        onOpenChange={(open) => !open && setConfirm(null)}
+        title={t("settings.data.resetConfirmTitle")}
+        description={t("settings.data.resetConfirmDescription")}
+        confirmLabel={t("settings.data.reset")}
+        cancelLabel={t("common.cancel")}
+        pending={pending === "reset-workspace"}
+        onConfirm={handleResetWorkspace}
       />
       <ConfirmActionDialog
         open={confirm === "restore"}

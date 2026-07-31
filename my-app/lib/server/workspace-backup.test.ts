@@ -182,7 +182,7 @@ describe("exportWorkspaceBackup", () => {
     const backup = await exportWorkspaceBackup("2026-07-15T00:00:00.000Z");
 
     expect(backup.manifest.format).toBe(BACKUP_FORMAT);
-    expect(backup.manifest.appVersion).toBe("0.2.3");
+    expect(backup.manifest.appVersion).toBe("0.2.4");
     expect(backup.manifest.version).toBe(BACKUP_VERSION);
     expect(backup.manifest.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(backup.manifest.excluded).toContain("keychain-secrets");

@@ -545,6 +545,7 @@ const zhCN = {
       "backupReady": "备份已保存。",
       "restoreTitle": "替换当前工作区？",
       "restoreDescription": "备份将替换当前项目、图片、画布和设置，完成后应用会重新载入。",
+      "restoreCleanupPending": "工作区已恢复，但旧文件未能删除。如需彻底重新开始，可在下方删除工作区数据。",
       "invalidBackup": "请选择有效的 Lunery 备份文件。",
       "healthTitle": "文件检查",
       "healthDescription": "查找缺失或未关联的本地文件。",
@@ -556,6 +557,12 @@ const zhCN = {
       "looseFilesRemoved": "已删除 {count} 个未关联文件。",
       "diagnostics": "导出诊断信息",
       "diagnosticsReady": "诊断信息已保存。",
+      "resetTitle": "重新开始",
+      "resetDescription": "删除全部项目、画布和媒体文件，然后重启 Studio。本地模型和服务连接会保留。",
+      "reset": "删除工作区数据",
+      "resetConfirmTitle": "删除全部工作区数据？",
+      "resetConfirmDescription": "这会永久删除全部项目、画布、生成或导入的媒体文件、回收站内容和恢复副本。本地模型和服务连接会保留在这台电脑上。",
+      "resettingWorkspace": "正在删除本地数据并重启 Studio…",
       "loadFailed": "无法载入本地数据详情。",
       "actionFailed": "本地数据操作失败。"
     }

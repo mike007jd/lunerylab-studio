@@ -11,6 +11,7 @@ import { z } from "zod";
 import { requireDesktopBridge } from "@/lib/server/desktop-bridge";
 import { parseJsonBody } from "@/lib/server/http-validation";
 import { jsonError } from "@/lib/server/errors";
+import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import {
   byokModelInputRoles,
   findByokProvider,
@@ -115,8 +116,15 @@ export async function POST(request: NextRequest) {
 
 export async function DELETE(request: NextRequest) {
   try {
-    const bridge = requireDesktopBridge();
-    if (bridge instanceof NextResponse) return bridge;
+    // Metadata is owned by the local profile, not by the native bridge. Keep
+    // browser access denied, but do not let a bridge/keychain outage prevent
+    // the user from unlinking a provider from the product.
+    if (!isDesktopRuntime()) {
+      return NextResponse.json(
+        { error: "Desktop runtime bridge is not available" },
+        { status: 404 },
+      );
+    }
     const { providerId } = await parseJsonBody(request, providerConnectionDeleteSchema);
     deleteByokConnectionMeta(providerId);
     return NextResponse.json({ ok: true });

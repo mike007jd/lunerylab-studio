@@ -1,5 +1,6 @@
 import "server-only";
 
+import { ApiError } from "@/lib/server/errors";
 import { prisma } from "@/lib/server/prisma";
 import { deleteStoredFile } from "@/lib/server/storage";
 
@@ -16,10 +17,11 @@ import { deleteStoredFile } from "@/lib/server/storage";
  *   - A stored file is unlinked only when no OTHER surviving asset references the
  *     same storagePath, so shared/bundled media is never removed out from under
  *     a still-live asset.
+ *   - Stored files are deleted before rows. A failed unlink keeps the asset rows
+ *     as the retry record instead of reporting a permanent delete that left
+ *     local data behind. Missing files are already idempotent in deleteStoredFile.
  *   - Rows are removed in a single deleteMany; their ReferenceSetAsset
- *     memberships cascade away via FK. File deletion runs after and is
- *     best-effort (a failed unlink leaves a reconcilable orphan, never a
- *     dangling DB row).
+ *     memberships cascade away via FK.
  */
 export interface AssetPurgeResult {
   purgedCount: number;
@@ -45,8 +47,14 @@ export async function purgeAssets(userId: string, target: PurgeTarget): Promise<
   }
 
   const purgedIds = targets.map((a) => a.id);
-  const bytesFreed = targets.reduce((sum, a) => sum + (a.byteSize ?? 0), 0);
   const candidatePaths = [...new Set(targets.map((a) => a.storagePath))];
+  const bytesByPath = new Map<string, number>();
+  for (const target of targets) {
+    bytesByPath.set(
+      target.storagePath,
+      Math.max(bytesByPath.get(target.storagePath) ?? 0, target.byteSize ?? 0),
+    );
+  }
 
   // Paths still referenced by a surviving (non-purged) asset must NOT be
   // unlinked — another live asset shares that file.
@@ -56,23 +64,40 @@ export async function purgeAssets(userId: string, target: PurgeTarget): Promise<
   });
   const sharedPaths = new Set(survivorsUsingPaths.map((a) => a.storagePath));
   const pathsToDelete = candidatePaths.filter((p) => !sharedPaths.has(p));
+  const bytesFreed = pathsToDelete.reduce(
+    (sum, storagePath) => sum + (bytesByPath.get(storagePath) ?? 0),
+    0,
+  );
+
+  let filesDeleted = 0;
+  for (const storagePath of pathsToDelete) {
+    try {
+      await deleteStoredFile(storagePath);
+      filesDeleted += 1;
+    } catch {
+      throw new ApiError({
+        status: 503,
+        code: "asset_file_delete_failed",
+        message: "Could not delete all local asset files. Please try again.",
+        retryable: true,
+      });
+    }
+  }
 
   // Deleting the asset rows also removes their ReferenceSetAsset memberships via
   // the join table's onDelete: Cascade FK — no dangling reference ids survive.
-  await prisma.asset.deleteMany({ where: { id: { in: purgedIds }, userId } });
-
-  let filesDeleted = 0;
-  await Promise.all(
-    pathsToDelete.map(async (storagePath) => {
-      try {
-        await deleteStoredFile(storagePath);
-        filesDeleted += 1;
-      } catch {
-        // Best-effort: a failed unlink leaves a reconcilable orphan file, not a
-        // dangling DB row. The orphan reconciler (T-M4-5) sweeps these.
-      }
-    }),
-  );
+  // If this step fails, the rows retain the storage paths needed for an
+  // idempotent retry; files already removed resolve as success on the next run.
+  try {
+    await prisma.asset.deleteMany({ where: { id: { in: purgedIds }, userId } });
+  } catch {
+    throw new ApiError({
+      status: 503,
+      code: "asset_record_delete_failed",
+      message: "Local files were deleted, but their records could not be removed. Please try again.",
+      retryable: true,
+    });
+  }
 
   return { purgedCount: targets.length, bytesFreed, filesDeleted };
 }

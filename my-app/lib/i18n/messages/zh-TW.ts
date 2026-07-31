@@ -545,6 +545,7 @@ const zhTW = {
       "backupReady": "備份已儲存。",
       "restoreTitle": "取代目前工作區？",
       "restoreDescription": "備份將取代目前專案、圖片、畫布和設定，完成後應用程式會重新載入。",
+      "restoreCleanupPending": "工作區已恢復，但舊檔案未能刪除。如需徹底重新開始，可在下方刪除工作區資料。",
       "invalidBackup": "請選擇有效的 Lunery 備份檔案。",
       "healthTitle": "檔案檢查",
       "healthDescription": "尋找缺失或未連結的本機檔案。",
@@ -556,6 +557,12 @@ const zhTW = {
       "looseFilesRemoved": "已刪除 {count} 個未連結檔案。",
       "diagnostics": "匯出診斷資訊",
       "diagnosticsReady": "診斷資訊已儲存。",
+      "resetTitle": "重新開始",
+      "resetDescription": "刪除全部專案、畫布和媒體檔案，然後重新啟動 Studio。本機模型和服務連線會保留。",
+      "reset": "刪除工作區資料",
+      "resetConfirmTitle": "刪除全部工作區資料？",
+      "resetConfirmDescription": "這會永久刪除全部專案、畫布、產生或匯入的媒體檔案、回收站內容和復原副本。本機模型和服務連線會保留在這台電腦上。",
+      "resettingWorkspace": "正在刪除本機資料並重新啟動 Studio…",
       "loadFailed": "無法載入本機資料詳情。",
       "actionFailed": "本機資料操作失敗。"
     }

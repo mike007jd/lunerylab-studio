@@ -20,6 +20,7 @@ import { useI18n } from "@/lib/i18n/provider";
 import { readResponseError } from "@/lib/client/fetch-json";
 import { invalidateBootstrapSnapshot } from "@/lib/client/use-bootstrap-snapshot";
 import { invalidateModelCatalog } from "@/lib/client/use-model-catalog";
+import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model-delete";
 import { cn } from "@/lib/utils";
 import {
   HF_MODEL_CATALOG,
@@ -344,22 +345,34 @@ export function LocalModelsPanel({ capability = "image" }: { capability?: "text"
   }, [copy.importError, copy.importQueued, handleQueueChange, hfUrl, refreshLocalState, reportImportError, runtimeTarget, watchImportJob]);
 
   const deleteModel = useCallback(async (entry: HubModelEntry) => {
+    const deleteExternalFile = entry.imported && entry.source === "local-path";
     const response = await fetch(`/api/desktop-runtime/models/${encodeURIComponent(entry.id)}`, {
       method: "DELETE",
+      headers: deleteExternalFile ? { "content-type": "application/json" } : undefined,
+      body: deleteExternalFile
+        ? JSON.stringify({
+            deleteExternalFile: true,
+            confirmation: EXTERNAL_MODEL_DELETE_CONFIRMATION,
+          })
+        : undefined,
       cache: "no-store",
     });
     if (!response.ok) {
       throw new Error(await readResponseError(response, copy.deleteError));
     }
-    const result = (await response.json()) as { preservedExternalFile?: boolean };
+    const result = (await response.json()) as { preservedExternalFile?: boolean; warnings?: string[] };
     setImportStatus({
       tone: "success",
-      text: result.preservedExternalFile ? copy.deleteUnregistered : copy.deleteDone,
+      text: result.warnings?.length
+        ? copy.deleteDoneWithRuntimeWarning
+        : result.preservedExternalFile
+          ? copy.deleteUnregistered
+          : copy.deleteDone,
     });
     await refreshLocalState();
     invalidateModelCatalog();
     invalidateBootstrapSnapshot();
-  }, [copy.deleteDone, copy.deleteError, copy.deleteUnregistered, refreshLocalState]);
+  }, [copy.deleteDone, copy.deleteDoneWithRuntimeWarning, copy.deleteError, copy.deleteUnregistered, refreshLocalState]);
 
   // Fire-and-forget launcher for installed-but-not-running external runtimes.
   // After kicking the bridge we wait 1.5s and re-probe so the UX flips from

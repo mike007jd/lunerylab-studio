@@ -1,6 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { accessSync, constants, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { NextResponse } from "next/server";
+import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model-delete";
 
 const mocks = vi.hoisted(() => ({
+  isDesktopRuntime: vi.fn(),
   findHfModelEntry: vi.fn(),
   bridgeFetch: vi.fn(),
   getBridgeDownloadStatus: vi.fn(),
@@ -14,6 +20,10 @@ const mocks = vi.hoisted(() => ({
   requireLocalWorkspaceOwner: vi.fn(),
   getLocalWorkspacePreferences: vi.fn(),
   userSettingsUpdate: vi.fn(),
+}));
+
+vi.mock("@/lib/desktop-runtime", () => ({
+  isDesktopRuntime: mocks.isDesktopRuntime,
 }));
 
 vi.mock("@/lib/hf-model-catalog", () => ({
@@ -54,8 +64,19 @@ import { DELETE } from "@/app/api/desktop-runtime/models/[modelId]/route";
 
 const bridge = { url: "http://127.0.0.1:49152", token: "bridge-token" };
 
-function request(modelId: string) {
-  return DELETE(new Request(`http://localhost/api/desktop-runtime/models/${modelId}`, { method: "DELETE" }), {
+let tempRoot: string | null = null;
+
+afterEach(() => {
+  if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+  tempRoot = null;
+});
+
+function request(modelId: string, body?: Record<string, unknown>) {
+  return DELETE(new Request(`http://localhost/api/desktop-runtime/models/${modelId}`, {
+    method: "DELETE",
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  }), {
     params: Promise.resolve({ modelId }),
   });
 }
@@ -63,6 +84,7 @@ function request(modelId: string) {
 describe("/api/desktop-runtime/models/[modelId]", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.isDesktopRuntime.mockReturnValue(true);
     mocks.requireDesktopBridge.mockReturnValue(bridge);
     mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "owner-1" });
     mocks.getLocalWorkspacePreferences.mockResolvedValue({
@@ -77,6 +99,17 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     mocks.removeManagedModelFiles.mockResolvedValue(0);
     mocks.getBridgeDownloadStatus.mockResolvedValue({ status: "ready" });
     mocks.bridgeFetch.mockResolvedValue(Response.json({ ok: true }));
+  });
+
+  it("keeps model deletion desktop-only even when the native bridge is unavailable", async () => {
+    mocks.isDesktopRuntime.mockReturnValue(false);
+    mocks.requireDesktopBridge.mockReturnValue(new Response(null, { status: 503 }));
+
+    const response = await request("llama-model");
+
+    expect(response.status).toBe(404);
+    expect(mocks.requireLocalWorkspaceOwner).not.toHaveBeenCalled();
+    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
   });
 
   it("removes catalog files and clears a matching image default", async () => {
@@ -140,6 +173,128 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     });
     expect(mocks.removeManagedModelFiles).toHaveBeenCalledWith([]);
     expect(mocks.removeImportedModel).toHaveBeenCalledWith("imported-sd-cpp-original-12345678");
+  });
+
+  it("deletes an imported external file after explicit confirmation", async () => {
+    tempRoot = mkdtempSync(path.join(tmpdir(), "lunery-external-model-delete-"));
+    const modelPath = path.join(tempRoot, "original.safetensors");
+    writeFileSync(modelPath, "model");
+    mocks.findImportedModel.mockResolvedValue({
+      id: "imported-sd-cpp-delete-12345678",
+      source: "local-path",
+      runtimeTarget: "sd-cpp",
+      modelPath,
+      status: "ready",
+    });
+
+    const response = await request("imported-sd-cpp-delete-12345678", {
+      deleteExternalFile: true,
+      confirmation: EXTERNAL_MODEL_DELETE_CONFIRMATION,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deleted: true,
+      preservedExternalFile: false,
+      removedFiles: 1,
+    });
+    expect(() => writeFileSync(modelPath, "replacement", { flag: "wx" })).not.toThrow();
+  });
+
+  it("keeps the imported file and registry when a confirmed external delete fails", async () => {
+    tempRoot = mkdtempSync(path.join(tmpdir(), "lunery-external-model-delete-fail-"));
+    const modelPath = tempRoot;
+    mocks.findImportedModel.mockResolvedValue({
+      id: "imported-sd-cpp-delete-fail-12345678",
+      source: "local-path",
+      runtimeTarget: "sd-cpp",
+      modelPath,
+      status: "ready",
+    });
+
+    const response = await request("imported-sd-cpp-delete-fail-12345678", {
+      deleteExternalFile: true,
+      confirmation: EXTERNAL_MODEL_DELETE_CONFIRMATION,
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "external_model_file_delete_failed",
+      retryable: true,
+    });
+    expect(mocks.removeImportedModel).not.toHaveBeenCalled();
+    expect(() => accessSync(modelPath, constants.F_OK)).not.toThrow();
+  });
+
+  it("does not delete an imported file without the shared confirmation token", async () => {
+    tempRoot = mkdtempSync(path.join(tmpdir(), "lunery-external-model-no-confirm-"));
+    const modelPath = path.join(tempRoot, "original.safetensors");
+    writeFileSync(modelPath, "model");
+    mocks.findImportedModel.mockResolvedValue({
+      id: "imported-sd-cpp-no-confirm-12345678",
+      source: "local-path",
+      runtimeTarget: "sd-cpp",
+      modelPath,
+      status: "ready",
+    });
+
+    const response = await request("imported-sd-cpp-no-confirm-12345678", {
+      deleteExternalFile: true,
+      confirmation: "yes",
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deleted: true,
+      preservedExternalFile: true,
+      removedFiles: 0,
+    });
+    expect(() => accessSync(modelPath, constants.F_OK)).not.toThrow();
+  });
+
+  it("continues deletion when the native bridge is unavailable and reports residual risk", async () => {
+    mocks.findHfModelEntry.mockReturnValue({
+      id: "llama-model",
+      runtimeTarget: "llama-cpp",
+      fileName: "model.gguf",
+    });
+    mocks.catalogModelFiles.mockReturnValue([{ fileName: "model.gguf" }]);
+    mocks.modelCachePath.mockImplementation((_runtime: string, fileName: string) => `/profile/models/llama-cpp/${fileName}`);
+    mocks.requireDesktopBridge.mockReturnValue(
+      NextResponse.json({ error: "bridge unavailable" }, { status: 503 }),
+    );
+    mocks.removeManagedModelFiles.mockResolvedValue(2);
+
+    const response = await request("llama-model");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deleted: true,
+      removedFiles: 2,
+      warnings: ["runtime_not_stopped"],
+    });
+    expect(mocks.bridgeFetch).not.toHaveBeenCalled();
+  });
+
+  it("continues deletion when runtime status probing fails and reports the residual risk", async () => {
+    mocks.findHfModelEntry.mockReturnValue({
+      id: "llama-model",
+      runtimeTarget: "llama-cpp",
+      fileName: "model.gguf",
+    });
+    mocks.catalogModelFiles.mockReturnValue([{ fileName: "model.gguf" }]);
+    mocks.modelCachePath.mockImplementation((_runtime: string, fileName: string) => `/profile/models/llama-cpp/${fileName}`);
+    mocks.bridgeFetch.mockRejectedValue(new Error("bridge down"));
+    mocks.removeManagedModelFiles.mockResolvedValue(2);
+
+    const response = await request("llama-model");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deleted: true,
+      removedFiles: 2,
+      warnings: ["runtime_not_stopped"],
+    });
   });
 
   it("stops an active imported llama model before removing its cache", async () => {

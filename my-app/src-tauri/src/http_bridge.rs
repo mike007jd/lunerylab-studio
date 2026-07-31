@@ -24,7 +24,9 @@ use crate::secrets::{
     ProviderSecretPayload, ProviderSecretReadError,
 };
 use crate::security::{bridge_token, constant_time_eq, host_is_loopback};
-use crate::DesktopBridge;
+use crate::{DesktopBridge, DESKTOP_WORKSPACE_RESET_CONFIRMATION};
+
+pub(crate) type WorkspaceResetHandler = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 fn read_http_request(
     stream: &mut TcpStream,
@@ -330,7 +332,12 @@ fn handle_sse_download_events(
     }
 }
 
-fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc<DownloadState>) {
+fn handle_bridge_request(
+    mut stream: TcpStream,
+    token: &str,
+    download_state: Arc<DownloadState>,
+    workspace_reset: WorkspaceResetHandler,
+) {
     let Ok((method, path, headers, body)) = read_http_request(&mut stream) else {
         bridge_error(&mut stream, "400 Bad Request", "Invalid request");
         return;
@@ -385,6 +392,30 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
             Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
             Err(err) => bridge_error(&mut stream, "500 Internal Server Error", &err.to_string()),
         },
+        ("POST", "/reset-workspace") => {
+            #[derive(Deserialize)]
+            struct ResetWorkspaceBody {
+                confirmation: String,
+            }
+
+            match serde_json::from_str::<ResetWorkspaceBody>(&body) {
+                Ok(request) if request.confirmation == DESKTOP_WORKSPACE_RESET_CONFIRMATION => {
+                    match workspace_reset() {
+                        Ok(()) => write_http_response(
+                            &mut stream,
+                            "202 Accepted",
+                            &serde_json::json!({ "resetting": true }).to_string(),
+                        ),
+                        Err(err) => bridge_error(&mut stream, "409 Conflict", &err),
+                    }
+                }
+                _ => bridge_error(
+                    &mut stream,
+                    "400 Bad Request",
+                    "Explicit workspace reset confirmation is required",
+                ),
+            }
+        }
         ("POST", "/provider-secret") => {
             let payload = match serde_json::from_str::<ProviderSecretPayload>(&body) {
                 Ok(payload) => payload,
@@ -819,6 +850,7 @@ fn provider_secret_mutation_http_status(error: ProviderSecretMutationError) -> &
 
 pub(crate) fn start_desktop_bridge(
     download_state: Arc<DownloadState>,
+    workspace_reset: WorkspaceResetHandler,
 ) -> Result<DesktopBridge, String> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|err| format!("Could not start desktop bridge: {err}"))?;
@@ -844,9 +876,10 @@ pub(crate) fn start_desktop_bridge(
             }
             let token = bridge_token.clone();
             let ds = Arc::clone(&download_state);
+            let reset = Arc::clone(&workspace_reset);
             let in_flight_for_worker = Arc::clone(&in_flight);
             thread::spawn(move || {
-                handle_bridge_request(stream, &token, ds);
+                handle_bridge_request(stream, &token, ds, reset);
                 in_flight_for_worker.fetch_sub(1, Ordering::AcqRel);
             });
         }

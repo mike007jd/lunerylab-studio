@@ -22,7 +22,7 @@ use crate::engine_mlx::{bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_prog
 use crate::engine_sd::{bridge_stop_sd, sd_binary_path};
 use crate::external_apps::{is_lmstudio_installed, is_ollama_installed};
 use crate::hardware::{cached_accel, detect_hardware, probe_local_runtime, AccelInfo};
-use crate::http_bridge::start_desktop_bridge;
+use crate::http_bridge::{start_desktop_bridge, WorkspaceResetHandler};
 use crate::profile::{ensure_profile_dirs, profile_dirs, ProfileDirs, ProfileStorageDirs};
 use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(debug_assertions))]
 use std::process::Stdio;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 #[cfg(not(debug_assertions))]
@@ -86,7 +86,7 @@ struct DesktopServerState {
     url: Mutex<Option<String>>,
     pid_lockfile: Mutex<Option<PathBuf>>,
     dev_bridge_file: Mutex<Option<PathBuf>>,
-    booting: AtomicBool,
+    runtime_operation: AtomicU8,
     /// Flipped by `shutdown` so the local-runtime watcher thread exits cleanly
     /// on app shutdown instead of being a daemon leak. The watcher reads this
     /// every 2s tick.
@@ -94,9 +94,7 @@ struct DesktopServerState {
 }
 
 impl DesktopServerState {
-    fn shutdown(&self) {
-        self.watcher_cancel.store(true, Ordering::Relaxed);
-
+    fn stop_runtime(&self) {
         let mut child_guard = self
             .child
             .lock()
@@ -114,6 +112,15 @@ impl DesktopServerState {
         }
         drop(child_guard);
 
+        #[cfg(unix)]
+        {
+            let mut process_group_guard = self
+                .process_group
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *process_group_guard = None;
+        }
+
         let mut pid_lockfile_guard = self
             .pid_lockfile
             .lock()
@@ -123,6 +130,17 @@ impl DesktopServerState {
         }
         drop(pid_lockfile_guard);
 
+        let mut url_guard = self
+            .url
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *url_guard = None;
+    }
+
+    fn shutdown(&self) {
+        self.watcher_cancel.store(true, Ordering::Relaxed);
+        self.stop_runtime();
+
         let mut dev_bridge_guard = self
             .dev_bridge_file
             .lock()
@@ -130,13 +148,6 @@ impl DesktopServerState {
         if let Some(path) = dev_bridge_guard.take() {
             let _ = std::fs::remove_file(path);
         }
-        drop(dev_bridge_guard);
-
-        let mut url_guard = self
-            .url
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *url_guard = None;
     }
 }
 
@@ -254,6 +265,128 @@ struct DesktopDevBridgeFile {
 pub(crate) struct DesktopBridge {
     pub(crate) port: u16,
     pub(crate) token: String,
+}
+
+pub(crate) const DESKTOP_WORKSPACE_RESET_CONFIRMATION: &str = "DELETE_LUNERY_WORKSPACE";
+const RUNTIME_OPERATION_IDLE: u8 = 0;
+const RUNTIME_OPERATION_BOOT: u8 = 1;
+#[cfg(not(debug_assertions))]
+const RUNTIME_OPERATION_RESET: u8 = 2;
+
+#[cfg(any(test, not(debug_assertions)))]
+fn remove_profile_owned_path(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("Could not inspect {}: {err}", path.display())),
+    };
+
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(path)
+            .map_err(|err| format!("Could not remove {}: {err}", path.display()))
+    } else {
+        std::fs::remove_dir_all(path)
+            .map_err(|err| format!("Could not remove {}: {err}", path.display()))
+    }
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn reset_workspace_data(dirs: &ProfileDirs) -> Result<(), String> {
+    use std::path::Component;
+
+    let expected_data = dirs.root.join("data");
+    if !dirs.root.is_absolute()
+        || dirs
+            .root
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || dirs.data != expected_data
+        || dirs.pglite != expected_data.join("pglite")
+        || dirs.media != expected_data.join("media")
+    {
+        return Err(
+            "Workspace reset only deletes the resolved Lunery profile data directory".to_string(),
+        );
+    }
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let normal_component_count = dirs
+        .root
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    if dirs.root.parent().is_none()
+        || dirs.root.parent() == Some(Path::new("/"))
+        || home
+            .as_ref()
+            .is_some_and(|home| dirs.root == *home || dirs.root.parent() == Some(home.as_path()))
+        || normal_component_count < 2
+    {
+        return Err("Refusing to reset an unsafe or overly broad profile path".to_string());
+    }
+
+    for candidate in [dirs.root.parent(), Some(dirs.root.as_path())]
+        .into_iter()
+        .flatten()
+    {
+        if std::fs::symlink_metadata(candidate)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err("Refusing to reset a profile reached through a symlink".to_string());
+        }
+    }
+
+    let canonical_root = dirs.root.canonicalize().map_err(|err| {
+        format!(
+            "Could not verify profile root {}: {err}",
+            dirs.root.display()
+        )
+    })?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&dirs.data) {
+        if !metadata.file_type().is_symlink() {
+            let canonical_data = dirs.data.canonicalize().map_err(|err| {
+                format!(
+                    "Could not verify profile data directory {}: {err}",
+                    dirs.data.display()
+                )
+            })?;
+            if canonical_data.parent() != Some(canonical_root.as_path()) {
+                return Err(
+                    "Profile data directory escapes the resolved Lunery profile".to_string()
+                );
+            }
+        }
+    }
+
+    remove_profile_owned_path(&dirs.data)?;
+    for dir in [&dirs.data, &dirs.pglite, &dirs.media] {
+        std::fs::create_dir_all(dir)
+            .map_err(|err| format!("Could not recreate {}: {err}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn open_desktop_profile_folder() -> Result<(), String> {
+    let folder = profile_dirs()?.root;
+    std::fs::create_dir_all(&folder)
+        .map_err(|err| format!("Could not create {}: {err}", folder.display()))?;
+
+    let mut command = if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(windows) {
+        Command::new("explorer")
+    } else {
+        Command::new("xdg-open")
+    };
+    command
+        .arg(&folder)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Could not open the Lunery profile folder: {err}"))
 }
 
 fn has_env_key(keys: &[&str]) -> bool {
@@ -1043,7 +1176,10 @@ fn start_desktop_server(
 
     let port = reserve_local_port()?;
     let url = format!("http://127.0.0.1:{port}");
-    let bridge = start_desktop_bridge(Arc::clone(download_state))?;
+    let bridge = start_desktop_bridge(
+        Arc::clone(download_state),
+        workspace_reset_handler(app.clone(), Arc::clone(download_state)),
+    )?;
     let media_dir = desktop_media_dir(&profile)?;
     let pglite_dir = profile.pglite.clone();
     let migrations_dir = app_dir.join("prisma").join("migrations");
@@ -1166,11 +1302,9 @@ fn show_startup_error(app: &AppHandle) {
     }
 }
 
-fn boot_desktop_runtime(app: AppHandle, download_state: Arc<DownloadState>) {
+fn boot_desktop_runtime_inner(app: &AppHandle, download_state: &Arc<DownloadState>) {
+    #[cfg(not(debug_assertions))]
     let state = app.state::<DesktopServerState>();
-    if state.booting.swap(true, Ordering::SeqCst) {
-        return;
-    }
 
     #[cfg(debug_assertions)]
     let result = {
@@ -1181,21 +1315,128 @@ fn boot_desktop_runtime(app: AppHandle, download_state: Arc<DownloadState>) {
         })
     };
     #[cfg(not(debug_assertions))]
-    let result = start_desktop_server(&app, state.inner(), &download_state);
+    let result = start_desktop_server(app, state.inner(), download_state);
 
-    state.booting.store(false, Ordering::SeqCst);
     match result {
         Ok(runtime) => {
-            if let Err(err) = navigate_and_show(&app, &format!("{}/studio", runtime.url)) {
+            if let Err(err) = navigate_and_show(app, &format!("{}/studio", runtime.url)) {
                 eprintln!("Desktop Studio navigation failed: {err}");
-                show_startup_error(&app);
+                show_startup_error(app);
             }
         }
         Err(err) => {
             eprintln!("Desktop Studio startup failed: {err}");
-            show_startup_error(&app);
+            show_startup_error(app);
         }
     }
+}
+
+fn boot_desktop_runtime(app: AppHandle, download_state: Arc<DownloadState>) {
+    let state = app.state::<DesktopServerState>();
+    if state
+        .runtime_operation
+        .compare_exchange(
+            RUNTIME_OPERATION_IDLE,
+            RUNTIME_OPERATION_BOOT,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    boot_desktop_runtime_inner(&app, &download_state);
+    state
+        .runtime_operation
+        .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+}
+
+fn workspace_reset_handler(
+    app: AppHandle,
+    download_state: Arc<DownloadState>,
+) -> WorkspaceResetHandler {
+    Arc::new(move || {
+        request_desktop_workspace_reset(
+            app.clone(),
+            Arc::clone(&download_state),
+            DESKTOP_WORKSPACE_RESET_CONFIRMATION,
+        )
+    })
+}
+
+fn request_desktop_workspace_reset(
+    app: AppHandle,
+    download_state: Arc<DownloadState>,
+    confirmation: &str,
+) -> Result<(), String> {
+    if confirmation != DESKTOP_WORKSPACE_RESET_CONFIRMATION {
+        return Err("Explicit workspace reset confirmation is required".to_string());
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let _ = (app, download_state);
+        return Err(
+            "Workspace reset is available in packaged Studio builds; development runtime data must be reset by its owner"
+                .to_string(),
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let state = app.state::<DesktopServerState>();
+        if state
+            .runtime_operation
+            .compare_exchange(
+                RUNTIME_OPERATION_IDLE,
+                RUNTIME_OPERATION_RESET,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err("Studio is already starting or resetting".to_string());
+        }
+
+        thread::spawn(move || {
+            // Let the invoking page receive its acknowledgement before the
+            // owned Next/PGlite process is stopped.
+            thread::sleep(Duration::from_millis(250));
+            let result = (|| -> Result<(), String> {
+                if let Err(err) = navigate_and_show(&app, "tauri://localhost/index.html") {
+                    eprintln!("Could not show workspace reset progress: {err}");
+                }
+                bridge_stop_llama();
+                bridge_stop_mlx();
+                bridge_stop_sd();
+                app.state::<DesktopServerState>().stop_runtime();
+                reset_workspace_data(&profile_dirs()?)?;
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => boot_desktop_runtime_inner(&app, &download_state),
+                Err(err) => {
+                    eprintln!("Desktop workspace reset failed: {err}");
+                    show_startup_error(&app);
+                }
+            }
+            app.state::<DesktopServerState>()
+                .runtime_operation
+                .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn reset_desktop_workspace(
+    app: AppHandle,
+    download_state: State<'_, Arc<DownloadState>>,
+    confirmation: String,
+) -> Result<(), String> {
+    request_desktop_workspace_reset(app, Arc::clone(download_state.inner()), confirmation.trim())
 }
 
 #[tauri::command]
@@ -1263,7 +1504,13 @@ pub fn run() {
             #[cfg(debug_assertions)]
             {
                 let dev_bridge_result = profile_dirs().and_then(|profile| {
-                    let bridge = start_desktop_bridge(Arc::clone(&dev_bridge_download_state))?;
+                    let bridge = start_desktop_bridge(
+                        Arc::clone(&dev_bridge_download_state),
+                        workspace_reset_handler(
+                            app.handle().clone(),
+                            Arc::clone(&dev_bridge_download_state),
+                        ),
+                    )?;
                     write_desktop_dev_bridge_file(&profile, &bridge)
                 });
                 match dev_bridge_result {
@@ -1342,6 +1589,8 @@ pub fn run() {
             save_provider_secret,
             delete_provider_secret,
             retry_desktop_runtime,
+            reset_desktop_workspace,
+            open_desktop_profile_folder,
             detect_hardware,
             probe_local_runtime,
         ]);
@@ -1433,6 +1682,134 @@ mod desktop_server_lifecycle_tests {
 
         state.shutdown();
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod workspace_reset_tests {
+    use crate::profile::ProfileDirs;
+    use crate::reset_workspace_data;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("lunery-workspace-reset-{name}-{nonce}"))
+    }
+
+    fn profile(root: PathBuf) -> ProfileDirs {
+        let data = root.join("data");
+        ProfileDirs {
+            config: root.join("config"),
+            pglite: data.join("pglite"),
+            media: data.join("media"),
+            models: root.join("models"),
+            logs: root.join("logs"),
+            runtime: root.join("runtime"),
+            root,
+            data,
+        }
+    }
+
+    #[test]
+    fn reset_deletes_workspace_and_recovery_but_preserves_models_connections_and_logs() {
+        let dirs = profile(unique_root("contents"));
+        for dir in [
+            &dirs.config,
+            &dirs.pglite,
+            &dirs.media,
+            &dirs.models,
+            &dirs.logs,
+        ] {
+            std::fs::create_dir_all(dir).expect("create profile fixture");
+        }
+        std::fs::create_dir_all(dirs.data.join("recovery/pglite-old"))
+            .expect("create recovery fixture");
+        std::fs::write(dirs.pglite.join("PG_VERSION"), b"broken").expect("seed database");
+        std::fs::write(dirs.media.join("asset.webp"), b"asset").expect("seed media");
+        std::fs::write(dirs.data.join("recovery/pglite-old/PG_VERSION"), b"old")
+            .expect("seed recovery");
+        std::fs::write(dirs.config.join("provider-connections.json"), b"{}")
+            .expect("seed connections");
+        std::fs::write(dirs.models.join("model.gguf"), b"model").expect("seed model");
+        std::fs::write(dirs.logs.join("desktop-runtime.log"), b"log").expect("seed log");
+
+        reset_workspace_data(&dirs).expect("reset workspace");
+
+        assert!(dirs.pglite.is_dir());
+        assert!(dirs.media.is_dir());
+        assert!(!dirs.pglite.join("PG_VERSION").exists());
+        assert!(!dirs.media.join("asset.webp").exists());
+        assert!(!dirs.data.join("recovery").exists());
+        assert!(dirs.config.join("provider-connections.json").exists());
+        assert!(dirs.models.join("model.gguf").exists());
+        assert!(dirs.logs.join("desktop-runtime.log").exists());
+
+        let _ = std::fs::remove_dir_all(dirs.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_unlinks_a_data_symlink_without_deleting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dirs = profile(unique_root("symlink"));
+        let external = unique_root("external");
+        std::fs::create_dir_all(&dirs.root).expect("create profile root");
+        std::fs::create_dir_all(&external).expect("create external target");
+        std::fs::write(external.join("keep.txt"), b"keep").expect("seed external target");
+        symlink(&external, &dirs.data).expect("link data outside profile");
+
+        reset_workspace_data(&dirs).expect("replace data symlink");
+
+        assert!(dirs.data.is_dir());
+        assert!(!std::fs::symlink_metadata(&dirs.data)
+            .expect("inspect recreated data")
+            .file_type()
+            .is_symlink());
+        assert!(external.join("keep.txt").exists());
+
+        let _ = std::fs::remove_dir_all(dirs.root);
+        let _ = std::fs::remove_dir_all(external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_rejects_a_symlinked_profile_root() {
+        use std::os::unix::fs::symlink;
+
+        let link_parent = unique_root("linked-parent");
+        let actual_root = unique_root("linked-target");
+        let linked_root = link_parent.join("profile");
+        std::fs::create_dir_all(&link_parent).expect("create link parent");
+        std::fs::create_dir_all(actual_root.join("data")).expect("create linked profile target");
+        std::fs::write(actual_root.join("data/keep.txt"), b"keep")
+            .expect("seed linked profile target");
+        symlink(&actual_root, &linked_root).expect("link profile root");
+
+        assert!(reset_workspace_data(&profile(linked_root)).is_err());
+        assert!(actual_root.join("data/keep.txt").exists());
+
+        let _ = std::fs::remove_dir_all(link_parent);
+        let _ = std::fs::remove_dir_all(actual_root);
+    }
+
+    #[test]
+    fn reset_rejects_parent_traversal_and_broad_roots() {
+        let fixture = unique_root("unsafe");
+        let victim = fixture.join("victim");
+        std::fs::create_dir_all(victim.join("data")).expect("create victim data");
+        std::fs::write(victim.join("data/keep.txt"), b"keep").expect("seed victim data");
+
+        let traversing = profile(fixture.join("nested/../victim"));
+        assert!(reset_workspace_data(&traversing).is_err());
+        assert!(victim.join("data/keep.txt").exists());
+        assert!(reset_workspace_data(&profile(PathBuf::from("/"))).is_err());
+
+        let _ = std::fs::remove_dir_all(fixture);
     }
 }
 

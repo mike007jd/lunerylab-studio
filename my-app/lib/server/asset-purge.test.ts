@@ -49,12 +49,71 @@ describe("purgeAssets", () => {
     const result = await purgeAssets("user-1", ["a1", "a2"]);
 
     expect(result.purgedCount).toBe(2);
-    expect(result.bytesFreed).toBe(150);
+    expect(result.bytesFreed).toBe(100);
     expect(mocks.deleteMany).toHaveBeenCalledWith({ where: { id: { in: ["a1", "a2"] }, userId: "user-1" } });
     // Only the non-shared file is unlinked.
     expect(mocks.deleteStoredFile).toHaveBeenCalledTimes(1);
     expect(mocks.deleteStoredFile).toHaveBeenCalledWith("gen/a1.png");
     expect(result.filesDeleted).toBe(1);
+  });
+
+  it("keeps asset rows and returns a retryable failure when a stored file cannot be deleted", async () => {
+    mocks.findMany.mockResolvedValueOnce([
+      { id: "a1", storagePath: "generated/a1.png", byteSize: 100 },
+    ]);
+    mocks.findMany.mockResolvedValueOnce([]);
+    mocks.deleteStoredFile.mockRejectedValueOnce(
+      Object.assign(new Error("permission denied"), { code: "EACCES" }),
+    );
+
+    await expect(purgeAssets("user-1", ["a1"])).rejects.toMatchObject({
+      code: "asset_file_delete_failed",
+      retryable: true,
+    });
+
+    expect(mocks.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("returns a retryable failure when row deletion fails after files are gone", async () => {
+    mocks.findMany.mockResolvedValueOnce([
+      { id: "a1", storagePath: "generated/a1.png", byteSize: 100 },
+    ]);
+    mocks.findMany.mockResolvedValueOnce([]);
+    mocks.deleteMany.mockRejectedValueOnce(new Error("database unavailable"));
+
+    await expect(purgeAssets("user-1", ["a1"])).rejects.toMatchObject({
+      code: "asset_record_delete_failed",
+      retryable: true,
+    });
+
+    expect(mocks.deleteStoredFile).toHaveBeenCalledWith("generated/a1.png");
+  });
+
+  it("retains every row so a partial multi-file failure can be retried to completion", async () => {
+    const targets = [
+      { id: "a1", storagePath: "generated/a1.png", byteSize: 100 },
+      { id: "a2", storagePath: "generated/a2.png", byteSize: 200 },
+    ];
+    mocks.findMany
+      .mockResolvedValueOnce(targets)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(targets)
+      .mockResolvedValueOnce([]);
+    mocks.deleteStoredFile
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("volume busy"));
+
+    await expect(purgeAssets("user-1", ["a1", "a2"])).rejects.toMatchObject({
+      code: "asset_file_delete_failed",
+      retryable: true,
+    });
+    expect(mocks.deleteMany).not.toHaveBeenCalled();
+
+    await expect(purgeAssets("user-1", ["a1", "a2"])).resolves.toMatchObject({
+      purgedCount: 2,
+      filesDeleted: 2,
+    });
+    expect(mocks.deleteMany).toHaveBeenCalledTimes(1);
   });
 
   it("deletes asset rows so ReferenceSetAsset memberships cascade away", async () => {

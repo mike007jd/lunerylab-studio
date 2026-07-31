@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { LunaLogo } from "@/components/ui/luna-logo";
+import { WorkspaceResetRecovery } from "@/components/layout/workspace-reset-recovery";
 import { useErrorCopy } from "@/lib/i18n/error-copy";
 
 // Routes-level error boundary. Uses the static `ERROR_COPY` table from
@@ -38,9 +39,12 @@ export default function RouteError({
           {copy.unexpected}
         </p>
       </div>
-      <Button type="button" onClick={reset} variant="outline">
-        {copy.retry}
-      </Button>
+      <div className="flex flex-wrap justify-center gap-2">
+        <Button type="button" onClick={reset} variant="outline">
+          {copy.retry}
+        </Button>
+        <WorkspaceResetRecovery copy={copy} />
+      </div>
     </main>
   );
 }
