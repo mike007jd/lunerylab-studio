@@ -30,6 +30,13 @@ const targets = [
   // user never opens a previously bundled binary by mistake.
   path.join("src-tauri", "target", "release", "bundle"),
   path.join("src-tauri", "target", "debug", "bundle"),
+  // Tauri resource staging copies of desktop-server/engine. These are not the
+  // Rust object cache; leaving them makes `target/` grow by ~1GB per profile
+  // and can keep stale UI/server bytes next to a fresh source tree.
+  path.join("src-tauri", "target", "release", "_up_"),
+  path.join("src-tauri", "target", "debug", "_up_"),
+  // TypeScript incremental cache — regenerable and gitignored.
+  "tsconfig.tsbuildinfo",
 ];
 
 const removed = [];

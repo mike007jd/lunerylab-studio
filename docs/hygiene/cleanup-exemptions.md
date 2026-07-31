@@ -1,6 +1,6 @@
 # Cleanup Exemptions
 
-Reviewed 2026-07-30. Static unused-code tools and filename scans generate
+Reviewed 2026-07-31. Static unused-code tools and filename scans generate
 candidates; they do not prove that a file is dead.
 
 ## Always Preserve
@@ -22,7 +22,9 @@ candidates; they do not prove that a file is dead.
 | Database archive on incompatible baseline | Current local-data recovery boundary. |
 | `WEB_WORKSPACE_ROUTES` retired route names | Browser deny-list, not live pages. |
 | `docs/PNPM_OVERRIDES.md` | Unique security rationale and atomic patch exit criteria. |
-| `src-tauri/target`, `node_modules`, `.env.local`, `engine` | Intentional local build, dependency, secret, and runtime state. |
+| `src-tauri/target` Rust object cache, `node_modules`, `.env.local`, `engine` | Intentional local build, dependency, secret, and runtime state. Stale `target/**/_up_` resource copies are cleaned by `pnpm desktop:clean`, not preserved. |
+| `scripts/desktop-runtime-server.mjs` | Bundled by `desktop-bundle-assets.mjs`, invoked by Tauri/dev wrappers; knip false positive. |
+| `scripts/fixtures/client-ai-imports/*` | Negative fixtures for `check-client-ai-imports.mjs`. |
 
 ## Completed Convergence
 
