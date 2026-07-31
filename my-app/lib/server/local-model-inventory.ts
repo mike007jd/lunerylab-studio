@@ -97,6 +97,10 @@ async function catalogModelStatus(entry: HfModelEntry): Promise<LocalModelInstal
 let installStatusCache: { expiresAt: number; value: LocalModelInstallStatus[] } | null = null;
 let installStatusInflight: Promise<LocalModelInstallStatus[]> | null = null;
 
+export function invalidateLocalModelInstallStatusCache(): void {
+  installStatusCache = null;
+}
+
 async function readLocalModelInstallStatuses(): Promise<LocalModelInstallStatus[]> {
   const [catalogModels, importedModels] = await Promise.all([
     Promise.all((HF_MODEL_CATALOG as readonly HfModelEntry[]).map(catalogModelStatus)),

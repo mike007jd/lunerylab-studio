@@ -139,8 +139,8 @@ const en = {
       "readyTitle": "Default set",
       "readyDetailWithModel": "New images use {model}.",
       "missingTitle": "Pick a default",
-      "missingDetail": "Choose which image model to use by default.",
-      "missingReason": "Choose a default image model.",
+      "missingDetail": "Pick an image model in Studio or set one as the default in Settings.",
+      "missingReason": "Pick an image model in Studio or set one as the default in Settings.",
       "noModelTitle": "No model yet",
       "noModelDetail": "Add an image model first.",
       "noModelReason": "Add an image model first."
@@ -421,7 +421,16 @@ const en = {
     "videoAiRequiredDetail": "Add a video model to execute this video step. The task can continue afterward.",
     "configureVideoAi": "Configure Video AI",
     "openTextSettings": "Open Text settings",
-    "textDraftHint": "Your draft stays here. Set up a text model to send."
+    "textDraftHint": "Your draft stays here. Set up a text model to send.",
+    "models": "Models",
+    "modelsAuto": "Auto",
+    "modelsManual": "Manual",
+    "chatModel": "Chat model",
+    "imageModel": "Image model",
+    "modelNone": "Not set",
+    "selectModel": "Select a model",
+    "noConfiguredModels": "No models available. Set one up in Settings first.",
+    "imageModelNotSet": "No image model selected. Pick one in Manual mode, or set a default in Settings."
   },
   "library": {
     "title": "Creation History",

@@ -1,12 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useChat, type UseChatHelpers } from "@ai-sdk/react";
 import { AssistantChatTransport } from "@assistant-ui/react-ai-sdk";
 import { useI18n } from "@/lib/i18n/provider";
 import type { Locale } from "@/lib/i18n/locale";
 import type { GenerationOptions } from "@/lib/constants/generation";
 import { fetchJson } from "@/lib/client/fetch-json";
+import type { ImageModelEntry } from "@/lib/image-models";
+import { findByokProvider, type ByokConnectionModels } from "@/lib/byok-providers";
+import {
+  AGENT_MODEL_ROUTING_AUTO,
+  resolveAgentImageModelId,
+  resolveAgentTextModelId,
+  type AgentModelRouting,
+  type AgentModelRoutingOption,
+} from "./agent-message-parts";
 import type {
   AgentChatAction,
   AgentChatMessage,
@@ -92,7 +101,7 @@ export function mergeAgentThreadHistory(
   return missingHistory.length > 0 ? [...missingHistory, ...current] : current;
 }
 
-function buildUiContext(
+export function buildUiContext(
   options: GenerationOptions,
   selectedModelId: string,
   selectedTextModelId: string,
@@ -105,6 +114,115 @@ function buildUiContext(
     selectedCount: options.count,
     generationMode,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Per-capability model routing (Auto = persisted Settings defaults, Manual =
+// explicit live picks). The selection shape lives in agent-message-parts.tsx
+// next to the composer UI; this hook owns the state and resolves the exact
+// ids sent in uiContext. The server contract is unchanged: "" means "no model
+// configured" and no fallback id is ever invented.
+// ---------------------------------------------------------------------------
+
+/**
+ * Live text options: the currently-loaded local runtime model plus every
+ * configured BYOK connection's text slot. Ids use the server contract formats
+ * (`local:<id>`, `byok:<providerId>:<modelId>`) — no catalog constants.
+ */
+export function buildAgentTextModelOptions({
+  providerConnections,
+  providers,
+  localTextModelId,
+  localTextModelLabel,
+  localSourceLabel,
+}: {
+  providerConnections: Record<string, { models?: ByokConnectionModels }>;
+  providers: Record<string, { configured: boolean; source?: "keychain" | null }>;
+  localTextModelId?: string | null;
+  localTextModelLabel?: string | null;
+  localSourceLabel: string;
+}): AgentModelRoutingOption[] {
+  const options: AgentModelRoutingOption[] = [];
+  const localId = localTextModelId?.trim();
+  if (localId) {
+    options.push({
+      id: `local:${localId}`,
+      label: `${localSourceLabel} · ${localTextModelLabel?.trim() || localId}`,
+    });
+  }
+  for (const [providerId, connection] of Object.entries(providerConnections)) {
+    const modelId = connection.models?.text?.trim();
+    if (!modelId || providers[providerId]?.configured !== true) continue;
+    const providerLabel = findByokProvider(providerId)?.label ?? providerId;
+    options.push({ id: `byok:${providerId}:${modelId}`, label: `${providerLabel} · ${modelId}` });
+  }
+  return options;
+}
+
+/** Live image options straight from the shared model catalog snapshot. */
+export function buildAgentImageModelOptions(
+  models: ImageModelEntry[],
+  preferZh: boolean,
+): AgentModelRoutingOption[] {
+  return models.map((model) => ({
+    id: model.id,
+    label: preferZh ? model.labelZh : model.label,
+  }));
+}
+
+/**
+ * Owns the Auto/Manual routing state for the canvas agent chat. Every slot
+ * starts on the Auto sentinel; the composer UI flips slots to Manual by
+ * pinning a concrete live option (see ModelRoutingBar in agent-thread.tsx).
+ */
+export function useAgentModelRouting({
+  defaultTextModelId,
+  defaultImageModelId,
+  textOptions,
+  imageOptions,
+  imageCatalogLoaded,
+}: {
+  defaultTextModelId: string;
+  defaultImageModelId: string;
+  textOptions: AgentModelRoutingOption[];
+  imageOptions: AgentModelRoutingOption[];
+  /** False until the shared model catalog first resolves — Auto image ids are trusted until it lands. */
+  imageCatalogLoaded: boolean;
+}): AgentModelRouting {
+  const [textSelection, setTextSelection] = useState<string>(AGENT_MODEL_ROUTING_AUTO);
+  const [imageSelection, setImageSelection] = useState<string>(AGENT_MODEL_ROUTING_AUTO);
+
+  const textModelId = resolveAgentTextModelId(textSelection, defaultTextModelId, textOptions);
+  const imageModelId = resolveAgentImageModelId(
+    imageSelection,
+    defaultImageModelId.trim(),
+    imageCatalogLoaded ? imageOptions : null,
+  );
+
+  return useMemo(
+    () => ({
+      textSelection,
+      imageSelection,
+      onTextSelectionChange: setTextSelection,
+      onImageSelectionChange: setImageSelection,
+      textOptions,
+      imageOptions,
+      autoTextModelId: defaultTextModelId,
+      autoImageModelId: defaultImageModelId,
+      textModelId,
+      imageModelId,
+    }),
+    [
+      defaultImageModelId,
+      defaultTextModelId,
+      imageModelId,
+      imageOptions,
+      imageSelection,
+      textModelId,
+      textOptions,
+      textSelection,
+    ],
+  );
 }
 
 interface AgentRequestContext {

@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import {
   AgentChatUIProvider,
   type AgentChatUI,
+  type AgentModelRouting,
 } from "@/components/studio/agent-chat/agent-message-parts";
 import { AgentThread } from "@/components/studio/agent-chat/agent-thread";
 import type { UseAgentChat } from "@/components/studio/agent-chat/use-agent-chat";
@@ -16,6 +17,8 @@ import { getAgentMessageText } from "@/components/studio/agent-chat/agent-chat-t
 export interface AgentChatPanelProps {
   /** Chat state + actions, owned by the caller via `useAgentChat`. */
   chat: UseAgentChat;
+  /** Auto/Manual per-capability model routing, owned by the caller via `useAgentModelRouting`. */
+  modelRouting?: AgentModelRouting;
   /** Click a generated thumbnail to focus that asset's layer on the canvas. */
   onFocusAsset?: (assetId: string) => void;
   /** Resolves a persisted chat asset against current Canvas layers. */
@@ -31,6 +34,7 @@ export interface AgentChatPanelProps {
  */
 export function AgentChatPanel({
   chat,
+  modelRouting,
   onFocusAsset,
   isAssetAvailable,
   showGenerationOptions = true,
@@ -53,6 +57,7 @@ export function AgentChatPanel({
       options: chat.options,
       setOptions: chat.setOptions,
       showGenerationOptions,
+      modelRouting,
       onFocusAsset,
       isAssetAvailable,
       onRetry,
@@ -61,6 +66,7 @@ export function AgentChatPanel({
       chat.options,
       chat.setOptions,
       showGenerationOptions,
+      modelRouting,
       onFocusAsset,
       isAssetAvailable,
       onRetry,

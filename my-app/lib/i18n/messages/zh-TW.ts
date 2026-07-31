@@ -139,8 +139,8 @@ const zhTW = {
       "readyTitle": "已設預設",
       "readyDetailWithModel": "新圖片預設使用 {model}。",
       "missingTitle": "選個預設",
-      "missingDetail": "選擇預設使用的圖片模型。",
-      "missingReason": "選擇預設圖片模型。",
+      "missingDetail": "在 Studio 選擇圖片模型，或在設定中將它設為預設。",
+      "missingReason": "在 Studio 選擇圖片模型，或在設定中將它設為預設。",
       "noModelTitle": "暫無模型",
       "noModelDetail": "先新增一個圖片模型。",
       "noModelReason": "先新增一個圖片模型。"
@@ -421,7 +421,16 @@ const zhTW = {
     "videoAiRequiredDetail": "加入影片模型後即可執行這個影片步驟，目前任務會保留。",
     "configureVideoAi": "設定影片 AI",
     "openTextSettings": "打開文字設定",
-    "textDraftHint": "草稿會保留，設定文字模型後即可傳送。"
+    "textDraftHint": "草稿會保留，設定文字模型後即可傳送。",
+    "models": "模型",
+    "modelsAuto": "自動",
+    "modelsManual": "手動",
+    "chatModel": "對話模型",
+    "imageModel": "圖片模型",
+    "selectModel": "選擇模型",
+    "modelNone": "無",
+    "noConfiguredModels": "尚無已配置的模型，請前往設定新增。",
+    "imageModelNotSet": "尚未選擇圖片模型。請在手動模式中選擇，或在設定中設為預設。"
   },
   "library": {
     "title": "創作歷史",

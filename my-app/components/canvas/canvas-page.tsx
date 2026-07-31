@@ -11,7 +11,7 @@
  * itself owns: layer selection and the agent dock.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
@@ -42,15 +42,20 @@ import {
   type LayerDeletionPreparation,
 } from "@/components/canvas/use-canvas-persistence-coordinator";
 import { AgentChatPanel } from "@/components/studio/agent-chat-panel";
-import { useAgentChat } from "@/components/studio/agent-chat/use-agent-chat";
+import {
+  buildAgentImageModelOptions,
+  buildAgentTextModelOptions,
+  useAgentChat,
+  useAgentModelRouting,
+} from "@/components/studio/agent-chat/use-agent-chat";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, Check, Loader2, Sparkles, Wand2, X } from "@/components/ui/icons";
-import {
-  resolveSelectableImageModelId,
-  useModelCatalog,
-} from "@/lib/client/use-model-catalog";
+import { useModelCatalog } from "@/lib/client/use-model-catalog";
 import { useSharedBootstrapSnapshot } from "@/lib/client/bootstrap-snapshot-provider";
 import { useI18n } from "@/lib/i18n/provider";
+import { isChineseLocale } from "@/lib/i18n/locale";
+import { useT } from "@/lib/i18n/useT";
+import { useLocalModelSummary } from "@/hooks/use-local-model-summary";
 import { cn } from "@/lib/utils";
 import { useCreativeCapabilityReadiness } from "@/hooks/use-creative-capability-readiness";
 import { resolveCanvasReturnTarget } from "@/lib/client/creation-flow";
@@ -69,6 +74,7 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { locale } = useI18n();
+  const t = useT();
   const copy = COPY[locale] ?? COPY.en;
   const readiness = useCreativeCapabilityReadiness();
   const bootstrap = useSharedBootstrapSnapshot();
@@ -83,12 +89,42 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
   // the Studio surface uses to gate generation. Both canvas edit actions
   // (inpaint / remove-bg) run image-generation agent tools, so this is the
   // correct backend to require.
-  const { imageModels, defaultImageModelId } = useModelCatalog();
-  const activeImageModelId = resolveSelectableImageModelId(
-    imageModels,
-    defaultImageModelId,
-    defaultImageModelId,
+  const { imageModels, loading: modelCatalogLoading } = useModelCatalog();
+  const localSummary = useLocalModelSummary();
+
+  // Agent model routing (Auto = persisted Settings defaults, Manual = explicit
+  // live picks per capability). Options come only from live sources — the
+  // bootstrap provider connections, the current local runtime model, and the
+  // shared model catalog — so no invented or first-row fallback id can send.
+  const textModelOptions = useMemo(
+    () =>
+      buildAgentTextModelOptions({
+        providerConnections: bootstrap?.providerConnections ?? {},
+        providers: bootstrap?.providers ?? {},
+        localTextModelId: localSummary.currentTextModelId,
+        localTextModelLabel: localSummary.currentTextModel,
+        localSourceLabel: t("modelSource.local"),
+      }),
+    [
+      bootstrap?.providerConnections,
+      bootstrap?.providers,
+      localSummary.currentTextModel,
+      localSummary.currentTextModelId,
+      t,
+    ],
   );
+  const imageModelOptions = useMemo(
+    () => buildAgentImageModelOptions(imageModels, isChineseLocale(locale)),
+    [imageModels, locale],
+  );
+  const modelRouting = useAgentModelRouting({
+    defaultTextModelId: bootstrap?.app.defaultTextModel ?? "",
+    defaultImageModelId: bootstrap?.app.defaultImageModel ?? "",
+    textOptions: textModelOptions,
+    imageOptions: imageModelOptions,
+    imageCatalogLoaded: !modelCatalogLoading,
+  });
+  const activeImageModelId = modelRouting.imageModelId;
   const hasImageBackend = Boolean(activeImageModelId);
   const hasFalImageEditing = hasFalImageEditBackend(imageModels);
 
@@ -104,7 +140,7 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
     sessionId,
     selectedLayerId,
     selectedModelId: activeImageModelId,
-    selectedTextModelId: bootstrap?.app.defaultTextModel ?? "",
+    selectedTextModelId: modelRouting.textModelId,
     generationMode: "image",
   });
   const sendChatMessage = chat.sendMessage;
@@ -573,6 +609,7 @@ export function CanvasPage({ sessionId }: { sessionId: string }) {
                   onFocusAsset={handleFocusAsset}
                   isAssetAvailable={isAssetAvailable}
                   showGenerationOptions
+                  modelRouting={modelRouting}
                   className="h-full bg-transparent"
                 />
               </div>

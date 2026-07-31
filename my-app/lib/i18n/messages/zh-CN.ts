@@ -139,8 +139,8 @@ const zhCN = {
       "readyTitle": "已设默认",
       "readyDetailWithModel": "新图片默认使用 {model}。",
       "missingTitle": "选个默认",
-      "missingDetail": "选择默认使用的图片模型。",
-      "missingReason": "选择默认图片模型。",
+      "missingDetail": "在 Studio 选择图片模型，或在设置中将其设为默认。",
+      "missingReason": "在 Studio 选择图片模型，或在设置中将其设为默认。",
       "noModelTitle": "暂无模型",
       "noModelDetail": "先添加一个图片模型。",
       "noModelReason": "先添加一个图片模型。"
@@ -421,7 +421,16 @@ const zhCN = {
     "videoAiRequiredDetail": "添加视频模型后即可执行这个视频步骤，当前任务会保留。",
     "configureVideoAi": "配置视频 AI",
     "openTextSettings": "打开文本设置",
-    "textDraftHint": "草稿会保留，设置文本模型后即可发送。"
+    "textDraftHint": "草稿会保留，设置文本模型后即可发送。",
+    "models": "模型",
+    "modelsAuto": "自动",
+    "modelsManual": "手动",
+    "chatModel": "对话模型",
+    "imageModel": "图片模型",
+    "selectModel": "选择模型",
+    "modelNone": "无",
+    "noConfiguredModels": "暂无已配置的模型，请前往设置添加。",
+    "imageModelNotSet": "尚未选择图片模型。请在手动模式中选择，或在设置中设为默认。"
   },
   "library": {
     "title": "创作历史",
