@@ -277,9 +277,10 @@ async function copyDesktopDatabaseRuntime(nodeModulesDir) {
   await copyNodePackage(nodeModulesDir, "@electric-sql/pglite-socket");
 }
 
-// The recovery page uses a tiny same-origin Tauri IPC shim so script-src 'self'
-// is satisfied without a CDN or withGlobalTauri=true. The normal startup path
-// is Rust-owned; the fallback UI can only ask Tauri to retry it.
+// The recovery page uses same-origin modules so script-src 'self' stays strict
+// without a CDN or withGlobalTauri=true. The normal startup path is Rust-owned;
+// this bootstrap surface only exposes the bounded recovery commands registered
+// by Tauri.
 const tauriCoreShim = `export async function invoke(cmd, args = {}, options) {
   const internals = globalThis.__TAURI_INTERNALS__;
   if (!internals || typeof internals.invoke !== "function") {
@@ -287,6 +288,99 @@ const tauriCoreShim = `export async function invoke(cmd, args = {}, options) {
   }
   return internals.invoke(cmd, args, options);
 }
+`;
+
+const DESKTOP_WORKSPACE_RESET_CONFIRMATION = "DELETE_LUNERY_WORKSPACE";
+
+const errorScript = `import { invoke } from "./tauri-core.js";
+
+const RETRY_TIMEOUT_MS = 35_000;
+const DESKTOP_WORKSPACE_RESET_CONFIRMATION = ${JSON.stringify(DESKTOP_WORKSPACE_RESET_CONFIRMATION)};
+const status = document.getElementById("status");
+const retry = document.getElementById("retry");
+const openData = document.getElementById("open-data");
+const requestDelete = document.getElementById("request-delete");
+const deleteConfirmation = document.getElementById("delete-confirmation");
+const cancelDelete = document.getElementById("cancel-delete");
+const confirmDelete = document.getElementById("confirm-delete");
+const controls = [retry, openData, requestDelete, cancelDelete, confirmDelete];
+let retryAttempt = 0;
+
+function setStatus(message, tone = "neutral") {
+  status.textContent = message;
+  status.dataset.tone = tone;
+}
+
+function setBusy(busy) {
+  for (const control of controls) control.disabled = busy;
+  document.body.setAttribute("aria-busy", busy ? "true" : "false");
+}
+
+function restoreRetry(attempt, message) {
+  if (attempt !== retryAttempt) return;
+  setBusy(false);
+  retry.textContent = "Try again";
+  setStatus(message, "error");
+  retry.focus();
+}
+
+retry.addEventListener("click", async () => {
+  const attempt = ++retryAttempt;
+  setBusy(true);
+  retry.textContent = "Trying again…";
+  setStatus("Starting Studio…");
+  window.setTimeout(() => {
+    restoreRetry(attempt, "Studio still couldn't start. Try again or delete the workspace data below.");
+  }, RETRY_TIMEOUT_MS);
+
+  try {
+    await invoke("retry_desktop_runtime");
+  } catch {
+    restoreRetry(attempt, "Studio couldn't retry. Try again or delete the workspace data below.");
+  }
+});
+
+openData.addEventListener("click", async () => {
+  openData.disabled = true;
+  openData.textContent = "Opening…";
+  try {
+    await invoke("open_desktop_profile_folder");
+    setStatus("Opened the Lunery data folder.");
+  } catch {
+    setStatus("The Lunery data folder couldn't be opened.", "error");
+  } finally {
+    openData.disabled = false;
+    openData.textContent = "Open data folder";
+  }
+});
+
+requestDelete.addEventListener("click", () => {
+  deleteConfirmation.hidden = false;
+  requestDelete.setAttribute("aria-expanded", "true");
+  confirmDelete.focus();
+});
+
+cancelDelete.addEventListener("click", () => {
+  deleteConfirmation.hidden = true;
+  requestDelete.setAttribute("aria-expanded", "false");
+  requestDelete.focus();
+});
+
+confirmDelete.addEventListener("click", async () => {
+  setBusy(true);
+  confirmDelete.textContent = "Deleting workspace data…";
+  setStatus("Deleting workspace data and restarting Studio…");
+  try {
+    await invoke("reset_desktop_workspace", {
+      confirmation: DESKTOP_WORKSPACE_RESET_CONFIRMATION,
+    });
+  } catch {
+    setBusy(false);
+    confirmDelete.textContent = "Delete workspace data";
+    setStatus("Workspace data couldn't be deleted. Open the data folder or try again.", "error");
+    confirmDelete.focus();
+  }
+});
 `;
 
 const indexHtml = `<!doctype html>
@@ -318,7 +412,9 @@ const indexHtml = `<!doctype html>
       main {
         display: grid;
         place-items: center;
-        gap: 12px;
+        width: min(560px, calc(100vw - 48px));
+        gap: 14px;
+        text-align: center;
       }
       .mark {
         display: inline-grid;
@@ -340,6 +436,7 @@ const indexHtml = `<!doctype html>
         margin: 0;
         color: var(--muted);
         font-size: 13px;
+        line-height: 1.55;
       }
     </style>
   </head>
@@ -358,11 +455,29 @@ const errorHtml = indexHtml
     "<h1>Lunery Lab Studio</h1>\n      <p>Starting Studio…</p>",
     `<h1>Studio couldn't start</h1>
       <p id="status" role="alert">Technical details were saved in the Lunery Logs folder.</p>
-      <button id="retry" type="button">Try again</button>`,
+      <div class="actions">
+        <button id="retry" type="button">Try again</button>
+        <button id="open-data" class="secondary" type="button">Open data folder</button>
+        <button id="request-delete" class="danger" type="button" aria-expanded="false" aria-controls="delete-confirmation">Delete workspace data</button>
+      </div>
+      <section id="delete-confirmation" class="confirmation" aria-labelledby="delete-title" hidden>
+        <h2 id="delete-title">Permanently delete workspace data?</h2>
+        <p>Projects, canvases, media files, and recovery copies in this workspace will be permanently deleted. Models and service connections stay on this computer. This cannot be undone.</p>
+        <div class="confirmation-actions">
+          <button id="cancel-delete" class="secondary" type="button">Cancel</button>
+          <button id="confirm-delete" class="danger solid" type="button">Delete workspace data</button>
+        </div>
+      </section>`,
   )
   .replace(
     "</style>",
-    `button {
+    `.actions, .confirmation-actions {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 10px;
+      }
+      button {
         min-height: 40px;
         border: 1px solid var(--accent);
         border-radius: 10px;
@@ -376,22 +491,39 @@ const errorHtml = indexHtml
       }
       button:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
       button:disabled { cursor: wait; opacity: 0.65; }
+      button.secondary {
+        border-color: var(--border);
+        background: transparent;
+        color: var(--text);
+      }
+      button.danger {
+        border-color: #d7685d;
+        background: transparent;
+        color: #ef8b80;
+      }
+      button.danger.solid {
+        background: #c84f44;
+        color: #fff;
+      }
+      .confirmation {
+        width: 100%;
+        padding: 18px;
+        border: 1px solid rgba(215, 104, 93, 0.45);
+        border-radius: 14px;
+        background: rgba(215, 104, 93, 0.08);
+      }
+      .confirmation[hidden] { display: none; }
+      .confirmation h2 {
+        margin: 0 0 8px;
+        font-size: 15px;
+      }
+      .confirmation-actions { margin-top: 14px; }
+      #status[data-tone="error"] { color: #ef8b80; }
     </style>`,
   )
   .replace(
     "</body>",
-    `<script type="module">
-      import { invoke } from "./tauri-core.js";
-      const retry = document.getElementById("retry");
-      retry.addEventListener("click", async () => {
-        retry.disabled = true;
-        retry.textContent = "Trying again…";
-        await invoke("retry_desktop_runtime").catch(() => {
-          retry.disabled = false;
-          retry.textContent = "Try again";
-        });
-      });
-    </script>
+    `<script type="module" src="./error.js"></script>
   </body>`,
   );
 
@@ -427,6 +559,7 @@ console.log(`Bundled Node runtime: ${nodeSource}`);
 await writeFile(path.join(distOut, "index.html"), indexHtml, "utf8");
 await writeFile(path.join(distOut, "error.html"), errorHtml, "utf8");
 await writeFile(path.join(distOut, "tauri-core.js"), tauriCoreShim, "utf8");
+await writeFile(path.join(distOut, "error.js"), errorScript, "utf8");
 
 console.log(`Prepared desktop server in ${path.relative(root, outDir)}`);
 console.log(`Prepared desktop bootstrap in ${path.relative(root, distOut)}`);

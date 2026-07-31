@@ -2,8 +2,10 @@ import { cache } from "react";
 import { Prisma } from "@prisma/client";
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { ApiError } from "@/lib/server/errors";
+import { reconcileExternalModelDeleteJournals } from "@/lib/server/imported-model-registry";
 import { prisma } from "@/lib/server/prisma";
 import { ensureBuiltInProjectTemplates } from "@/lib/server/sample-projects";
+import { reconcileStagedStoredFileDeletions } from "@/lib/server/storage";
 import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
 
 export interface LocalWorkspaceOwner {
@@ -47,6 +49,7 @@ async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
   // Crash recovery must finish before any owner/bootstrap query so workspace
   // APIs never observe a split media/config/DB restore.
   await ensureWorkspaceRestoreReconciled();
+  await reconcileExternalModelDeleteJournals();
 
   const existing = await prisma.user.findUnique({
     where: { id: LOCAL_WORKSPACE_OWNER.id },
@@ -81,6 +84,11 @@ async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
       }
     }
   }
+
+  const referencedFiles = await prisma.asset.findMany({ select: { storagePath: true } });
+  await reconcileStagedStoredFileDeletions(
+    new Set(referencedFiles.map((asset) => asset.storagePath)),
+  );
 
   await ensureBuiltInProjectTemplates(LOCAL_WORKSPACE_OWNER.id);
 }

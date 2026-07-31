@@ -65,6 +65,60 @@ describe("writeFilesOrCleanup (#7)", () => {
     });
   });
 
+  it("stages deletion, restores on rollback, and removes only on commit", async () => {
+    const original = storage.resolveStoragePath("generated/staged.png");
+    fs.writeFileSync(original, "staged");
+
+    const stage = await storage.stageStoredFileDeletion("generated/staged.png");
+    expect(fs.existsSync(original)).toBe(false);
+    expect(fs.existsSync(storage.resolveStoragePath(stage.stagedStoragePath))).toBe(true);
+
+    await storage.rollbackStoredFileDeletion(stage);
+    expect(fs.readFileSync(original, "utf8")).toBe("staged");
+
+    const restaged = await storage.stageStoredFileDeletion("generated/staged.png");
+    await storage.commitStoredFileDeletion(restaged);
+    expect(fs.existsSync(original)).toBe(false);
+    expect(fs.existsSync(storage.resolveStoragePath(restaged.stagedStoragePath))).toBe(false);
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "refuses deletion through a symlinked bucket outside the media root",
+    async () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "storage-outside-"));
+      try {
+        fs.writeFileSync(path.join(outside, "victim.png"), "keep");
+        fs.symlinkSync(outside, path.join(tmpDir, "uploads"), "dir");
+
+        await expect(storage.deleteStoredFile("uploads/victim.png")).rejects.toThrow(
+          "escapes the media root",
+        );
+        await expect(storage.stageStoredFileDeletion("uploads/victim.png")).rejects.toThrow(
+          "escapes the media root",
+        );
+        expect(fs.readFileSync(path.join(outside, "victim.png"), "utf8")).toBe("keep");
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "deletes a final-component symlink without touching its target",
+    async () => {
+      const outside = path.join(tmpDir, "outside.png");
+      const linked = storage.resolveStoragePath("generated/linked.png");
+      fs.writeFileSync(outside, "keep");
+      fs.symlinkSync(outside, linked);
+
+      const stage = await storage.stageStoredFileDeletion("generated/linked.png");
+      await storage.commitStoredFileDeletion(stage);
+
+      expect(fs.existsSync(linked)).toBe(false);
+      expect(fs.readFileSync(outside, "utf8")).toBe("keep");
+    },
+  );
+
   it("normalizes a configured root without using a dynamic filesystem trace", () => {
     vi.stubEnv("LUNERY_MEDIA_DIR", `${tmpDir}${path.sep}`);
     expect(storage.resolveStoragePath("generated/sample.png")).toBe(

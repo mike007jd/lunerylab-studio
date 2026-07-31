@@ -1,7 +1,9 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::engine_lifecycle::EngineLifecycle;
 use crate::llama_resident::LlamaResident;
@@ -16,6 +18,115 @@ use std::process::Child;
 /// the live endpoint without threading Tauri State through the bridge.
 /// Mirrors the HTTP_CLIENT OnceLock pattern.
 static LLAMA_ENGINE_INFO: OnceLock<Mutex<Option<LlamaEngineInfo>>> = OnceLock::new();
+
+struct LlamaModelDeleteLease {
+    lease_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct LlamaModelState {
+    starting_path: Option<String>,
+    delete_leases: HashMap<String, LlamaModelDeleteLease>,
+}
+
+static LLAMA_MODEL_STATE: OnceLock<Mutex<LlamaModelState>> = OnceLock::new();
+
+fn llama_model_state() -> &'static Mutex<LlamaModelState> {
+    LLAMA_MODEL_STATE.get_or_init(|| Mutex::new(LlamaModelState::default()))
+}
+
+fn normalize_llama_model_path(value: &str) -> String {
+    let path = PathBuf::from(value);
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical.to_string_lossy().to_string();
+    }
+    path.parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+pub(crate) fn acquire_llama_model_delete_lease(
+    model_path: &str,
+    lease_id: &str,
+) -> Result<(), String> {
+    if lease_id.is_empty() || lease_id.len() > 128 {
+        return Err("Invalid llama model deletion lease".to_string());
+    }
+    let model_path = normalize_llama_model_path(model_path);
+    let now = Instant::now();
+    let mut state = llama_model_state()
+        .lock()
+        .map_err(|_| "Llama model state lock poisoned".to_string())?;
+    state
+        .delete_leases
+        .retain(|_, lease| lease.expires_at > now);
+    if state.starting_path.as_deref() == Some(model_path.as_str()) {
+        return Err("Text model is starting".to_string());
+    }
+    if let Some(existing) = state.delete_leases.get(&model_path) {
+        if existing.lease_id != lease_id {
+            return Err("Text model is already being deleted".to_string());
+        }
+    }
+    state.delete_leases.insert(
+        model_path,
+        LlamaModelDeleteLease {
+            lease_id: lease_id.to_string(),
+            expires_at: now + Duration::from_secs(60),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn release_llama_model_delete_lease(model_path: &str, lease_id: &str) {
+    let model_path = normalize_llama_model_path(model_path);
+    if let Ok(mut state) = llama_model_state().lock() {
+        if state
+            .delete_leases
+            .get(&model_path)
+            .map(|lease| lease.lease_id.as_str())
+            == Some(lease_id)
+        {
+            state.delete_leases.remove(&model_path);
+        }
+    }
+}
+
+struct LlamaModelStartGuard {
+    model_path: String,
+}
+
+impl LlamaModelStartGuard {
+    fn acquire(model_path: &str) -> Result<Self, String> {
+        let model_path = normalize_llama_model_path(model_path);
+        let now = Instant::now();
+        let mut state = llama_model_state()
+            .lock()
+            .map_err(|_| "Llama model state lock poisoned".to_string())?;
+        state
+            .delete_leases
+            .retain(|_, lease| lease.expires_at > now);
+        if state.delete_leases.contains_key(&model_path) {
+            return Err("Text model is being deleted".to_string());
+        }
+        state.starting_path = Some(model_path.clone());
+        Ok(Self { model_path })
+    }
+}
+
+impl Drop for LlamaModelStartGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = llama_model_state().lock() {
+            if state.starting_path.as_deref() == Some(self.model_path.as_str()) {
+                state.starting_path = None;
+            }
+        }
+    }
+}
 
 // Fields are written here (start/stop) and read by the bridge `/status` path
 // (`desktop_runtime_status()`) plus `bridge_start_llama` / `/llama-status`.
@@ -149,6 +260,7 @@ pub(crate) fn bridge_start_llama(
         .to_string_lossy()
         .to_string();
     let _start_guard = LLAMA_LIFECYCLE.start_guard();
+    let _model_start_guard = LlamaModelStartGuard::acquire(&model_path)?;
 
     let current = llama_engine_slot()
         .lock()
@@ -272,9 +384,10 @@ pub(crate) fn bridge_stop_llama() {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_stop_llama, cleanup_llama_exit_if_current, llama_bridge_child, llama_engine_slot,
-        llama_residency_slot, prepare_llama_start, validate_model_alias, LlamaEngineInfo,
-        LLAMA_LIFECYCLE,
+        acquire_llama_model_delete_lease, bridge_stop_llama, cleanup_llama_exit_if_current,
+        llama_bridge_child, llama_engine_slot, llama_residency_slot, prepare_llama_start,
+        release_llama_model_delete_lease, validate_model_alias, LlamaEngineInfo,
+        LlamaModelStartGuard, LLAMA_LIFECYCLE,
     };
     use crate::llama_resident::LlamaResident;
     use crate::model_residency::ResidencyManager;
@@ -305,6 +418,50 @@ mod tests {
         assert!(validate_model_alias("".to_string()).is_err());
         assert!(validate_model_alias("first,second".to_string()).is_err());
         assert!(validate_model_alias("bad\nalias".to_string()).is_err());
+    }
+
+    #[test]
+    fn model_delete_lease_and_start_admission_are_mutually_exclusive() {
+        let _g = test_global_lock();
+        let model_path = std::env::temp_dir().join("lunery-llama-delete-lease.gguf");
+        let model_path = model_path.to_string_lossy().to_string();
+
+        acquire_llama_model_delete_lease(&model_path, "delete-lease")
+            .expect("acquire delete lease");
+        assert!(LlamaModelStartGuard::acquire(&model_path).is_err());
+        release_llama_model_delete_lease(&model_path, "delete-lease");
+
+        let start = LlamaModelStartGuard::acquire(&model_path).expect("admit start");
+        assert!(acquire_llama_model_delete_lease(&model_path, "racing-delete").is_err());
+        drop(start);
+        acquire_llama_model_delete_lease(&model_path, "racing-delete")
+            .expect("start completion releases admission");
+        release_llama_model_delete_lease(&model_path, "racing-delete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_model_lease_canonicalizes_a_symlinked_parent() {
+        let _g = test_global_lock();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lunery-llama-lease-symlink-{nonce}"));
+        let physical = root.join("physical");
+        let logical = root.join("logical");
+        std::fs::create_dir_all(&physical).expect("create physical root");
+        std::os::unix::fs::symlink(&physical, &logical).expect("create logical root symlink");
+        let logical_model = logical.join("pending.gguf").to_string_lossy().to_string();
+        let physical_model = physical.join("pending.gguf").to_string_lossy().to_string();
+
+        acquire_llama_model_delete_lease(&logical_model, "symlink-delete")
+            .expect("acquire missing model lease");
+        assert!(LlamaModelStartGuard::acquire(&physical_model).is_err());
+        release_llama_model_delete_lease(&logical_model, "symlink-delete");
+        drop(LlamaModelStartGuard::acquire(&physical_model).expect("release canonical lease"));
+
+        std::fs::remove_dir_all(root).expect("remove fixture");
     }
 
     // bridge_stop_llama must kill AND reap (wait) — the old code only killed,

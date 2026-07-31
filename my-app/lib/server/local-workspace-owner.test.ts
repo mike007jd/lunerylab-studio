@@ -7,6 +7,9 @@ const mocks = vi.hoisted(() => ({
   userCreate: vi.fn(),
   ensureBuiltInProjectTemplates: vi.fn(),
   ensureWorkspaceRestoreReconciled: vi.fn(),
+  reconcileStagedStoredFileDeletions: vi.fn(),
+  reconcileExternalModelDeleteJournals: vi.fn(),
+  assetFindMany: vi.fn(),
   isDesktopRuntime: vi.fn(),
 }));
 
@@ -21,6 +24,7 @@ vi.mock("@/lib/server/prisma", () => ({
       create: mocks.userCreate,
     },
     userSettings: { upsert: vi.fn() },
+    asset: { findMany: mocks.assetFindMany },
   },
 }));
 vi.mock("@/lib/server/sample-projects", () => ({
@@ -29,6 +33,12 @@ vi.mock("@/lib/server/sample-projects", () => ({
 vi.mock("@/lib/server/workspace-restore-journal", () => ({
   ensureWorkspaceRestoreReconciled: mocks.ensureWorkspaceRestoreReconciled,
 }));
+vi.mock("@/lib/server/storage", () => ({
+  reconcileStagedStoredFileDeletions: mocks.reconcileStagedStoredFileDeletions,
+}));
+vi.mock("@/lib/server/imported-model-registry", () => ({
+  reconcileExternalModelDeleteJournals: mocks.reconcileExternalModelDeleteJournals,
+}));
 
 beforeEach(() => {
   vi.resetModules();
@@ -36,6 +46,9 @@ beforeEach(() => {
   mocks.isDesktopRuntime.mockReturnValue(true);
   mocks.ensureBuiltInProjectTemplates.mockResolvedValue(undefined);
   mocks.ensureWorkspaceRestoreReconciled.mockResolvedValue(undefined);
+  mocks.reconcileStagedStoredFileDeletions.mockResolvedValue(undefined);
+  mocks.reconcileExternalModelDeleteJournals.mockResolvedValue(undefined);
+  mocks.assetFindMany.mockResolvedValue([]);
   mocks.userCreate.mockResolvedValue({ id: "owner" });
 });
 
@@ -53,6 +66,7 @@ describe("local workspace owner initialization", () => {
     await ensureLocalWorkspaceOwner();
 
     expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
+    expect(mocks.reconcileExternalModelDeleteJournals).toHaveBeenCalledTimes(1);
     expect(mocks.userCreate).toHaveBeenCalledTimes(1);
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledWith(LOCAL_WORKSPACE_OWNER.id);
   });
@@ -99,6 +113,22 @@ describe("local workspace owner initialization", () => {
     await ensureLocalWorkspaceOwner();
 
     expect(order).toEqual(["reconcile", "owner-query"]);
+  });
+
+  it("reconciles staged file deletions against current asset references", async () => {
+    mocks.userFindUnique.mockResolvedValue({ id: "owner" });
+    mocks.assetFindMany.mockResolvedValue([
+      { storagePath: "generated/keep.png" },
+      { storagePath: "uploads/project/remove.png" },
+    ]);
+    const { ensureLocalWorkspaceOwner } = await import("@/lib/server/local-workspace-owner");
+
+    await ensureLocalWorkspaceOwner();
+
+    expect(mocks.reconcileStagedStoredFileDeletions).toHaveBeenCalledWith(new Set([
+      "generated/keep.png",
+      "uploads/project/remove.png",
+    ]));
   });
 });
 

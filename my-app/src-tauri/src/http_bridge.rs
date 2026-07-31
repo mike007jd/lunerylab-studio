@@ -2,19 +2,25 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::download::{hf_download_start_inner, DownloadState, JobSnapshot};
-use crate::engine_llama::{bridge_start_llama, bridge_stop_llama, llama_engine_slot};
+use crate::download::{
+    canonical_download_destination, hf_download_start_inner, DownloadState, JobSnapshot,
+};
+use crate::engine_llama::{
+    acquire_llama_model_delete_lease, bridge_start_llama, bridge_stop_llama, llama_engine_slot,
+    release_llama_model_delete_lease,
+};
 use crate::engine_mlx::{
     bridge_start_mlx, bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot,
 };
 use crate::engine_sd::{
-    bridge_cancel_sd, bridge_finish_sd, bridge_sd_generate, sd_binary_path, sd_progress_for_run,
-    valid_sd_run_id, SdGenerateBody, SdProgressPhase,
+    acquire_sd_model_delete_lease, bridge_cancel_sd, bridge_finish_sd, bridge_sd_generate,
+    bridge_stop_sd_if_model_path, release_sd_model_delete_lease, sd_active_model_path,
+    sd_binary_path, sd_progress_for_run, valid_sd_run_id, SdGenerateBody, SdProgressPhase,
 };
 use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
@@ -24,7 +30,37 @@ use crate::secrets::{
     ProviderSecretPayload, ProviderSecretReadError,
 };
 use crate::security::{bridge_token, constant_time_eq, host_is_loopback};
-use crate::DesktopBridge;
+use crate::{DesktopBridge, DESKTOP_WORKSPACE_RESET_CONFIRMATION};
+
+pub(crate) type WorkspaceResetHandler = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+pub(crate) struct DesktopBridgeServer {
+    pub(crate) bridge: DesktopBridge,
+    shutdown: Arc<AtomicBool>,
+    listener_thread: Option<JoinHandle<()>>,
+}
+
+impl DesktopBridgeServer {
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        // Wake the nonblocking accept loop immediately instead of waiting for
+        // its poll interval. No request is sent and the connection is dropped.
+        let _ = TcpStream::connect(("127.0.0.1", self.bridge.port));
+        if let Some(thread) = self.listener_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    pub(crate) fn shutdown(mut self) {
+        self.stop();
+    }
+}
+
+impl Drop for DesktopBridgeServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 fn read_http_request(
     stream: &mut TcpStream,
@@ -330,7 +366,12 @@ fn handle_sse_download_events(
     }
 }
 
-fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc<DownloadState>) {
+fn handle_bridge_request(
+    mut stream: TcpStream,
+    token: &str,
+    download_state: Arc<DownloadState>,
+    workspace_reset: WorkspaceResetHandler,
+) {
     let Ok((method, path, headers, body)) = read_http_request(&mut stream) else {
         bridge_error(&mut stream, "400 Bad Request", "Invalid request");
         return;
@@ -385,6 +426,30 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
             Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
             Err(err) => bridge_error(&mut stream, "500 Internal Server Error", &err.to_string()),
         },
+        ("POST", "/reset-workspace") => {
+            #[derive(Deserialize)]
+            struct ResetWorkspaceBody {
+                confirmation: String,
+            }
+
+            match serde_json::from_str::<ResetWorkspaceBody>(&body) {
+                Ok(request) if request.confirmation == DESKTOP_WORKSPACE_RESET_CONFIRMATION => {
+                    match workspace_reset() {
+                        Ok(()) => write_http_response(
+                            &mut stream,
+                            "202 Accepted",
+                            &serde_json::json!({ "resetting": true }).to_string(),
+                        ),
+                        Err(err) => bridge_error(&mut stream, "409 Conflict", &err),
+                    }
+                }
+                _ => bridge_error(
+                    &mut stream,
+                    "400 Bad Request",
+                    "Explicit workspace reset confirmation is required",
+                ),
+            }
+        }
         ("POST", "/provider-secret") => {
             let payload = match serde_json::from_str::<ProviderSecretPayload>(&body) {
                 Ok(payload) => payload,
@@ -604,6 +669,7 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
                             serde_json::json!({
                                 "jobId": id,
                                 "status": job.status,
+                                "destination": job.destination,
                                 "received": job.received,
                                 "total": job.total,
                                 "error": job.error,
@@ -614,6 +680,78 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
                 .unwrap_or_default();
             let payload = serde_json::json!({ "jobs": list }).to_string();
             write_http_response(&mut stream, "200 OK", &payload);
+        }
+        ("POST", "/hf-download-delete-lease-acquire") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                destinations: Vec<String>,
+            }
+            let result = serde_json::from_str::<LeaseBody>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(|lease| {
+                    if lease.lease_id.is_empty()
+                        || lease.lease_id.len() > 128
+                        || lease.destinations.is_empty()
+                        || lease.destinations.len() > 16
+                    {
+                        return Err("Invalid model deletion lease".to_string());
+                    }
+                    let destinations = lease
+                        .destinations
+                        .iter()
+                        .map(|value| canonical_download_destination(value))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut acquired: Vec<std::path::PathBuf> = Vec::new();
+                    for destination in destinations {
+                        if let Err(error) = download_state
+                            .acquire_destination_delete_lease(destination.clone(), &lease.lease_id)
+                        {
+                            for prior in &acquired {
+                                download_state
+                                    .release_destination_delete_lease(prior, &lease.lease_id);
+                            }
+                            return Err(error);
+                        }
+                        acquired.push(destination);
+                    }
+                    Ok(())
+                });
+            match result {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "acquired": true }).to_string(),
+                ),
+                Err(error) => bridge_error(&mut stream, "409 Conflict", &error),
+            }
+        }
+        ("POST", "/hf-download-delete-lease-release") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                destinations: Vec<String>,
+            }
+            match serde_json::from_str::<LeaseBody>(&body) {
+                Ok(lease) => {
+                    for destination in lease
+                        .destinations
+                        .iter()
+                        .filter_map(|value| canonical_download_destination(value).ok())
+                    {
+                        download_state
+                            .release_destination_delete_lease(&destination, &lease.lease_id);
+                    }
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "released": true }).to_string(),
+                    );
+                }
+                Err(error) => bridge_error(&mut stream, "400 Bad Request", &error.to_string()),
+            }
         }
         ("POST", "/llama-start") => {
             #[derive(Deserialize)]
@@ -650,6 +788,45 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
             .to_string();
             write_http_response(&mut stream, "200 OK", &payload);
         }
+        ("POST", "/llama-delete-lease-acquire") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(|lease| {
+                    acquire_llama_model_delete_lease(&lease.model_path, &lease.lease_id)
+                }) {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "acquired": true }).to_string(),
+                ),
+                Err(error) => bridge_error(&mut stream, "409 Conflict", &error),
+            }
+        }
+        ("POST", "/llama-delete-lease-release") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body) {
+                Ok(lease) => {
+                    release_llama_model_delete_lease(&lease.model_path, &lease.lease_id);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "released": true }).to_string(),
+                    );
+                }
+                Err(error) => bridge_error(&mut stream, "400 Bad Request", &error.to_string()),
+            }
+        }
         ("POST", "/sd-generate") => {
             match serde_json::from_str::<SdGenerateBody>(&body)
                 .map_err(|e| e.to_string())
@@ -662,14 +839,73 @@ fn handle_bridge_request(mut stream: TcpStream, token: &str, download_state: Arc
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
             }
         }
+        ("POST", "/sd-delete-lease-acquire") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(|lease| acquire_sd_model_delete_lease(&lease.model_path, &lease.lease_id))
+            {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "acquired": true }).to_string(),
+                ),
+                Err(error) => bridge_error(&mut stream, "409 Conflict", &error),
+            }
+        }
+        ("POST", "/sd-delete-lease-release") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body) {
+                Ok(lease) => {
+                    release_sd_model_delete_lease(&lease.model_path, &lease.lease_id);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "released": true }).to_string(),
+                    );
+                }
+                Err(error) => bridge_error(&mut stream, "400 Bad Request", &error.to_string()),
+            }
+        }
         ("GET", "/sd-status") => {
             let available = sd_binary_path().is_some();
+            let model_path = sd_active_model_path();
             let payload = serde_json::json!({
                 "available": available,
                 "engine": "stable-diffusion.cpp",
+                "running": model_path.is_some(),
+                "modelPath": model_path,
             })
             .to_string();
             write_http_response(&mut stream, "200 OK", &payload);
+        }
+        ("POST", "/sd-stop") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct StopBody {
+                model_path: String,
+            }
+            match serde_json::from_str::<StopBody>(&body) {
+                Ok(stop) => {
+                    let stopped = bridge_stop_sd_if_model_path(&stop.model_path);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "ok": true, "stopped": stopped }).to_string(),
+                    );
+                }
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err.to_string()),
+            }
         }
         ("GET", "/sd-progress") => {
             let Some(run_id) = query_param(query, "runId").filter(|run_id| valid_sd_run_id(run_id))
@@ -819,9 +1055,13 @@ fn provider_secret_mutation_http_status(error: ProviderSecretMutationError) -> &
 
 pub(crate) fn start_desktop_bridge(
     download_state: Arc<DownloadState>,
-) -> Result<DesktopBridge, String> {
+    workspace_reset: WorkspaceResetHandler,
+) -> Result<DesktopBridgeServer, String> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|err| format!("Could not start desktop bridge: {err}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("Could not configure desktop bridge: {err}"))?;
     let port = listener
         .local_addr()
         .map_err(|err| format!("Could not inspect desktop bridge port: {err}"))?
@@ -829,9 +1069,22 @@ pub(crate) fn start_desktop_bridge(
     let token = bridge_token()?;
     let bridge_token = token.clone();
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let listener_shutdown = Arc::clone(&shutdown);
 
-    thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
+    let listener_thread = thread::spawn(move || {
+        while !listener_shutdown.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if listener_shutdown.load(Ordering::Acquire) {
+                break;
+            }
             let current = in_flight.fetch_add(1, Ordering::AcqRel);
             if current >= BRIDGE_MAX_IN_FLIGHT {
                 in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -844,20 +1097,31 @@ pub(crate) fn start_desktop_bridge(
             }
             let token = bridge_token.clone();
             let ds = Arc::clone(&download_state);
+            let reset = Arc::clone(&workspace_reset);
             let in_flight_for_worker = Arc::clone(&in_flight);
             thread::spawn(move || {
-                handle_bridge_request(stream, &token, ds);
+                handle_bridge_request(stream, &token, ds, reset);
                 in_flight_for_worker.fetch_sub(1, Ordering::AcqRel);
             });
         }
     });
 
-    Ok(DesktopBridge { port, token })
+    Ok(DesktopBridgeServer {
+        bridge: DesktopBridge { port, token },
+        shutdown,
+        listener_thread: Some(listener_thread),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_secret_mutation_http_status, ProviderSecretMutationError};
+    use super::{
+        provider_secret_mutation_http_status, start_desktop_bridge, ProviderSecretMutationError,
+        WorkspaceResetHandler,
+    };
+    use crate::download::DownloadState;
+    use std::net::TcpStream;
+    use std::sync::Arc;
 
     #[test]
     fn provider_secret_validation_errors_map_to_bad_request() {
@@ -877,5 +1141,18 @@ mod tests {
             provider_secret_mutation_http_status(ProviderSecretMutationError::Unavailable),
             "503 Service Unavailable"
         );
+    }
+
+    #[test]
+    fn bridge_shutdown_revokes_the_previous_listener() {
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server =
+            start_desktop_bridge(Arc::new(DownloadState::default()), reset).expect("start bridge");
+        let port = server.bridge.port;
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+
+        server.shutdown();
+
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 }

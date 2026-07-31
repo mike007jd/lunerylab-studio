@@ -27,6 +27,7 @@ vi.mock("@/lib/server/asset-purge", () => ({
 }));
 
 import { DELETE } from "@/app/api/assets/[id]/route";
+import { ApiError } from "@/lib/server/errors";
 
 function deleteRequest(id: string, query = "") {
   return DELETE(new NextRequest(`http://localhost/api/assets/${id}${query}`, { method: "DELETE" }), {
@@ -85,5 +86,25 @@ describe("DELETE /api/assets/[id]?permanent=true", () => {
 
     expect(response.status).toBe(404);
     await expect(response.json()).resolves.toMatchObject({ code: "asset_not_found" });
+  });
+
+  it("returns a retryable error instead of permanent success when local file deletion fails", async () => {
+    mocks.purgeAssets.mockRejectedValue(
+      new ApiError({
+        status: 503,
+        code: "asset_file_delete_failed",
+        message: "Could not delete all local asset files. Please try again.",
+        retryable: true,
+      }),
+    );
+
+    const response = await deleteRequest("asset-still-local", "?permanent=true");
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      code: "asset_file_delete_failed",
+      message: "Could not delete all local asset files. Please try again.",
+      retryable: true,
+    });
   });
 });

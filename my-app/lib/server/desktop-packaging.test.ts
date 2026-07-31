@@ -90,7 +90,7 @@ describe("desktop installer packaging", () => {
     expect(build).toContain("{ secrets: [credentials.password] }");
   });
 
-  it("keeps packaged startup failures private and retryable", () => {
+  it("keeps packaged startup failures private, retryable, and user-resettable", () => {
     const bundleAssets = source("scripts/desktop-bundle-assets.mjs");
     const tauriSource = source("src-tauri/src/lib.rs");
     const tauriConfig = JSON.parse(source("src-tauri/tauri.conf.json"));
@@ -100,6 +100,17 @@ describe("desktop installer packaging", () => {
     expect(tauriSource).toContain('navigate_and_show(app, "tauri://localhost/error.html")');
     expect(tauriSource).toContain("probe_desktop_health(port, expected_session_hash)");
     expect(bundleAssets).toContain('await invoke("retry_desktop_runtime")');
+    expect(bundleAssets).toContain('await invoke("reset_desktop_workspace"');
+    expect(bundleAssets).toContain('const DESKTOP_WORKSPACE_RESET_CONFIRMATION = "DELETE_LUNERY_WORKSPACE"');
+    expect(bundleAssets).toContain("confirmation: DESKTOP_WORKSPACE_RESET_CONFIRMATION");
+    expect(bundleAssets).toContain('await invoke("open_desktop_profile_folder")');
+    expect(bundleAssets).toContain("Delete workspace data");
+    expect(bundleAssets).toContain("Projects, canvases, media files, and recovery copies");
+    expect(bundleAssets).toContain("Models and service connections stay on this computer.");
+    expect(bundleAssets).toContain("RETRY_TIMEOUT_MS = 35_000");
+    expect(bundleAssets).toContain('<script type="module" src="./error.js"></script>');
+    expect(bundleAssets).toContain('writeFile(path.join(distOut, "error.js"), errorScript');
+    expect(bundleAssets).not.toContain('<script type="module">');
     expect(bundleAssets).toContain("Technical details were saved in the Lunery Logs folder.");
     expect(bundleAssets).not.toContain("String(error)");
     expect(bundleAssets).not.toContain("Could not start local Studio runtime:");

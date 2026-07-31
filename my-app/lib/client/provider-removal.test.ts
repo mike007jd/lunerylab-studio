@@ -3,37 +3,54 @@ import { removeProviderCredentials } from "@/components/settings/desktop-runtime
 import type { DesktopInvoke } from "@/components/settings/desktop-runtime/types";
 
 describe("provider credential removal ordering", () => {
-  it("does not delete canonical metadata when the secret bridge is unavailable", async () => {
-    const fetcher = vi.fn();
+  it("unlinks metadata when the secret bridge is unavailable", async () => {
+    const order: string[] = [];
+    const fetcher = vi.fn(async () => {
+      order.push("metadata");
+      return new Response(null, { status: 200 });
+    });
 
     await expect(
-      removeProviderCredentials({ providerId: "openai", invoke: null, fetcher }),
-    ).resolves.toEqual({ ok: false, secretRemoved: false });
-    expect(fetcher).not.toHaveBeenCalled();
+      removeProviderCredentials({
+        providerId: "openai",
+        invoke: null,
+        fetcher,
+      }),
+    ).resolves.toEqual({ status: "removed-with-residual-secret" });
+    expect(order).toEqual(["metadata"]);
   });
 
-  it("does not delete canonical metadata when secret deletion fails", async () => {
-    const fetcher = vi.fn();
+  it("keeps the product unlinked and reports a residual when secret deletion fails", async () => {
+    const order: string[] = [];
+    const fetcher = vi.fn(async () => {
+      order.push("metadata");
+      return new Response(null, { status: 200 });
+    });
     const invoke: DesktopInvoke = async () => {
+      order.push("secret");
       throw new Error("keychain unavailable");
     };
 
     await expect(
-      removeProviderCredentials({ providerId: "openai", invoke, fetcher }),
-    ).resolves.toEqual({ ok: false, secretRemoved: false });
-    expect(fetcher).not.toHaveBeenCalled();
+      removeProviderCredentials({
+        providerId: "openai",
+        invoke,
+        fetcher,
+      }),
+    ).resolves.toEqual({ status: "removed-with-residual-secret" });
+    expect(order).toEqual(["metadata", "secret"]);
   });
 
-  it("reports partial removal when metadata deletion fails after the secret is gone", async () => {
+  it("still attempts secret cleanup when metadata deletion fails", async () => {
     const invoke: DesktopInvoke = async <T,>() => ({} as T);
     const fetcher = vi.fn(async () => new Response(null, { status: 500 }));
 
     await expect(
       removeProviderCredentials({ providerId: "openai", invoke, fetcher }),
-    ).resolves.toEqual({ ok: false, secretRemoved: true });
+    ).resolves.toEqual({ status: "metadata-removal-failed", secretRemoved: true });
   });
 
-  it("deletes metadata only after secret deletion succeeds", async () => {
+  it("unlinks metadata before deleting the system credential", async () => {
     const order: string[] = [];
     const invoke: DesktopInvoke = async <T,>() => {
       order.push("secret");
@@ -45,8 +62,35 @@ describe("provider credential removal ordering", () => {
     });
 
     await expect(
-      removeProviderCredentials({ providerId: "openai", invoke, fetcher }),
-    ).resolves.toEqual({ ok: true });
-    expect(order).toEqual(["secret", "metadata"]);
+      removeProviderCredentials({
+        providerId: "openai",
+        invoke,
+        fetcher,
+      }),
+    ).resolves.toEqual({ status: "removed" });
+    expect(order).toEqual(["metadata", "secret"]);
+  });
+
+  it("unlinks Lunery metadata for environment-backed providers without touching credentials", async () => {
+    const secretCalls: string[] = [];
+    const invoke: DesktopInvoke = async (command) => {
+      secretCalls.push(command);
+      throw new Error("environment credentials must not be deleted");
+    };
+    const fetcher = vi.fn(async () => new Response(null, { status: 200 }));
+
+    await expect(
+      removeProviderCredentials({
+        providerId: "openai",
+        invoke,
+        fetcher,
+        preserveEnvironmentSecret: true,
+      }),
+    ).resolves.toEqual({ status: "removed" });
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/desktop-runtime/provider-connections",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(secretCalls).toEqual([]);
   });
 });

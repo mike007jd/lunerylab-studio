@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { LunaLogo } from "@/components/ui/luna-logo";
+import { WorkspaceResetRecovery } from "@/components/layout/workspace-reset-recovery";
 import { useErrorCopy } from "@/lib/i18n/error-copy";
 
 // Root-level error boundary — replaces the entire layout on the most
@@ -31,9 +32,12 @@ export default function GlobalError({
           <h1 className="text-2xl font-light text-(--text-primary)">{copy.title}</h1>
           <p className="mt-2 text-sm text-(--text-secondary)">{copy.unexpected}</p>
         </div>
-        <Button type="button" onClick={() => reset()} variant="outline">
-          {copy.retry}
-        </Button>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button type="button" onClick={() => reset()} variant="outline">
+            {copy.retry}
+          </Button>
+          <WorkspaceResetRecovery copy={copy} />
+        </div>
       </body>
     </html>
   );
