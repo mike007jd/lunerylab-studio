@@ -70,4 +70,27 @@ describe("provider credential removal ordering", () => {
     ).resolves.toEqual({ status: "removed" });
     expect(order).toEqual(["metadata", "secret"]);
   });
+
+  it("unlinks Lunery metadata for environment-backed providers without touching credentials", async () => {
+    const secretCalls: string[] = [];
+    const invoke: DesktopInvoke = async (command) => {
+      secretCalls.push(command);
+      throw new Error("environment credentials must not be deleted");
+    };
+    const fetcher = vi.fn(async () => new Response(null, { status: 200 }));
+
+    await expect(
+      removeProviderCredentials({
+        providerId: "openai",
+        invoke,
+        fetcher,
+        preserveEnvironmentSecret: true,
+      }),
+    ).resolves.toEqual({ status: "removed" });
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/desktop-runtime/provider-connections",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(secretCalls).toEqual([]);
+  });
 });

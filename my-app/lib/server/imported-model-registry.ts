@@ -17,6 +17,12 @@ export interface ImportedModelRecord {
   fileName: string;
   modelPath: string;
   sizeBytes: number;
+  fileIdentity?: {
+    device: string;
+    inode: string;
+    sizeBytes: string;
+    modifiedAtNs: string;
+  };
   sha256: string | null;
   status: ImportedModelStatus;
   createdAt: string;
@@ -165,6 +171,7 @@ export async function resolveLocalModelPath(input: string): Promise<{
   modelPath: string;
   fileName: string;
   sizeBytes: number;
+  fileIdentity: NonNullable<ImportedModelRecord["fileIdentity"]>;
 } | {
   error: string;
 }> {
@@ -177,9 +184,21 @@ export async function resolveLocalModelPath(input: string): Promise<{
   if (!fileName) return { error: "Use a .gguf, .safetensors, or .bin model file." };
 
   try {
-    const stat = await fs.stat(expanded);
+    const stat = await fs.lstat(expanded, { bigint: true });
     if (!stat.isFile()) return { error: "The model path must point to a file." };
-    return { modelPath: path.resolve(expanded), fileName, sizeBytes: stat.size };
+    const sizeBytes = Number(stat.size);
+    if (!Number.isSafeInteger(sizeBytes)) return { error: "The model file is too large to index safely." };
+    return {
+      modelPath: path.resolve(expanded),
+      fileName,
+      sizeBytes,
+      fileIdentity: {
+        device: stat.dev.toString(),
+        inode: stat.ino.toString(),
+        sizeBytes: stat.size.toString(),
+        modifiedAtNs: stat.mtimeNs.toString(),
+      },
+    };
   } catch {
     return { error: "The model file does not exist." };
   }
@@ -196,6 +215,14 @@ function isImportedModelRecord(value: unknown): value is ImportedModelRecord {
     typeof record.runtimeTarget === "string" &&
     typeof record.capability === "string" &&
     typeof record.format === "string" &&
-    typeof record.sizeBytes === "number"
+    typeof record.sizeBytes === "number" &&
+    (record.fileIdentity === undefined || (
+      typeof record.fileIdentity === "object" &&
+      record.fileIdentity !== null &&
+      typeof record.fileIdentity.device === "string" &&
+      typeof record.fileIdentity.inode === "string" &&
+      typeof record.fileIdentity.sizeBytes === "string" &&
+      typeof record.fileIdentity.modifiedAtNs === "string"
+    ))
   );
 }

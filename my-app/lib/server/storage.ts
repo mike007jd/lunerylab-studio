@@ -98,7 +98,7 @@ async function walkFiles(
     const rel = `${relPrefix}/${entry.name}`;
     if (entry.isDirectory()) {
       await walkFiles(fs, joinRuntimePath(dir, entry.name), rel, out);
-    } else if (entry.isFile()) {
+    } else if (entry.isFile() || entry.isSymbolicLink()) {
       out.push(rel);
     }
   }
@@ -400,12 +400,128 @@ export async function deleteStoredFile(storagePath: string) {
 
   try {
     const fs = await localFs();
+    const metadata = await fs.lstat(resolved);
+    if (metadata.isDirectory()) throw new Error("Refusing to delete a storage directory as a file.");
+    await assertStoredFileParent(resolved);
     await fs.unlink(resolved);
   } catch (error) {
     if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
       return;
     }
     throw error;
+  }
+}
+
+const STAGED_DELETE_SUFFIX = ".lunery-purge";
+
+async function assertStoredFileParent(absolutePath: string): Promise<void> {
+  const fs = await localFs();
+  const [root, parent] = await Promise.all([
+    fs.realpath(storageRootPath()),
+    fs.realpath(path.dirname(absolutePath)),
+  ]);
+  const relative = path.relative(root, parent);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("Stored file parent escapes the media root.");
+  }
+}
+
+export interface StagedStoredFileDeletion {
+  storagePath: string;
+  stagedStoragePath: string;
+  hadFile: boolean;
+}
+
+function stagedDeleteStoragePath(storagePath: string): string {
+  return `${storagePath}${STAGED_DELETE_SUFFIX}`;
+}
+
+export async function stageStoredFileDeletion(
+  storagePath: string,
+): Promise<StagedStoredFileDeletion> {
+  const fs = await localFs();
+  const resolved = resolveStoragePath(storagePath);
+  const stagedStoragePath = stagedDeleteStoragePath(storagePath);
+  const staged = resolveStoragePath(stagedStoragePath);
+  const [originalExists, stagedExists] = await Promise.all(
+    [resolved, staged].map(async (candidate) => {
+      try {
+        return await fs.lstat(candidate);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return null;
+        throw error;
+      }
+    }),
+  );
+
+  const isDeletableFile = (metadata: import("node:fs").Stats) =>
+    metadata.isFile() || metadata.isSymbolicLink();
+  if (
+    (originalExists && !isDeletableFile(originalExists))
+    || (stagedExists && !isDeletableFile(stagedExists))
+  ) {
+    throw new Error("Refusing to stage a non-regular storage file.");
+  }
+  if (originalExists && stagedExists) {
+    throw new Error("A staged storage deletion conflicts with the current file.");
+  }
+  if (stagedExists) {
+    await assertStoredFileParent(staged);
+    return { storagePath, stagedStoragePath, hadFile: true };
+  }
+  if (!originalExists) {
+    return { storagePath, stagedStoragePath, hadFile: false };
+  }
+
+  await assertStoredFileParent(resolved);
+  await fs.rename(resolved, staged);
+  return { storagePath, stagedStoragePath, hadFile: true };
+}
+
+export async function rollbackStoredFileDeletion(
+  stage: StagedStoredFileDeletion,
+): Promise<void> {
+  if (!stage.hadFile) return;
+  const fs = await localFs();
+  const resolved = resolveStoragePath(stage.storagePath);
+  const staged = resolveStoragePath(stage.stagedStoragePath);
+  try {
+    await fs.lstat(staged);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    await fs.lstat(resolved);
+    throw new Error("Cannot restore a staged deletion over a replacement file.");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
+  }
+  await assertStoredFileParent(staged);
+  await fs.rename(staged, resolved);
+}
+
+export async function commitStoredFileDeletion(
+  stage: StagedStoredFileDeletion,
+): Promise<void> {
+  if (!stage.hadFile) return;
+  await deleteStoredFile(stage.stagedStoragePath);
+}
+
+export async function reconcileStagedStoredFileDeletions(
+  referencedPaths: ReadonlySet<string>,
+): Promise<void> {
+  const stagedPaths = (await listStoredRelativePaths()).filter((storagePath) =>
+    storagePath.endsWith(STAGED_DELETE_SUFFIX),
+  );
+  for (const stagedStoragePath of stagedPaths) {
+    const storagePath = stagedStoragePath.slice(0, -STAGED_DELETE_SUFFIX.length);
+    const stage = { storagePath, stagedStoragePath, hadFile: true };
+    if (referencedPaths.has(storagePath)) {
+      await rollbackStoredFileDeletion(stage);
+    } else {
+      await commitStoredFileDeletion(stage);
+    }
   }
 }
 

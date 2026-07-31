@@ -2,7 +2,12 @@ import "server-only";
 
 import { ApiError } from "@/lib/server/errors";
 import { prisma } from "@/lib/server/prisma";
-import { deleteStoredFile } from "@/lib/server/storage";
+import {
+  commitStoredFileDeletion,
+  rollbackStoredFileDeletion,
+  stageStoredFileDeletion,
+  type StagedStoredFileDeletion,
+} from "@/lib/server/storage";
 
 /**
  * Permanently remove assets: delete the database rows and the underlying stored
@@ -17,9 +22,8 @@ import { deleteStoredFile } from "@/lib/server/storage";
  *   - A stored file is unlinked only when no OTHER surviving asset references the
  *     same storagePath, so shared/bundled media is never removed out from under
  *     a still-live asset.
- *   - Stored files are deleted before rows. A failed unlink keeps the asset rows
- *     as the retry record instead of reporting a permanent delete that left
- *     local data behind. Missing files are already idempotent in deleteStoredFile.
+ *   - Files are first renamed to same-volume quarantine paths. A staging or DB
+ *     failure restores them before returning, without changing asset visibility.
  *   - Rows are removed in a single deleteMany; their ReferenceSetAsset
  *     memberships cascade away via FK.
  */
@@ -64,40 +68,59 @@ export async function purgeAssets(userId: string, target: PurgeTarget): Promise<
   });
   const sharedPaths = new Set(survivorsUsingPaths.map((a) => a.storagePath));
   const pathsToDelete = candidatePaths.filter((p) => !sharedPaths.has(p));
-  const bytesFreed = pathsToDelete.reduce(
-    (sum, storagePath) => sum + (bytesByPath.get(storagePath) ?? 0),
-    0,
-  );
 
-  let filesDeleted = 0;
-  for (const storagePath of pathsToDelete) {
-    try {
-      await deleteStoredFile(storagePath);
-      filesDeleted += 1;
-    } catch {
-      throw new ApiError({
-        status: 503,
-        code: "asset_file_delete_failed",
-        message: "Could not delete all local asset files. Please try again.",
-        retryable: true,
-      });
+  const stages: StagedStoredFileDeletion[] = [];
+  try {
+    for (const storagePath of pathsToDelete) {
+      stages.push(await stageStoredFileDeletion(storagePath));
     }
+  } catch {
+    await Promise.allSettled(stages.map((stage) => rollbackStoredFileDeletion(stage)));
+    throw new ApiError({
+      status: 503,
+      code: "asset_file_delete_failed",
+      message: "Could not stage all local asset files for deletion. Please try again.",
+      retryable: true,
+    });
   }
 
   // Deleting the asset rows also removes their ReferenceSetAsset memberships via
   // the join table's onDelete: Cascade FK — no dangling reference ids survive.
-  // If this step fails, the rows retain the storage paths needed for an
-  // idempotent retry; files already removed resolve as success on the next run.
   try {
     await prisma.asset.deleteMany({ where: { id: { in: purgedIds }, userId } });
   } catch {
+    const rollback = await Promise.allSettled(
+      stages.map((stage) => rollbackStoredFileDeletion(stage)),
+    );
+    const rollbackFailed = rollback.some((result) => result.status === "rejected");
     throw new ApiError({
       status: 503,
       code: "asset_record_delete_failed",
-      message: "Local files were deleted, but their records could not be removed. Please try again.",
+      message: rollbackFailed
+        ? "Asset records could not be removed and file rollback needs another retry."
+        : "Asset records could not be removed. Local files were restored; please try again.",
       retryable: true,
     });
   }
+
+  try {
+    for (const stage of stages) await commitStoredFileDeletion(stage);
+  } catch {
+    // Rows are already gone. The deterministic quarantine path is reconciled
+    // on the next desktop bootstrap, so never pretend disk cleanup completed.
+    throw new ApiError({
+      status: 503,
+      code: "asset_file_delete_failed",
+      message: "Asset records were removed, but staged files still need cleanup. Please restart Studio.",
+      retryable: true,
+    });
+  }
+
+  const filesDeleted = stages.filter((stage) => stage.hadFile).length;
+  const bytesFreed = stages.reduce(
+    (sum, stage) => sum + (stage.hadFile ? (bytesByPath.get(stage.storagePath) ?? 0) : 0),
+    0,
+  );
 
   return { purgedCount: targets.length, bytesFreed, filesDeleted };
 }

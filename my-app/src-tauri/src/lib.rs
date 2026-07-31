@@ -22,7 +22,7 @@ use crate::engine_mlx::{bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_prog
 use crate::engine_sd::{bridge_stop_sd, sd_binary_path};
 use crate::external_apps::{is_lmstudio_installed, is_ollama_installed};
 use crate::hardware::{cached_accel, detect_hardware, probe_local_runtime, AccelInfo};
-use crate::http_bridge::{start_desktop_bridge, WorkspaceResetHandler};
+use crate::http_bridge::{start_desktop_bridge, DesktopBridgeServer, WorkspaceResetHandler};
 use crate::profile::{ensure_profile_dirs, profile_dirs, ProfileDirs, ProfileStorageDirs};
 use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
@@ -84,8 +84,10 @@ struct DesktopServerState {
     #[cfg(unix)]
     process_group: Mutex<Option<u32>>,
     url: Mutex<Option<String>>,
+    bridge_server: Mutex<Option<DesktopBridgeServer>>,
     pid_lockfile: Mutex<Option<PathBuf>>,
     dev_bridge_file: Mutex<Option<PathBuf>>,
+    dev_bridge_server: Mutex<Option<DesktopBridgeServer>>,
     runtime_operation: AtomicU8,
     /// Flipped by `shutdown` so the local-runtime watcher thread exits cleanly
     /// on app shutdown instead of being a daemon leak. The watcher reads this
@@ -95,6 +97,21 @@ struct DesktopServerState {
 
 impl DesktopServerState {
     fn stop_runtime(&self) {
+        // Prefer stopping embedded engines before joining the bridge listener so
+        // in-flight generate workers cannot keep teardown waiting.
+        bridge_stop_llama();
+        bridge_stop_mlx();
+        bridge_stop_sd();
+
+        let bridge_server = self
+            .bridge_server
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(bridge_server) = bridge_server {
+            bridge_server.shutdown();
+        }
+
         let mut child_guard = self
             .child
             .lock()
@@ -147,6 +164,16 @@ impl DesktopServerState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(path) = dev_bridge_guard.take() {
             let _ = std::fs::remove_file(path);
+        }
+        drop(dev_bridge_guard);
+
+        let dev_bridge_server = self
+            .dev_bridge_server
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(dev_bridge_server) = dev_bridge_server {
+            dev_bridge_server.shutdown();
         }
     }
 }
@@ -1176,10 +1203,12 @@ fn start_desktop_server(
 
     let port = reserve_local_port()?;
     let url = format!("http://127.0.0.1:{port}");
-    let bridge = start_desktop_bridge(
+    let bridge_server = start_desktop_bridge(
         Arc::clone(download_state),
         workspace_reset_handler(app.clone(), Arc::clone(download_state)),
     )?;
+    let bridge_port = bridge_server.bridge.port;
+    let bridge_auth_token = bridge_server.bridge.token.clone();
     let media_dir = desktop_media_dir(&profile)?;
     let pglite_dir = profile.pglite.clone();
     let migrations_dir = app_dir.join("prisma").join("migrations");
@@ -1216,9 +1245,9 @@ fn start_desktop_server(
         .env("LUNERY_RUNTIME_DIR", &profile.runtime)
         .env(
             "LUNERY_DESKTOP_BRIDGE_URL",
-            format!("http://127.0.0.1:{}", bridge.port),
+            format!("http://127.0.0.1:{bridge_port}"),
         )
-        .env("LUNERY_DESKTOP_BRIDGE_TOKEN", bridge.token)
+        .env("LUNERY_DESKTOP_BRIDGE_TOKEN", bridge_auth_token)
         .env("LUNERY_MEDIA_DIR", media_dir)
         .env("LUNERY_PUBLIC_DIR", public_dir)
         .env("LUNERY_PGLITE_DIR", pglite_dir)
@@ -1273,6 +1302,11 @@ fn start_desktop_server(
             *group_guard = Some(child.id());
         }
         *child_guard = Some(child);
+        let mut bridge_guard = state
+            .bridge_server
+            .lock()
+            .map_err(|_| "Desktop bridge server lock is poisoned".to_string())?;
+        *bridge_guard = Some(bridge_server);
         let mut url_guard = state
             .url
             .lock()
@@ -1407,9 +1441,6 @@ fn request_desktop_workspace_reset(
                 if let Err(err) = navigate_and_show(&app, "tauri://localhost/index.html") {
                     eprintln!("Could not show workspace reset progress: {err}");
                 }
-                bridge_stop_llama();
-                bridge_stop_mlx();
-                bridge_stop_sd();
                 app.state::<DesktopServerState>().stop_runtime();
                 reset_workspace_data(&profile_dirs()?)?;
                 Ok(())
@@ -1504,21 +1535,27 @@ pub fn run() {
             #[cfg(debug_assertions)]
             {
                 let dev_bridge_result = profile_dirs().and_then(|profile| {
-                    let bridge = start_desktop_bridge(
+                    let bridge_server = start_desktop_bridge(
                         Arc::clone(&dev_bridge_download_state),
                         workspace_reset_handler(
                             app.handle().clone(),
                             Arc::clone(&dev_bridge_download_state),
                         ),
                     )?;
-                    write_desktop_dev_bridge_file(&profile, &bridge)
+                    let path = write_desktop_dev_bridge_file(&profile, &bridge_server.bridge)?;
+                    Ok((path, bridge_server))
                 });
                 match dev_bridge_result {
-                    Ok(path) => {
+                    Ok((path, bridge_server)) => {
                         if let Ok(mut guard) =
                             app.state::<DesktopServerState>().dev_bridge_file.lock()
                         {
                             *guard = Some(path);
+                        }
+                        if let Ok(mut guard) =
+                            app.state::<DesktopServerState>().dev_bridge_server.lock()
+                        {
+                            *guard = Some(bridge_server);
                         }
                     }
                     Err(err) => {

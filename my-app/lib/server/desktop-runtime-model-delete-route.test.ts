@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { accessSync, constants, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { NextResponse } from "next/server";
@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   findImportedModel: vi.fn(),
   modelCachePath: vi.fn(),
   removeImportedModel: vi.fn(),
+  upsertImportedModel: vi.fn(),
   catalogModelFiles: vi.fn(),
   removeManagedModelFiles: vi.fn(),
   invalidateLocalModelInstallStatusCache: vi.fn(),
@@ -40,6 +41,7 @@ vi.mock("@/lib/server/imported-model-registry", () => ({
   findImportedModel: mocks.findImportedModel,
   modelCachePath: mocks.modelCachePath,
   removeImportedModel: mocks.removeImportedModel,
+  upsertImportedModel: mocks.upsertImportedModel,
 }));
 
 vi.mock("@/lib/server/local-model-files", () => ({
@@ -81,6 +83,16 @@ function request(modelId: string, body?: Record<string, unknown>) {
   });
 }
 
+function fileIdentity(filePath: string) {
+  const stat = lstatSync(filePath, { bigint: true });
+  return {
+    device: stat.dev.toString(),
+    inode: stat.ino.toString(),
+    sizeBytes: stat.size.toString(),
+    modifiedAtNs: stat.mtimeNs.toString(),
+  };
+}
+
 describe("/api/desktop-runtime/models/[modelId]", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -95,6 +107,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     mocks.findHfModelEntry.mockReturnValue(null);
     mocks.findImportedModel.mockResolvedValue(undefined);
     mocks.removeImportedModel.mockResolvedValue(undefined);
+    mocks.upsertImportedModel.mockResolvedValue(undefined);
     mocks.catalogModelFiles.mockReturnValue([]);
     mocks.removeManagedModelFiles.mockResolvedValue(0);
     mocks.getBridgeDownloadStatus.mockResolvedValue({ status: "ready" });
@@ -150,6 +163,27 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     expect(mocks.invalidateLocalModelInstallStatusCache).toHaveBeenCalledOnce();
   });
 
+  it("does not turn a missing bridge probe into permission to block SD deletion", async () => {
+    mocks.findHfModelEntry.mockReturnValue({
+      id: "sdxl-base-1.0",
+      runtimeTarget: "sd-cpp",
+      fileName: "sd_xl_base_1.0.safetensors",
+    });
+    mocks.catalogModelFiles.mockReturnValue([{ fileName: "sd_xl_base_1.0.safetensors" }]);
+    mocks.modelCachePath.mockReturnValue("/profile/models/sd-cpp/sd_xl_base_1.0.safetensors");
+    mocks.requireDesktopBridge.mockReturnValue(new NextResponse(null, { status: 503 }));
+    mocks.removeManagedModelFiles.mockResolvedValue(1);
+
+    const response = await request("sdxl-base-1.0");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deleted: true,
+      removedFiles: 1,
+      warnings: ["runtime_not_stopped"],
+    });
+  });
+
   it("unregisters a local-path import without deleting the user's original file", async () => {
     mocks.findImportedModel.mockResolvedValue({
       id: "imported-sd-cpp-original-12345678",
@@ -184,6 +218,8 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       source: "local-path",
       runtimeTarget: "sd-cpp",
       modelPath,
+      sizeBytes: 5,
+      fileIdentity: fileIdentity(modelPath),
       status: "ready",
     });
 
@@ -201,7 +237,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     expect(() => writeFileSync(modelPath, "replacement", { flag: "wx" })).not.toThrow();
   });
 
-  it("keeps the imported file and registry when a confirmed external delete fails", async () => {
+  it("refuses a confirmed external delete when the imported path was replaced", async () => {
     tempRoot = mkdtempSync(path.join(tmpdir(), "lunery-external-model-delete-fail-"));
     const modelPath = tempRoot;
     mocks.findImportedModel.mockResolvedValue({
@@ -209,6 +245,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       source: "local-path",
       runtimeTarget: "sd-cpp",
       modelPath,
+      sizeBytes: 0,
       status: "ready",
     });
 
@@ -217,13 +254,39 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       confirmation: EXTERNAL_MODEL_DELETE_CONFIRMATION,
     });
 
-    expect(response.status).toBe(503);
+    expect(response.status).toBe(409);
     await expect(response.json()).resolves.toMatchObject({
-      code: "external_model_file_delete_failed",
-      retryable: true,
+      code: "external_model_file_changed",
+      retryable: false,
     });
     expect(mocks.removeImportedModel).not.toHaveBeenCalled();
     expect(() => accessSync(modelPath, constants.F_OK)).not.toThrow();
+  });
+
+  it("restores the external file and registry when metadata deletion fails", async () => {
+    tempRoot = mkdtempSync(path.join(tmpdir(), "lunery-external-model-rollback-"));
+    const modelPath = path.join(tempRoot, "original.safetensors");
+    writeFileSync(modelPath, "model");
+    const record = {
+      id: "imported-sd-cpp-rollback-12345678",
+      source: "local-path",
+      runtimeTarget: "sd-cpp",
+      modelPath,
+      sizeBytes: 5,
+      fileIdentity: fileIdentity(modelPath),
+      status: "ready",
+    };
+    mocks.findImportedModel.mockResolvedValue(record);
+    mocks.removeImportedModel.mockRejectedValueOnce(new Error("registry unavailable"));
+
+    const response = await request(record.id, {
+      deleteExternalFile: true,
+      confirmation: EXTERNAL_MODEL_DELETE_CONFIRMATION,
+    });
+
+    expect(response.status).toBe(500);
+    expect(() => accessSync(modelPath, constants.F_OK)).not.toThrow();
+    expect(mocks.upsertImportedModel).toHaveBeenCalledWith(record);
   });
 
   it("does not delete an imported file without the shared confirmation token", async () => {
@@ -330,6 +393,121 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       "/profile/models/llama-cpp/imported/demo.gguf",
       "/profile/models/llama-cpp/imported/demo.gguf.part",
     ]);
+  });
+
+  it("waits for an active Hugging Face import to cancel before deleting its files", async () => {
+    const modelId = "imported-llama-cpp-download-12345678";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath: "/profile/models/llama-cpp/imported/download.gguf",
+      jobId: "job-active",
+      status: "downloading",
+    });
+    mocks.getBridgeDownloadStatus
+      .mockResolvedValueOnce({ status: "downloading" })
+      .mockResolvedValueOnce({ status: "canceled" });
+    mocks.bridgeFetch.mockResolvedValue(Response.json({ ok: true, running: false }));
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(200);
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/hf-download-cancel",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ jobId: "job-active" }),
+      }),
+    );
+    expect(mocks.getBridgeDownloadStatus).toHaveBeenCalledTimes(2);
+    expect(mocks.removeManagedModelFiles).toHaveBeenCalledOnce();
+  });
+
+  it("refuses deletion when an active Hugging Face import does not settle", async () => {
+    const modelId = "imported-llama-cpp-download-timeout-12345678";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath: "/profile/models/llama-cpp/imported/download.gguf",
+      jobId: "job-stuck",
+      status: "downloading",
+    });
+    mocks.getBridgeDownloadStatus.mockResolvedValue({ status: "downloading" });
+    mocks.bridgeFetch.mockResolvedValue(Response.json({ ok: true }));
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "download_cancel_timeout",
+      retryable: true,
+    });
+    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("stops an active SD model before removing its cache", async () => {
+    const modelId = "imported-sd-cpp-demo-12345678";
+    const modelPath = "/profile/models/sd-cpp/imported/demo.safetensors";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "sd-cpp",
+      modelPath,
+      status: "ready",
+    });
+    mocks.bridgeFetch
+      .mockResolvedValueOnce(Response.json({ running: true, modelPath }))
+      .mockResolvedValueOnce(Response.json({ ok: true, stopped: true }));
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(200);
+    expect(mocks.bridgeFetch).toHaveBeenNthCalledWith(
+      1,
+      bridge,
+      "/sd-status",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(mocks.bridgeFetch).toHaveBeenNthCalledWith(
+      2,
+      bridge,
+      "/sd-stop",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ modelPath }),
+      }),
+    );
+    expect(mocks.removeManagedModelFiles).toHaveBeenCalledWith([
+      modelPath,
+      `${modelPath}.part`,
+    ]);
+  });
+
+  it("refuses deletion when a matching SD runtime cannot be stopped", async () => {
+    const modelId = "imported-sd-cpp-busy-12345678";
+    const modelPath = "/profile/models/sd-cpp/imported/busy.safetensors";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "sd-cpp",
+      modelPath,
+      status: "ready",
+    });
+    mocks.bridgeFetch
+      .mockResolvedValueOnce(Response.json({ running: true, modelPath }))
+      .mockResolvedValueOnce(Response.json({ ok: true, stopped: false }));
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "runtime_stop_failed",
+      retryable: true,
+    });
+    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
   });
 
   it("rejects malformed ids before looking up a model", async () => {

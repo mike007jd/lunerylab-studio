@@ -99,7 +99,10 @@ export function ProviderConnectionsPanel({
   onDraftEndpointChange: (value: string) => void;
   onDraftModelChange: (role: ByokModelRole, value: string) => void;
   onDraftKeyChange: (value: string) => void;
-  onRemoveProvider: (providerId: string) => Promise<boolean>;
+  onRemoveProvider: (
+    providerId: string,
+    options?: { preserveEnvironmentSecret?: boolean },
+  ) => Promise<boolean>;
   onTestConnection: () => void;
   onSaveProvider: () => void;
 }) {
@@ -119,6 +122,8 @@ export function ProviderConnectionsPanel({
   // toast.
   const activeProvider = providers.find((provider) => provider.id === draftProvider);
   const secretFromEnv = activeProvider?.source === copy.env;
+  const canRemoveProvider = Boolean(connections[draftProvider])
+    || (activeProviderHasSecret && !secretFromEnv);
   const showStoredSecret = activeProviderHasSecret && !draftKey.trim();
 
   return (
@@ -260,13 +265,9 @@ export function ProviderConnectionsPanel({
                     type="button"
                     variant="ghostMuted"
                     size="icon-sm"
-                    aria-label={secretFromEnv ? copy.managedByEnvironment : copy.moreActions}
-                    title={secretFromEnv ? copy.managedByEnvironment : undefined}
-                    disabled={
-                      secretFromEnv ||
-                      providerRemovalPending ||
-                      (!connections[draftProvider] && !activeProviderHasSecret)
-                    }
+                    aria-label={!canRemoveProvider && secretFromEnv ? copy.managedByEnvironment : copy.moreActions}
+                    title={!canRemoveProvider && secretFromEnv ? copy.managedByEnvironment : undefined}
+                    disabled={providerRemovalPending || !canRemoveProvider}
                   >
                     <MoreHorizontal className="h-4 w-4" />
                   </Button>
@@ -319,7 +320,9 @@ export function ProviderConnectionsPanel({
           if (!open && !providerRemovalPending) setProviderPendingRemoval(null);
         }}
         title={copy.removeConfirmTitle}
-        description={copy.removeConfirmDescription}
+        description={secretFromEnv
+          ? copy.removeEnvironmentConfirmDescription
+          : copy.removeConfirmDescription}
         confirmLabel={copy.remove}
         cancelLabel={copy.cancel}
         pending={providerRemovalPending}
@@ -327,7 +330,9 @@ export function ProviderConnectionsPanel({
           if (!providerPendingRemoval) return;
           setProviderRemovalPending(true);
           try {
-            await onRemoveProvider(providerPendingRemoval);
+            await onRemoveProvider(providerPendingRemoval, {
+              preserveEnvironmentSecret: secretFromEnv,
+            });
             // Close on both success and failure so the persistent inline status
             // behind the modal is visible and the user can recover immediately.
             setProviderPendingRemoval(null);

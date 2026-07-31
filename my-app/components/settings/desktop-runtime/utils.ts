@@ -172,10 +172,13 @@ export async function removeProviderCredentials({
   providerId,
   invoke,
   fetcher = fetch,
+  preserveEnvironmentSecret = false,
 }: {
   providerId: string;
   invoke: DesktopInvoke | null;
   fetcher?: typeof fetch;
+  /** When true, only unlink Lunery-owned connection metadata; leave env credentials alone. */
+  preserveEnvironmentSecret?: boolean;
 }): Promise<
   | { status: "removed" }
   | { status: "removed-with-residual-secret" }
@@ -194,6 +197,12 @@ export async function removeProviderCredentials({
     metadataRemoved = response.ok;
   } catch {
     metadataRemoved = false;
+  }
+
+  if (preserveEnvironmentSecret) {
+    return metadataRemoved
+      ? { status: "removed" }
+      : { status: "metadata-removal-failed", secretRemoved: false };
   }
 
   let secretRemoved = false;

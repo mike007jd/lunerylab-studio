@@ -90,4 +90,37 @@ describe("imported-model-registry profile paths", () => {
       expect.objectContaining({ id: "imported-llama-cpp-other-87654321" }),
     ]);
   });
+
+  it("captures a stable filesystem identity for a local-path import", async () => {
+    const modelPath = path.join(tmpDir, "external", "demo.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "model");
+    const registry = await import("@/lib/server/imported-model-registry");
+
+    const resolved = await registry.resolveLocalModelPath(modelPath);
+
+    expect(resolved).toMatchObject({
+      modelPath,
+      fileName: "demo.gguf",
+      sizeBytes: 5,
+      fileIdentity: {
+        device: expect.any(String),
+        inode: expect.any(String),
+        sizeBytes: "5",
+        modifiedAtNs: expect.any(String),
+      },
+    });
+  });
+
+  it.runIf(process.platform !== "win32")("rejects a symlink as a local model identity", async () => {
+    const target = path.join(tmpDir, "target.gguf");
+    const linked = path.join(tmpDir, "linked.gguf");
+    fs.writeFileSync(target, "model");
+    fs.symlinkSync(target, linked);
+    const registry = await import("@/lib/server/imported-model-registry");
+
+    await expect(registry.resolveLocalModelPath(linked)).resolves.toEqual({
+      error: "The model path must point to a file.",
+    });
+  });
 });

@@ -37,6 +37,37 @@ fn sd_progress_slot() -> &'static Mutex<Option<SdProgress>> {
     SD_PROGRESS.get_or_init(|| Mutex::new(None))
 }
 
+static SD_ACTIVE_MODEL_PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+fn sd_active_model_path_slot() -> &'static Mutex<Option<String>> {
+    SD_ACTIVE_MODEL_PATH.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn sd_active_model_path() -> Option<String> {
+    sd_active_model_path_slot()
+        .lock()
+        .ok()
+        .and_then(|path| path.clone())
+}
+
+struct ActiveSdModelGuard;
+
+impl ActiveSdModelGuard {
+    fn set(path: Option<String>) -> Self {
+        if let Ok(mut active) = sd_active_model_path_slot().lock() {
+            *active = path;
+        }
+        Self
+    }
+}
+
+impl Drop for ActiveSdModelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = sd_active_model_path_slot().lock() {
+            *active = None;
+        }
+    }
+}
+
 /// A cancel can reach the bridge before the long-running generate request has
 /// acquired the SD lock. Keep a small run-id keyed queue so that race cannot
 /// start a native process after the user already canceled it.
@@ -223,6 +254,27 @@ pub(crate) fn bridge_stop_sd() {
         }
     }
     stop_sd_child();
+}
+
+pub(crate) fn bridge_stop_sd_if_model_path(expected_model_path: &str) -> bool {
+    {
+        let Ok(active) = sd_active_model_path_slot().lock() else {
+            return false;
+        };
+        if active.as_deref() != Some(expected_model_path) {
+            return false;
+        }
+    }
+    // Release the active-path lock before stopping so the generate thread can
+    // finish and clear its guard. The generate lock still serializes batches.
+    bridge_stop_sd();
+    for _ in 0..200 {
+        if sd_active_model_path().as_deref() != Some(expected_model_path) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
 }
 
 /// Cancel only the matching run. Unknown run ids are queued briefly because
@@ -478,6 +530,11 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
     let _generate_guard = sd_generate_lock()
         .lock()
         .map_err(|_| "sd generation lock poisoned".to_string())?;
+    let _active_model = ActiveSdModelGuard::set(
+        body.runs
+            .first()
+            .and_then(|argv| sd_model_path_from_argv(argv)),
+    );
 
     // Fresh batch: replace stale progress, clear the global cancel bit from the
     // prior run, and bound the WHOLE
@@ -816,14 +873,18 @@ fn validate_sd_run_argv(
 /// file basename — same convention as LlamaResident so the UI shows comparable
 /// ids across backends. Returns None if argv has no recognisable model arg.
 fn sd_model_id_from_argv(argv: &[String]) -> Option<String> {
+    sd_model_path_from_argv(argv).and_then(|model_path| {
+        std::path::Path::new(&model_path)
+            .file_name()
+            .and_then(|name| name.to_str().map(str::to_string))
+    })
+}
+
+fn sd_model_path_from_argv(argv: &[String]) -> Option<String> {
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
         if arg == "-m" || arg == "--model" || arg == "--diffusion-model" {
-            if let Some(path) = iter.next() {
-                return std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|s| s.to_str().map(|s| s.to_string()));
-            }
+            return iter.next().cloned();
         }
     }
     None
@@ -832,9 +893,10 @@ fn sd_model_id_from_argv(argv: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_sd_run, bridge_cancel_sd, bridge_stop_sd, queue_pending_cancel, sd_cancel_flag,
-        sd_inflight_child, sd_model_id_from_argv, sd_progress_for_run, set_sd_image_phase,
-        set_sd_progress, validate_sd_run_argv, SdProgress, SdProgressParser, SdProgressPhase,
+        begin_sd_run, bridge_cancel_sd, bridge_stop_sd, bridge_stop_sd_if_model_path,
+        queue_pending_cancel, sd_active_model_path, sd_cancel_flag, sd_inflight_child,
+        sd_model_id_from_argv, sd_progress_for_run, set_sd_image_phase, set_sd_progress,
+        validate_sd_run_argv, ActiveSdModelGuard, SdProgress, SdProgressParser, SdProgressPhase,
     };
     use crate::test_global_lock;
     use std::sync::atomic::Ordering;
@@ -860,6 +922,33 @@ mod tests {
             sd_inflight_child().lock().unwrap().is_none(),
             "stop must clear the in-flight child slot"
         );
+    }
+
+    #[test]
+    fn bridge_stop_sd_only_stops_the_expected_model_path() {
+        let _g = test_global_lock();
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+        let worker = std::thread::spawn(|| {
+            let _active = ActiveSdModelGuard::set(Some("/models/current.safetensors".to_string()));
+            while !sd_cancel_flag().load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        for _ in 0..200 {
+            if sd_active_model_path().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!bridge_stop_sd_if_model_path("/models/other.safetensors"));
+        assert_eq!(
+            sd_active_model_path().as_deref(),
+            Some("/models/current.safetensors")
+        );
+        assert!(bridge_stop_sd_if_model_path("/models/current.safetensors"));
+        worker.join().expect("active SD worker exits after stop");
+        assert!(sd_active_model_path().is_none());
     }
 
     #[test]

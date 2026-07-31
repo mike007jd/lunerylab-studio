@@ -4,6 +4,7 @@ import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { ApiError } from "@/lib/server/errors";
 import { prisma } from "@/lib/server/prisma";
 import { ensureBuiltInProjectTemplates } from "@/lib/server/sample-projects";
+import { reconcileStagedStoredFileDeletions } from "@/lib/server/storage";
 import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
 
 export interface LocalWorkspaceOwner {
@@ -81,6 +82,11 @@ async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
       }
     }
   }
+
+  const referencedFiles = await prisma.asset.findMany({ select: { storagePath: true } });
+  await reconcileStagedStoredFileDeletions(
+    new Set(referencedFiles.map((asset) => asset.storagePath)),
+  );
 
   await ensureBuiltInProjectTemplates(LOCAL_WORKSPACE_OWNER.id);
 }

@@ -394,13 +394,17 @@ function DesktopRuntimeCardContent({
     }
   }
 
-  async function removeProvider(providerId: string): Promise<boolean> {
+  async function removeProvider(
+    providerId: string,
+    options?: { preserveEnvironmentSecret?: boolean },
+  ): Promise<boolean> {
     setSecretFeedback(null);
     const result = await removeProviderCredentials({
       providerId,
       // The status probe can be stale or temporarily unavailable. The direct
       // command remains retryable and will reach the bridge if it has recovered.
       invoke: invokeCommand ?? bridgeInvoke,
+      preserveEnvironmentSecret: options?.preserveEnvironmentSecret,
     });
     if (result.status === "metadata-removal-failed") {
       if (result.secretRemoved) {

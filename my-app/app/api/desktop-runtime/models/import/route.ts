@@ -103,6 +103,7 @@ export async function POST(request: NextRequest) {
       fileName: resolved.fileName,
       modelPath: resolved.modelPath,
       sizeBytes: resolved.sizeBytes,
+      fileIdentity: resolved.fileIdentity,
       sha256: null,
       status: "ready",
       createdAt: new Date().toISOString(),

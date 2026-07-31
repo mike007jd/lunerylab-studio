@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   userCreate: vi.fn(),
   userSettingsFindUnique: vi.fn(),
   projectFindMany: vi.fn(),
+  assetFindMany: vi.fn(),
+  reconcileStagedStoredFileDeletions: vi.fn(),
 }));
 
 // This dependency is intentionally hostile: if template initialization ever
@@ -25,6 +27,7 @@ vi.mock("@/lib/sample-data", () => ({
 
 vi.mock("@/lib/server/storage", () => ({
   deleteStoredFile: vi.fn(),
+  reconcileStagedStoredFileDeletions: mocks.reconcileStagedStoredFileDeletions,
   restoreStoredFile: vi.fn(),
   writeGeneratedImage: vi.fn(),
 }));
@@ -40,6 +43,9 @@ vi.mock("@/lib/server/prisma", () => ({
     },
     project: {
       findMany: mocks.projectFindMany,
+    },
+    asset: {
+      findMany: mocks.assetFindMany,
     },
     workspaceRestoreCommit: {
       findUnique: vi.fn().mockResolvedValue(null),
@@ -65,6 +71,8 @@ describe("local workspace first boot", () => {
     mocks.userCreate.mockResolvedValue({ id: "00000000-0000-0000-0000-000000000000" });
     mocks.userSettingsFindUnique.mockResolvedValue({ defaultLocale: "en" });
     mocks.projectFindMany.mockResolvedValue([]);
+    mocks.assetFindMany.mockResolvedValue([]);
+    mocks.reconcileStagedStoredFileDeletions.mockResolvedValue(undefined);
 
     const outcome = await Promise.race([
       ensureLocalWorkspaceOwner().then(() => "completed"),

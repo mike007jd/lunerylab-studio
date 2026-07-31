@@ -2,9 +2,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::download::{hf_download_start_inner, DownloadState, JobSnapshot};
@@ -13,8 +13,9 @@ use crate::engine_mlx::{
     bridge_start_mlx, bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot,
 };
 use crate::engine_sd::{
-    bridge_cancel_sd, bridge_finish_sd, bridge_sd_generate, sd_binary_path, sd_progress_for_run,
-    valid_sd_run_id, SdGenerateBody, SdProgressPhase,
+    bridge_cancel_sd, bridge_finish_sd, bridge_sd_generate, bridge_stop_sd_if_model_path,
+    sd_active_model_path, sd_binary_path, sd_progress_for_run, valid_sd_run_id, SdGenerateBody,
+    SdProgressPhase,
 };
 use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
@@ -27,6 +28,34 @@ use crate::security::{bridge_token, constant_time_eq, host_is_loopback};
 use crate::{DesktopBridge, DESKTOP_WORKSPACE_RESET_CONFIRMATION};
 
 pub(crate) type WorkspaceResetHandler = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+pub(crate) struct DesktopBridgeServer {
+    pub(crate) bridge: DesktopBridge,
+    shutdown: Arc<AtomicBool>,
+    listener_thread: Option<JoinHandle<()>>,
+}
+
+impl DesktopBridgeServer {
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        // Wake the nonblocking accept loop immediately instead of waiting for
+        // its poll interval. No request is sent and the connection is dropped.
+        let _ = TcpStream::connect(("127.0.0.1", self.bridge.port));
+        if let Some(thread) = self.listener_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    pub(crate) fn shutdown(mut self) {
+        self.stop();
+    }
+}
+
+impl Drop for DesktopBridgeServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 fn read_http_request(
     stream: &mut TcpStream,
@@ -695,12 +724,33 @@ fn handle_bridge_request(
         }
         ("GET", "/sd-status") => {
             let available = sd_binary_path().is_some();
+            let model_path = sd_active_model_path();
             let payload = serde_json::json!({
                 "available": available,
                 "engine": "stable-diffusion.cpp",
+                "running": model_path.is_some(),
+                "modelPath": model_path,
             })
             .to_string();
             write_http_response(&mut stream, "200 OK", &payload);
+        }
+        ("POST", "/sd-stop") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct StopBody {
+                model_path: String,
+            }
+            match serde_json::from_str::<StopBody>(&body) {
+                Ok(stop) => {
+                    let stopped = bridge_stop_sd_if_model_path(&stop.model_path);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "ok": true, "stopped": stopped }).to_string(),
+                    );
+                }
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err.to_string()),
+            }
         }
         ("GET", "/sd-progress") => {
             let Some(run_id) = query_param(query, "runId").filter(|run_id| valid_sd_run_id(run_id))
@@ -851,9 +901,12 @@ fn provider_secret_mutation_http_status(error: ProviderSecretMutationError) -> &
 pub(crate) fn start_desktop_bridge(
     download_state: Arc<DownloadState>,
     workspace_reset: WorkspaceResetHandler,
-) -> Result<DesktopBridge, String> {
+) -> Result<DesktopBridgeServer, String> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|err| format!("Could not start desktop bridge: {err}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("Could not configure desktop bridge: {err}"))?;
     let port = listener
         .local_addr()
         .map_err(|err| format!("Could not inspect desktop bridge port: {err}"))?
@@ -861,9 +914,22 @@ pub(crate) fn start_desktop_bridge(
     let token = bridge_token()?;
     let bridge_token = token.clone();
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let listener_shutdown = Arc::clone(&shutdown);
 
-    thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
+    let listener_thread = thread::spawn(move || {
+        while !listener_shutdown.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if listener_shutdown.load(Ordering::Acquire) {
+                break;
+            }
             let current = in_flight.fetch_add(1, Ordering::AcqRel);
             if current >= BRIDGE_MAX_IN_FLIGHT {
                 in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -885,12 +951,22 @@ pub(crate) fn start_desktop_bridge(
         }
     });
 
-    Ok(DesktopBridge { port, token })
+    Ok(DesktopBridgeServer {
+        bridge: DesktopBridge { port, token },
+        shutdown,
+        listener_thread: Some(listener_thread),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_secret_mutation_http_status, ProviderSecretMutationError};
+    use super::{
+        provider_secret_mutation_http_status, start_desktop_bridge, ProviderSecretMutationError,
+        WorkspaceResetHandler,
+    };
+    use crate::download::DownloadState;
+    use std::net::TcpStream;
+    use std::sync::Arc;
 
     #[test]
     fn provider_secret_validation_errors_map_to_bad_request() {
@@ -910,5 +986,18 @@ mod tests {
             provider_secret_mutation_http_status(ProviderSecretMutationError::Unavailable),
             "503 Service Unavailable"
         );
+    }
+
+    #[test]
+    fn bridge_shutdown_revokes_the_previous_listener() {
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server =
+            start_desktop_bridge(Arc::new(DownloadState::default()), reset).expect("start bridge");
+        let port = server.bridge.port;
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+
+        server.shutdown();
+
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 }
