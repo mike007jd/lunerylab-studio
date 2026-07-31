@@ -2,6 +2,7 @@ import { cache } from "react";
 import { Prisma } from "@prisma/client";
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { ApiError } from "@/lib/server/errors";
+import { reconcileExternalModelDeleteJournals } from "@/lib/server/imported-model-registry";
 import { prisma } from "@/lib/server/prisma";
 import { ensureBuiltInProjectTemplates } from "@/lib/server/sample-projects";
 import { reconcileStagedStoredFileDeletions } from "@/lib/server/storage";
@@ -48,6 +49,7 @@ async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
   // Crash recovery must finish before any owner/bootstrap query so workspace
   // APIs never observe a split media/config/DB restore.
   await ensureWorkspaceRestoreReconciled();
+  await reconcileExternalModelDeleteJournals();
 
   const existing = await prisma.user.findUnique({
     where: { id: LOCAL_WORKSPACE_OWNER.id },

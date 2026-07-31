@@ -34,6 +34,12 @@ export interface BridgeDownloadStartPayload {
   jobId: string;
 }
 
+export interface BridgeDownloadJob {
+  jobId: string;
+  status: string;
+  destination: string;
+}
+
 /**
  * Shared guard for desktop-runtime API routes.
  *
@@ -192,4 +198,20 @@ export async function getBridgeDownloadStatus(
   ).catch(() => null);
   if (!response?.ok) return null;
   return response.json().catch(() => null) as Promise<{ status?: unknown } | null>;
+}
+
+export async function getBridgeDownloadJobs(
+  bridge: DesktopBridge,
+): Promise<BridgeDownloadJob[] | null> {
+  const response = await bridgeFetch(bridge, "/hf-download-list").catch(() => null);
+  if (!response?.ok) return null;
+  const payload = await response.json().catch(() => null) as { jobs?: unknown } | null;
+  if (!Array.isArray(payload?.jobs)) return null;
+  return payload.jobs.filter((job): job is BridgeDownloadJob => {
+    if (!job || typeof job !== "object") return false;
+    const candidate = job as Partial<BridgeDownloadJob>;
+    return typeof candidate.jobId === "string"
+      && typeof candidate.status === "string"
+      && typeof candidate.destination === "string";
+  });
 }

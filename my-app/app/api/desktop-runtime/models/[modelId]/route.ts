@@ -8,17 +8,22 @@ import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { findHfModelEntry, type HfModelEntry } from "@/lib/hf-model-catalog";
 import {
   bridgeFetch,
-  getBridgeDownloadStatus,
+  getBridgeDownloadJobs,
   requireDesktopBridge,
   type DesktopBridge,
 } from "@/lib/server/desktop-bridge";
 import { ApiError, jsonError } from "@/lib/server/errors";
 import {
   findImportedModel,
+  finishImportedExternalModelRollback,
+  commitImportedExternalModelFile,
   modelCachePath,
   removeImportedModel,
+  rollbackImportedExternalModelFile,
+  stageImportedExternalModelFile,
   upsertImportedModel,
   type ImportedModelRecord,
+  type StagedExternalModelFile,
 } from "@/lib/server/imported-model-registry";
 import {
   catalogModelFiles,
@@ -64,130 +69,48 @@ function importedModelPaths(record: ImportedModelRecord): string[] {
   return [record.modelPath, `${record.modelPath}.part`];
 }
 
-interface StagedExternalModelFile {
-  originalPath: string;
-  stagedPath: string;
-  hadFile: boolean;
-}
-
-function externalIdentityMatches(
-  record: ImportedModelRecord,
-  stat: import("node:fs").BigIntStats,
-): boolean {
-  const identity = record.fileIdentity;
-  if (!identity) return false;
-  return stat.isFile()
-    && stat.dev.toString() === identity.device
-    && stat.ino.toString() === identity.inode
-    && stat.size.toString() === identity.sizeBytes
-    && stat.mtimeNs.toString() === identity.modifiedAtNs;
-}
-
-async function stageImportedExternalFile(
-  record: ImportedModelRecord,
-): Promise<StagedExternalModelFile> {
-  let stagedPath = "";
-  try {
-    const handle = await fs.open(record.modelPath, "r");
-    try {
-      const opened = await handle.stat({ bigint: true });
-      const current = await fs.lstat(record.modelPath, { bigint: true });
-      if (!externalIdentityMatches(record, opened) || !externalIdentityMatches(record, current)) {
-        throw new ApiError({
-          status: 409,
-          code: "external_model_file_changed",
-          message: "The imported model path now points to a different file. Import it again before deleting it.",
-          retryable: false,
-        });
-      }
-    } finally {
-      await handle.close();
+async function settleActiveDownloadsForPaths(
+  bridge: DesktopBridge,
+  modelPaths: string[],
+): Promise<void> {
+  const destinations = new Set(modelPaths.map((modelPath) => path.resolve(modelPath)));
+  const matchingActiveJobs = async () => {
+    const jobs = await getBridgeDownloadJobs(bridge);
+    if (!jobs) {
+      throw new ApiError({
+        status: 503,
+        code: "bridge_unreachable",
+        message: "Could not inspect active model downloads.",
+        retryable: true,
+      });
     }
-    stagedPath = path.join(
-      path.dirname(record.modelPath),
-      `.${path.basename(record.modelPath)}.lunery-delete-${randomUUID()}`,
+    return jobs.filter((job) =>
+      ACTIVE_DOWNLOAD_STATUSES.has(job.status)
+      && destinations.has(path.resolve(job.destination))
     );
-    await fs.rename(record.modelPath, stagedPath);
-    try {
-      const staged = await fs.lstat(stagedPath, { bigint: true });
-      if (!externalIdentityMatches(record, staged)) {
-        throw new ApiError({
-          status: 409,
-          code: "external_model_file_changed",
-          message: "The imported model path changed while it was being deleted. Import it again before retrying.",
-          retryable: false,
-        });
-      }
-    } catch (error) {
-      try {
-        await fs.rename(stagedPath, record.modelPath);
-      } catch {
-        throw new ApiError({
-          status: 503,
-          code: "external_model_delete_rollback_failed",
-          message: "The imported model file could not be restored after its identity changed. Restart Studio and try again.",
-          retryable: true,
-        });
-      }
-      throw error;
+  };
+
+  const active = await matchingActiveJobs();
+  if (active.length === 0) return;
+  await Promise.all(active.map(async (job) => {
+    const response = await bridgeFetch(bridge, "/hf-download-cancel", {
+      method: "POST",
+      body: JSON.stringify({ jobId: job.jobId }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      throw new ApiError({
+        status: 503,
+        code: "download_cancel_failed",
+        message: "Could not stop the model download. Try again.",
+        retryable: true,
+      });
     }
-    return { originalPath: record.modelPath, stagedPath, hadFile: true };
-  } catch (error) {
-    if (error instanceof ApiError) throw error;
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { originalPath: record.modelPath, stagedPath: "", hadFile: false };
-    }
-    throw new ApiError({
-      status: 503,
-      code: "external_model_file_delete_failed",
-      message: "Could not stage the imported model file for deletion. Please try again.",
-      retryable: true,
-    });
-  }
-}
-
-async function rollbackImportedExternalFile(stage: StagedExternalModelFile): Promise<void> {
-  if (!stage.hadFile) return;
-  await fs.rename(stage.stagedPath, stage.originalPath);
-}
-
-async function commitImportedExternalFile(stage: StagedExternalModelFile): Promise<number> {
-  if (!stage.hadFile) return 0;
-  await fs.unlink(stage.stagedPath);
-  return 1;
-}
-
-async function cancelActiveImport(bridge: DesktopBridge, record: ImportedModelRecord): Promise<void> {
-  if (!record.jobId) return;
-  const status = await getBridgeDownloadStatus(bridge, record.jobId);
-  if (!status) {
-    throw new ApiError({
-      status: 503,
-      code: "bridge_unreachable",
-      message: "Could not verify the model download before removing it.",
-      retryable: true,
-    });
-  }
-  if (!ACTIVE_DOWNLOAD_STATUSES.has(String(status.status))) return;
-
-  const response = await bridgeFetch(bridge, "/hf-download-cancel", {
-    method: "POST",
-    body: JSON.stringify({ jobId: record.jobId }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) {
-    throw new ApiError({
-      status: 503,
-      code: "download_cancel_failed",
-      message: "Could not stop the model download. Try again.",
-      retryable: true,
-    });
-  }
+  }));
 
   for (let attempt = 0; attempt < 30; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 100));
-    const next = await getBridgeDownloadStatus(bridge, record.jobId);
-    if (next && !ACTIVE_DOWNLOAD_STATUSES.has(String(next.status))) return;
+    if ((await matchingActiveJobs()).length === 0) return;
   }
   throw new ApiError({
     status: 503,
@@ -195,6 +118,100 @@ async function cancelActiveImport(bridge: DesktopBridge, record: ImportedModelRe
     message: "The model download did not stop in time.",
     retryable: true,
   });
+}
+
+interface ModelDeleteLeases {
+  leaseId: string;
+  downloadPaths: string[];
+  sdModelPath: string | null;
+}
+
+async function acquireModelDeleteLeases(
+  bridge: DesktopBridge,
+  downloadPaths: string[],
+  sdModelPath: string | null,
+): Promise<ModelDeleteLeases> {
+  const leases: ModelDeleteLeases = {
+    leaseId: randomUUID(),
+    downloadPaths: [],
+    sdModelPath: null,
+  };
+  if (downloadPaths.length > 0) {
+    const response = await bridgeFetch(bridge, "/hf-download-delete-lease-acquire", {
+      method: "POST",
+      body: JSON.stringify({ leaseId: leases.leaseId, destinations: downloadPaths }),
+      signal: AbortSignal.timeout(15_000),
+    }).catch(() => null);
+    if (!response) {
+      throw new ApiError({
+        status: 503,
+        code: "bridge_unreachable",
+        message: "Could not coordinate model deletion with the desktop runtime.",
+        retryable: true,
+      });
+    }
+    if (!response.ok) {
+      throw new ApiError({
+        status: 409,
+        code: "model_delete_in_progress",
+        message: "This model is already being changed. Try again.",
+        retryable: true,
+      });
+    }
+    leases.downloadPaths = downloadPaths;
+  }
+  if (sdModelPath) {
+    const response = await bridgeFetch(bridge, "/sd-delete-lease-acquire", {
+      method: "POST",
+      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: sdModelPath }),
+      signal: AbortSignal.timeout(15_000),
+    }).catch(() => null);
+    if (!response) {
+      await releaseModelDeleteLeases(bridge, leases);
+      throw new ApiError({
+        status: 503,
+        code: "bridge_unreachable",
+        message: "Could not coordinate image-model deletion with the desktop runtime.",
+        retryable: true,
+      });
+    }
+    if (!response.ok) {
+      await releaseModelDeleteLeases(bridge, leases);
+      throw new ApiError({
+        status: 409,
+        code: "model_delete_in_progress",
+        message: "This image model is already being changed. Try again.",
+        retryable: true,
+      });
+    }
+    leases.sdModelPath = sdModelPath;
+  }
+  return leases;
+}
+
+async function releaseModelDeleteLeases(
+  bridge: DesktopBridge,
+  leases: ModelDeleteLeases,
+): Promise<void> {
+  const releases: Promise<unknown>[] = [];
+  if (leases.downloadPaths.length > 0) {
+    releases.push(bridgeFetch(bridge, "/hf-download-delete-lease-release", {
+      method: "POST",
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        destinations: leases.downloadPaths,
+      }),
+      signal: AbortSignal.timeout(5_000),
+    }));
+  }
+  if (leases.sdModelPath) {
+    releases.push(bridgeFetch(bridge, "/sd-delete-lease-release", {
+      method: "POST",
+      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.sdModelPath }),
+      signal: AbortSignal.timeout(5_000),
+    }));
+  }
+  await Promise.allSettled(releases);
 }
 
 async function stopActiveLlama(
@@ -254,15 +271,21 @@ async function stopActiveSd(bridge: DesktopBridge, modelPath: string | null): Pr
   }
   const status = (await response.json().catch(() => null)) as SdStatus | null;
   if (!status?.running) return;
+  const [expectedPath, activePath] = await Promise.all([
+    modelPath ? fs.realpath(modelPath).catch(() => path.resolve(modelPath)) : null,
+    status.modelPath
+      ? fs.realpath(status.modelPath).catch(() => path.resolve(status.modelPath!))
+      : null,
+  ]);
   if (
-    !modelPath
-    || !status.modelPath
-    || path.resolve(status.modelPath) !== path.resolve(modelPath)
+    !expectedPath
+    || !activePath
+    || activePath !== expectedPath
   ) return;
 
   const stopResponse = await bridgeFetch(bridge, "/sd-stop", {
     method: "POST",
-    body: JSON.stringify({ modelPath: status.modelPath }),
+    body: JSON.stringify({ modelPath }),
     signal: AbortSignal.timeout(15_000),
   });
   if (!stopResponse.ok) {
@@ -379,20 +402,37 @@ export async function DELETE(
     const modelPath = catalogEntry
       ? modelCachePath(catalogEntry.runtimeTarget, catalogEntry.fileName || catalogEntry.id)
       : imported?.modelPath ?? null;
-    if (
-      imported?.jobId
-      && ACTIVE_DOWNLOAD_STATUSES.has(String(imported.status))
-    ) {
-      if (!bridge) {
-        throw new ApiError({
-          status: 503,
-          code: "bridge_unreachable",
-          message: "Could not verify the model download before removing it.",
-          retryable: true,
-        });
+    const downloadablePaths = catalogEntry
+      ? catalogModelFiles(catalogEntry).map(({ fileName }) =>
+        modelCachePath(catalogEntry.runtimeTarget, fileName))
+      : imported?.source === "huggingface-url"
+        ? [imported.modelPath]
+        : [];
+    const isSdModel = catalogEntry?.runtimeTarget === "sd-cpp"
+      || imported?.runtimeTarget === "sd-cpp";
+    let leases: ModelDeleteLeases | null = null;
+    if (bridge) {
+      try {
+        leases = await acquireModelDeleteLeases(
+          bridge,
+          downloadablePaths,
+          isSdModel ? modelPath : null,
+        );
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== "bridge_unreachable") throw error;
+        warnings.push("runtime_delete_lease_unavailable");
       }
-      // Active Hugging Face work must settle before managed files are removed.
-      await cancelActiveImport(bridge, imported);
+    }
+    try {
+    if (bridge && downloadablePaths.length > 0) {
+      try {
+        await settleActiveDownloadsForPaths(bridge, downloadablePaths);
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== "bridge_unreachable") throw error;
+        warnings.push("download_not_stopped");
+      }
+    } else if (downloadablePaths.length > 0) {
+      warnings.push("download_not_stopped");
     }
     if (catalogEntry?.runtimeTarget === "llama-cpp" || imported?.runtimeTarget === "llama-cpp") {
       if (bridge) {
@@ -405,7 +445,7 @@ export async function DELETE(
         warnings.push("runtime_not_stopped");
       }
     }
-    if (catalogEntry?.runtimeTarget === "sd-cpp" || imported?.runtimeTarget === "sd-cpp") {
+    if (isSdModel) {
       if (bridge) {
         try {
           // A positively identified active run must settle before its file is removed.
@@ -427,20 +467,27 @@ export async function DELETE(
     let removedFiles = 0;
     try {
       if (imported?.source === "local-path" && deleteExternalFile) {
-        stagedExternal = await stageImportedExternalFile(imported);
+        stagedExternal = await stageImportedExternalModelFile(imported);
+        if (stagedExternal.preservedChangedFile) {
+          warnings.push("external_file_changed_preserved");
+        }
       }
       removedFiles = await removeManagedModelFiles(paths);
-      if (imported) await removeImportedModel(modelId);
       clearedDefaults = await clearDeletedModelDefaults(owner.id, modelId);
-      if (stagedExternal) removedFiles += await commitImportedExternalFile(stagedExternal);
+      if (imported) await removeImportedModel(modelId);
+      if (stagedExternal) {
+        removedFiles += await commitImportedExternalModelFile(stagedExternal);
+      }
     } catch (error) {
       if (stagedExternal && imported) {
-        const rollback = await Promise.allSettled([
-          rollbackImportedExternalFile(stagedExternal),
-          upsertImportedModel(imported),
-          ...(clearedDefaults ? [restoreDeletedModelDefaults(owner.id, clearedDefaults)] : []),
-        ]);
-        if (rollback.some((result) => result.status === "rejected")) {
+        try {
+          const restored = await rollbackImportedExternalModelFile(stagedExternal, imported);
+          await upsertImportedModel(restored);
+          if (clearedDefaults) {
+            await restoreDeletedModelDefaults(owner.id, clearedDefaults);
+          }
+          await finishImportedExternalModelRollback(stagedExternal);
+        } catch {
           throw new ApiError({
             status: 503,
             code: "external_model_delete_rollback_failed",
@@ -458,10 +505,14 @@ export async function DELETE(
       modelId,
       removedFiles,
       unregistered: Boolean(imported),
-      preservedExternalFile: imported?.source === "local-path" && !deleteExternalFile,
+      preservedExternalFile: imported?.source === "local-path"
+        && (!deleteExternalFile || Boolean(stagedExternal?.preservedChangedFile)),
       clearedDefaults: clearedDefaults?.cleared ?? [],
       warnings,
     });
+    } finally {
+      if (bridge && leases) await releaseModelDeleteLeases(bridge, leases);
+    }
   } catch (error) {
     return jsonError(error);
   }

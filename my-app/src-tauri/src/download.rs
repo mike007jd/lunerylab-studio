@@ -28,7 +28,7 @@ pub(crate) struct DownloadJob {
     pub(crate) received: u64,
     pub(crate) total: u64,
     pub(crate) error: Option<String>,
-    destination: PathBuf,
+    pub(crate) destination: PathBuf,
     owns_destination: bool,
     finished_at: Option<Instant>,
     pub(crate) cancel: Arc<AtomicBool>,
@@ -49,11 +49,100 @@ impl DownloadJob {
 
 /// Shared download state — managed via Tauri's app.manage() AND arc-cloned into
 /// bridge handler threads so the SSE path can drain progress from the same store.
+struct DestinationDeleteLease {
+    lease_id: String,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
-pub struct DownloadState(pub(crate) Mutex<HashMap<String, DownloadJob>>);
+pub struct DownloadState(
+    pub(crate) Mutex<HashMap<String, DownloadJob>>,
+    Mutex<HashMap<PathBuf, DestinationDeleteLease>>,
+);
 
 const TERMINAL_HISTORY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_TERMINAL_HISTORY: usize = 128;
+const DESTINATION_DELETE_LEASE_TTL: Duration = Duration::from_secs(60);
+
+impl DownloadState {
+    fn reserve_job(
+        &self,
+        job_id: &str,
+        destination: PathBuf,
+        cancel: Arc<AtomicBool>,
+        tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+    ) -> Result<(), String> {
+        let now = Instant::now();
+        let mut deletion_leases = self
+            .1
+            .lock()
+            .map_err(|_| "Download deletion lease lock poisoned".to_string())?;
+        deletion_leases.retain(|_, lease| lease.expires_at > now);
+        if deletion_leases.contains_key(&destination) {
+            return Err("Model file is being deleted".to_string());
+        }
+        let mut jobs = self
+            .0
+            .lock()
+            .map_err(|_| "Download state lock poisoned".to_string())?;
+        reserve_download_job(&mut jobs, job_id, destination, cancel, tx)
+    }
+
+    pub(crate) fn acquire_destination_delete_lease(
+        &self,
+        destination: PathBuf,
+        lease_id: &str,
+    ) -> Result<(), String> {
+        let now = Instant::now();
+        let mut leases = self
+            .1
+            .lock()
+            .map_err(|_| "Download deletion lease lock poisoned".to_string())?;
+        leases.retain(|_, lease| lease.expires_at > now);
+        if let Some(existing) = leases.get(&destination) {
+            if existing.lease_id != lease_id {
+                return Err("Model file is already being deleted".to_string());
+            }
+        }
+        leases.insert(
+            destination,
+            DestinationDeleteLease {
+                lease_id: lease_id.to_string(),
+                expires_at: now + DESTINATION_DELETE_LEASE_TTL,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn release_destination_delete_lease(&self, destination: &Path, lease_id: &str) {
+        if let Ok(mut leases) = self.1.lock() {
+            if leases.get(destination).map(|lease| lease.lease_id.as_str()) == Some(lease_id) {
+                leases.remove(destination);
+            }
+        }
+    }
+}
+
+pub(crate) fn canonical_download_destination(value: &str) -> Result<PathBuf, String> {
+    let destination = validate_hf_download_dest(value)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "Download destination must include a parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not create model directory: {err}"))?;
+    let root = canonical_models_root_for_path(&destination)?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|err| format!("Could not verify model directory: {err}"))?;
+    if !parent.starts_with(&root) {
+        return Err("Download destination escapes the model directory".to_string());
+    }
+    Ok(parent.join(
+        destination
+            .file_name()
+            .ok_or_else(|| "Download destination must point to a file".to_string())?,
+    ))
+}
 
 /// Synchronous entry point for starting a download job — called from the bridge
 /// handler. Validates state, inserts the job record, then spawns an async task
@@ -96,42 +185,13 @@ pub(crate) fn hf_download_start_inner(
         }
     }
 
-    // Create destination parent directory.
-    let parent = dest_path
-        .parent()
-        .ok_or_else(|| "Download destination must include a parent directory".to_string())?;
-    std::fs::create_dir_all(parent)
-        .map_err(|err| format!("Could not create model directory: {err}"))?;
-    let root = canonical_models_root_for_path(&dest_path)?;
-    let parent_canon = parent
-        .canonicalize()
-        .map_err(|err| format!("Could not verify model directory: {err}"))?;
-    if !parent_canon.starts_with(&root) {
-        return Err("Download destination escapes the model directory".to_string());
-    }
-    let destination = parent_canon.join(
-        dest_path
-            .file_name()
-            .ok_or_else(|| "Download destination must point to a file".to_string())?,
-    );
+    let destination = canonical_download_destination(&dest)?;
 
     // Set up a broadcast channel for SSE progress ticks (capacity 64 frames).
     let (tx, _) = tokio::sync::broadcast::channel::<JobSnapshot>(64);
     let cancel = Arc::new(AtomicBool::new(false));
 
-    {
-        let mut guard = state
-            .0
-            .lock()
-            .map_err(|_| "Download state lock poisoned".to_string())?;
-        reserve_download_job(
-            &mut guard,
-            &job_id,
-            destination,
-            Arc::clone(&cancel),
-            tx.clone(),
-        )?;
-    }
+    state.reserve_job(&job_id, destination, Arc::clone(&cancel), tx.clone())?;
 
     let state_clone = Arc::clone(&state);
     tauri::async_runtime::spawn(async move {
@@ -1048,6 +1108,35 @@ mod tests {
         } else {
             std::env::remove_var(name);
         }
+    }
+
+    #[test]
+    fn destination_delete_lease_closes_the_download_start_race() {
+        let state = DownloadState::default();
+        let destination = unique_test_path("leased-download.gguf");
+        state
+            .acquire_destination_delete_lease(destination.clone(), "delete-lease")
+            .expect("acquire delete lease");
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+
+        assert!(state
+            .reserve_job(
+                "blocked-job",
+                destination.clone(),
+                Arc::new(AtomicBool::new(false)),
+                tx.clone(),
+            )
+            .is_err());
+
+        state.release_destination_delete_lease(&destination, "delete-lease");
+        state
+            .reserve_job(
+                "allowed-job",
+                destination,
+                Arc::new(AtomicBool::new(false)),
+                tx,
+            )
+            .expect("released lease allows a new download");
     }
 
     #[test]

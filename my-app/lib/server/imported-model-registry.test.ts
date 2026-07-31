@@ -123,4 +123,86 @@ describe("imported-model-registry profile paths", () => {
       error: "The model path must point to a file.",
     });
   });
+
+  it("recovers a staged external deletion after a process crash", async () => {
+    const modelPath = path.join(tmpDir, "external", "recover.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "original-model");
+    const registry = await import("@/lib/server/imported-model-registry");
+    const resolved = await registry.resolveLocalModelPath(modelPath);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const imported = record({
+      id: "imported-llama-cpp-recover-12345678",
+      source: "local-path",
+      modelPath,
+      fileName: path.basename(modelPath),
+      sizeBytes: resolved.sizeBytes,
+      fileIdentity: resolved.fileIdentity,
+    });
+    await registry.upsertImportedModel(imported);
+
+    const staged = await registry.stageImportedExternalModelFile(imported);
+    expect(staged.hadFile).toBe(true);
+    expect(fs.existsSync(modelPath)).toBe(false);
+    expect(fs.existsSync(staged.stagedPath)).toBe(true);
+
+    await registry.reconcileExternalModelDeleteJournals();
+
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("original-model");
+    expect(fs.existsSync(staged.stagedPath)).toBe(false);
+    await expect(registry.findImportedModel(imported.id)).resolves.toMatchObject({
+      modelPath,
+    });
+  });
+
+  it("never overwrites a replacement while rolling back an external deletion", async () => {
+    const modelPath = path.join(tmpDir, "external", "collision.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "original-model");
+    const registry = await import("@/lib/server/imported-model-registry");
+    const resolved = await registry.resolveLocalModelPath(modelPath);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const imported = record({
+      id: "imported-llama-cpp-collision-12345678",
+      source: "local-path",
+      modelPath,
+      fileName: path.basename(modelPath),
+      sizeBytes: resolved.sizeBytes,
+      fileIdentity: resolved.fileIdentity,
+    });
+    await registry.upsertImportedModel(imported);
+    const staged = await registry.stageImportedExternalModelFile(imported);
+    fs.writeFileSync(modelPath, "replacement-model");
+
+    const restored = await registry.rollbackImportedExternalModelFile(staged, imported);
+    await registry.upsertImportedModel(restored);
+    await registry.finishImportedExternalModelRollback(staged);
+
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("replacement-model");
+    expect(restored.modelPath).not.toBe(modelPath);
+    expect(fs.readFileSync(restored.modelPath, "utf8")).toBe("original-model");
+  });
+
+  it("unregisters a changed external file without staging or deleting it", async () => {
+    const modelPath = path.join(tmpDir, "external", "changed.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "original-model");
+    const registry = await import("@/lib/server/imported-model-registry");
+    const resolved = await registry.resolveLocalModelPath(modelPath);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const imported = record({
+      id: "imported-llama-cpp-changed-12345678",
+      source: "local-path",
+      modelPath,
+      fileName: path.basename(modelPath),
+      sizeBytes: resolved.sizeBytes,
+      fileIdentity: resolved.fileIdentity,
+    });
+    fs.writeFileSync(modelPath, "replacement-model-with-new-identity");
+
+    const staged = await registry.stageImportedExternalModelFile(imported);
+
+    expect(staged).toMatchObject({ hadFile: false, preservedChangedFile: true });
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("replacement-model-with-new-identity");
+  });
 });

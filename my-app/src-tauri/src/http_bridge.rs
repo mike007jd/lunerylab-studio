@@ -7,15 +7,17 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::download::{hf_download_start_inner, DownloadState, JobSnapshot};
+use crate::download::{
+    canonical_download_destination, hf_download_start_inner, DownloadState, JobSnapshot,
+};
 use crate::engine_llama::{bridge_start_llama, bridge_stop_llama, llama_engine_slot};
 use crate::engine_mlx::{
     bridge_start_mlx, bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot,
 };
 use crate::engine_sd::{
-    bridge_cancel_sd, bridge_finish_sd, bridge_sd_generate, bridge_stop_sd_if_model_path,
-    sd_active_model_path, sd_binary_path, sd_progress_for_run, valid_sd_run_id, SdGenerateBody,
-    SdProgressPhase,
+    acquire_sd_model_delete_lease, bridge_cancel_sd, bridge_finish_sd, bridge_sd_generate,
+    bridge_stop_sd_if_model_path, release_sd_model_delete_lease, sd_active_model_path,
+    sd_binary_path, sd_progress_for_run, valid_sd_run_id, SdGenerateBody, SdProgressPhase,
 };
 use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
@@ -664,6 +666,7 @@ fn handle_bridge_request(
                             serde_json::json!({
                                 "jobId": id,
                                 "status": job.status,
+                                "destination": job.destination,
                                 "received": job.received,
                                 "total": job.total,
                                 "error": job.error,
@@ -674,6 +677,78 @@ fn handle_bridge_request(
                 .unwrap_or_default();
             let payload = serde_json::json!({ "jobs": list }).to_string();
             write_http_response(&mut stream, "200 OK", &payload);
+        }
+        ("POST", "/hf-download-delete-lease-acquire") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                destinations: Vec<String>,
+            }
+            let result = serde_json::from_str::<LeaseBody>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(|lease| {
+                    if lease.lease_id.is_empty()
+                        || lease.lease_id.len() > 128
+                        || lease.destinations.is_empty()
+                        || lease.destinations.len() > 16
+                    {
+                        return Err("Invalid model deletion lease".to_string());
+                    }
+                    let destinations = lease
+                        .destinations
+                        .iter()
+                        .map(|value| canonical_download_destination(value))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut acquired: Vec<std::path::PathBuf> = Vec::new();
+                    for destination in destinations {
+                        if let Err(error) = download_state
+                            .acquire_destination_delete_lease(destination.clone(), &lease.lease_id)
+                        {
+                            for prior in &acquired {
+                                download_state
+                                    .release_destination_delete_lease(prior, &lease.lease_id);
+                            }
+                            return Err(error);
+                        }
+                        acquired.push(destination);
+                    }
+                    Ok(())
+                });
+            match result {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "acquired": true }).to_string(),
+                ),
+                Err(error) => bridge_error(&mut stream, "409 Conflict", &error),
+            }
+        }
+        ("POST", "/hf-download-delete-lease-release") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                destinations: Vec<String>,
+            }
+            match serde_json::from_str::<LeaseBody>(&body) {
+                Ok(lease) => {
+                    for destination in lease
+                        .destinations
+                        .iter()
+                        .filter_map(|value| canonical_download_destination(value).ok())
+                    {
+                        download_state
+                            .release_destination_delete_lease(&destination, &lease.lease_id);
+                    }
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "released": true }).to_string(),
+                    );
+                }
+                Err(error) => bridge_error(&mut stream, "400 Bad Request", &error.to_string()),
+            }
         }
         ("POST", "/llama-start") => {
             #[derive(Deserialize)]
@@ -720,6 +795,44 @@ fn handle_bridge_request(
                 }) {
                 Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        ("POST", "/sd-delete-lease-acquire") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(|lease| acquire_sd_model_delete_lease(&lease.model_path, &lease.lease_id))
+            {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "acquired": true }).to_string(),
+                ),
+                Err(error) => bridge_error(&mut stream, "409 Conflict", &error),
+            }
+        }
+        ("POST", "/sd-delete-lease-release") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body) {
+                Ok(lease) => {
+                    release_sd_model_delete_lease(&lease.model_path, &lease.lease_id);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "released": true }).to_string(),
+                    );
+                }
+                Err(error) => bridge_error(&mut stream, "400 Bad Request", &error.to_string()),
             }
         }
         ("GET", "/sd-status") => {

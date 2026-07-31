@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -37,33 +37,111 @@ fn sd_progress_slot() -> &'static Mutex<Option<SdProgress>> {
     SD_PROGRESS.get_or_init(|| Mutex::new(None))
 }
 
-static SD_ACTIVE_MODEL_PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-fn sd_active_model_path_slot() -> &'static Mutex<Option<String>> {
-    SD_ACTIVE_MODEL_PATH.get_or_init(|| Mutex::new(None))
+struct SdModelDeleteLease {
+    lease_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct SdModelState {
+    active_path: Option<String>,
+    delete_leases: HashMap<String, SdModelDeleteLease>,
+}
+
+static SD_MODEL_STATE: OnceLock<Mutex<SdModelState>> = OnceLock::new();
+fn sd_model_state() -> &'static Mutex<SdModelState> {
+    SD_MODEL_STATE.get_or_init(|| Mutex::new(SdModelState::default()))
+}
+
+fn normalize_sd_model_path(value: &str) -> String {
+    std::fs::canonicalize(value)
+        .unwrap_or_else(|_| PathBuf::from(value))
+        .to_string_lossy()
+        .to_string()
 }
 
 pub(crate) fn sd_active_model_path() -> Option<String> {
-    sd_active_model_path_slot()
+    sd_model_state()
         .lock()
         .ok()
-        .and_then(|path| path.clone())
+        .and_then(|state| state.active_path.clone())
 }
 
-struct ActiveSdModelGuard;
+pub(crate) fn acquire_sd_model_delete_lease(
+    model_path: &str,
+    lease_id: &str,
+) -> Result<(), String> {
+    if lease_id.is_empty() || lease_id.len() > 128 {
+        return Err("Invalid SD model deletion lease".to_string());
+    }
+    let model_path = normalize_sd_model_path(model_path);
+    let now = Instant::now();
+    let mut state = sd_model_state()
+        .lock()
+        .map_err(|_| "SD model state lock poisoned".to_string())?;
+    state
+        .delete_leases
+        .retain(|_, lease| lease.expires_at > now);
+    if let Some(existing) = state.delete_leases.get(&model_path) {
+        if existing.lease_id != lease_id {
+            return Err("Image model is already being deleted".to_string());
+        }
+    }
+    state.delete_leases.insert(
+        model_path,
+        SdModelDeleteLease {
+            lease_id: lease_id.to_string(),
+            expires_at: now + Duration::from_secs(60),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn release_sd_model_delete_lease(model_path: &str, lease_id: &str) {
+    let model_path = normalize_sd_model_path(model_path);
+    if let Ok(mut state) = sd_model_state().lock() {
+        if state
+            .delete_leases
+            .get(&model_path)
+            .map(|lease| lease.lease_id.as_str())
+            == Some(lease_id)
+        {
+            state.delete_leases.remove(&model_path);
+        }
+    }
+}
+
+struct ActiveSdModelGuard {
+    model_path: Option<String>,
+}
 
 impl ActiveSdModelGuard {
-    fn set(path: Option<String>) -> Self {
-        if let Ok(mut active) = sd_active_model_path_slot().lock() {
-            *active = path;
+    fn set(path: Option<String>) -> Result<Self, String> {
+        let path = path.map(|value| normalize_sd_model_path(&value));
+        let now = Instant::now();
+        let mut state = sd_model_state()
+            .lock()
+            .map_err(|_| "SD model state lock poisoned".to_string())?;
+        state
+            .delete_leases
+            .retain(|_, lease| lease.expires_at > now);
+        if path
+            .as_ref()
+            .is_some_and(|model_path| state.delete_leases.contains_key(model_path))
+        {
+            return Err("Image model is being deleted".to_string());
         }
-        Self
+        state.active_path = path.clone();
+        Ok(Self { model_path: path })
     }
 }
 
 impl Drop for ActiveSdModelGuard {
     fn drop(&mut self) {
-        if let Ok(mut active) = sd_active_model_path_slot().lock() {
-            *active = None;
+        if let Ok(mut state) = sd_model_state().lock() {
+            if state.active_path == self.model_path {
+                state.active_path = None;
+            }
         }
     }
 }
@@ -257,11 +335,12 @@ pub(crate) fn bridge_stop_sd() {
 }
 
 pub(crate) fn bridge_stop_sd_if_model_path(expected_model_path: &str) -> bool {
+    let expected_model_path = normalize_sd_model_path(expected_model_path);
     {
-        let Ok(active) = sd_active_model_path_slot().lock() else {
+        let Ok(state) = sd_model_state().lock() else {
             return false;
         };
-        if active.as_deref() != Some(expected_model_path) {
+        if state.active_path.as_deref() != Some(expected_model_path.as_str()) {
             return false;
         }
     }
@@ -269,7 +348,7 @@ pub(crate) fn bridge_stop_sd_if_model_path(expected_model_path: &str) -> bool {
     // finish and clear its guard. The generate lock still serializes batches.
     bridge_stop_sd();
     for _ in 0..200 {
-        if sd_active_model_path().as_deref() != Some(expected_model_path) {
+        if sd_active_model_path().as_deref() != Some(expected_model_path.as_str()) {
             return true;
         }
         thread::sleep(Duration::from_millis(10));
@@ -534,7 +613,7 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
         body.runs
             .first()
             .and_then(|argv| sd_model_path_from_argv(argv)),
-    );
+    )?;
 
     // Fresh batch: replace stale progress, clear the global cancel bit from the
     // prior run, and bound the WHOLE
@@ -893,10 +972,11 @@ fn sd_model_path_from_argv(argv: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_sd_run, bridge_cancel_sd, bridge_stop_sd, bridge_stop_sd_if_model_path,
-        queue_pending_cancel, sd_active_model_path, sd_cancel_flag, sd_inflight_child,
-        sd_model_id_from_argv, sd_progress_for_run, set_sd_image_phase, set_sd_progress,
-        validate_sd_run_argv, ActiveSdModelGuard, SdProgress, SdProgressParser, SdProgressPhase,
+        acquire_sd_model_delete_lease, begin_sd_run, bridge_cancel_sd, bridge_stop_sd,
+        bridge_stop_sd_if_model_path, queue_pending_cancel, release_sd_model_delete_lease,
+        sd_active_model_path, sd_cancel_flag, sd_inflight_child, sd_model_id_from_argv,
+        sd_progress_for_run, set_sd_image_phase, set_sd_progress, validate_sd_run_argv,
+        ActiveSdModelGuard, SdProgress, SdProgressParser, SdProgressPhase,
     };
     use crate::test_global_lock;
     use std::sync::atomic::Ordering;
@@ -929,7 +1009,8 @@ mod tests {
         let _g = test_global_lock();
         sd_cancel_flag().store(false, Ordering::SeqCst);
         let worker = std::thread::spawn(|| {
-            let _active = ActiveSdModelGuard::set(Some("/models/current.safetensors".to_string()));
+            let _active = ActiveSdModelGuard::set(Some("/models/current.safetensors".to_string()))
+                .expect("active model is not leased for deletion");
             while !sd_cancel_flag().load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -959,6 +1040,23 @@ mod tests {
         sd_cancel_flag().store(true, Ordering::SeqCst);
         assert!(sd_cancel_flag().load(Ordering::SeqCst));
         sd_cancel_flag().store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn deletion_lease_closes_the_sd_start_race() {
+        let _g = test_global_lock();
+        let model_path = "/models/deleting.safetensors";
+        acquire_sd_model_delete_lease(model_path, "delete-lease").expect("acquire delete lease");
+
+        assert!(ActiveSdModelGuard::set(Some(model_path.to_string())).is_err());
+        assert!(sd_active_model_path().is_none());
+
+        release_sd_model_delete_lease(model_path, "delete-lease");
+        let active = ActiveSdModelGuard::set(Some(model_path.to_string()))
+            .expect("released lease allows generation");
+        assert_eq!(sd_active_model_path().as_deref(), Some(model_path));
+        drop(active);
+        assert!(sd_active_model_path().is_none());
     }
 
     #[test]

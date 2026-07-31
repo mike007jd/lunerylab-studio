@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { accessSync, constants, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  lstatSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { NextResponse } from "next/server";
@@ -9,12 +18,16 @@ const mocks = vi.hoisted(() => ({
   isDesktopRuntime: vi.fn(),
   findHfModelEntry: vi.fn(),
   bridgeFetch: vi.fn(),
-  getBridgeDownloadStatus: vi.fn(),
+  getBridgeDownloadJobs: vi.fn(),
   requireDesktopBridge: vi.fn(),
   findImportedModel: vi.fn(),
   modelCachePath: vi.fn(),
   removeImportedModel: vi.fn(),
   upsertImportedModel: vi.fn(),
+  stageImportedExternalModelFile: vi.fn(),
+  rollbackImportedExternalModelFile: vi.fn(),
+  finishImportedExternalModelRollback: vi.fn(),
+  commitImportedExternalModelFile: vi.fn(),
   catalogModelFiles: vi.fn(),
   removeManagedModelFiles: vi.fn(),
   invalidateLocalModelInstallStatusCache: vi.fn(),
@@ -33,7 +46,7 @@ vi.mock("@/lib/hf-model-catalog", () => ({
 
 vi.mock("@/lib/server/desktop-bridge", () => ({
   bridgeFetch: mocks.bridgeFetch,
-  getBridgeDownloadStatus: mocks.getBridgeDownloadStatus,
+  getBridgeDownloadJobs: mocks.getBridgeDownloadJobs,
   requireDesktopBridge: mocks.requireDesktopBridge,
 }));
 
@@ -42,6 +55,10 @@ vi.mock("@/lib/server/imported-model-registry", () => ({
   modelCachePath: mocks.modelCachePath,
   removeImportedModel: mocks.removeImportedModel,
   upsertImportedModel: mocks.upsertImportedModel,
+  stageImportedExternalModelFile: mocks.stageImportedExternalModelFile,
+  rollbackImportedExternalModelFile: mocks.rollbackImportedExternalModelFile,
+  finishImportedExternalModelRollback: mocks.finishImportedExternalModelRollback,
+  commitImportedExternalModelFile: mocks.commitImportedExternalModelFile,
 }));
 
 vi.mock("@/lib/server/local-model-files", () => ({
@@ -110,8 +127,49 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     mocks.upsertImportedModel.mockResolvedValue(undefined);
     mocks.catalogModelFiles.mockReturnValue([]);
     mocks.removeManagedModelFiles.mockResolvedValue(0);
-    mocks.getBridgeDownloadStatus.mockResolvedValue({ status: "ready" });
-    mocks.bridgeFetch.mockResolvedValue(Response.json({ ok: true }));
+    mocks.getBridgeDownloadJobs.mockResolvedValue([]);
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint === "/llama-status" || endpoint === "/sd-status") {
+        return Response.json({ running: false });
+      }
+      return Response.json({ ok: true, acquired: true, released: true, stopped: true });
+    });
+    mocks.stageImportedExternalModelFile.mockImplementation(async (record) => {
+      const identity = record.fileIdentity;
+      const stat = lstatSync(record.modelPath, { bigint: true });
+      if (!identity
+        || stat.dev.toString() !== identity.device
+        || stat.ino.toString() !== identity.inode
+        || stat.size.toString() !== identity.sizeBytes
+        || stat.mtimeNs.toString() !== identity.modifiedAtNs) {
+        return {
+          originalPath: record.modelPath,
+          stagedPath: "",
+          journalPath: "",
+          hadFile: false,
+          preservedChangedFile: true,
+        };
+      }
+      const stagedPath = `${record.modelPath}.test-stage`;
+      renameSync(record.modelPath, stagedPath);
+      return {
+        originalPath: record.modelPath,
+        stagedPath,
+        journalPath: `${stagedPath}.json`,
+        hadFile: true,
+        preservedChangedFile: false,
+      };
+    });
+    mocks.commitImportedExternalModelFile.mockImplementation(async (stage) => {
+      if (!stage.hadFile) return 0;
+      unlinkSync(stage.stagedPath);
+      return 1;
+    });
+    mocks.rollbackImportedExternalModelFile.mockImplementation(async (stage, record) => {
+      if (stage.hadFile) renameSync(stage.stagedPath, stage.originalPath);
+      return record;
+    });
+    mocks.finishImportedExternalModelRollback.mockResolvedValue(undefined);
   });
 
   it("keeps model deletion desktop-only even when the native bridge is unavailable", async () => {
@@ -180,7 +238,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     await expect(response.json()).resolves.toMatchObject({
       deleted: true,
       removedFiles: 1,
-      warnings: ["runtime_not_stopped"],
+      warnings: ["download_not_stopped", "runtime_not_stopped"],
     });
   });
 
@@ -237,7 +295,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     expect(() => writeFileSync(modelPath, "replacement", { flag: "wx" })).not.toThrow();
   });
 
-  it("refuses a confirmed external delete when the imported path was replaced", async () => {
+  it("unregisters a replaced external file without deleting the replacement", async () => {
     tempRoot = mkdtempSync(path.join(tmpdir(), "lunery-external-model-delete-fail-"));
     const modelPath = tempRoot;
     mocks.findImportedModel.mockResolvedValue({
@@ -254,12 +312,13 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       confirmation: EXTERNAL_MODEL_DELETE_CONFIRMATION,
     });
 
-    expect(response.status).toBe(409);
+    expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      code: "external_model_file_changed",
-      retryable: false,
+      deleted: true,
+      preservedExternalFile: true,
+      warnings: ["external_file_changed_preserved"],
     });
-    expect(mocks.removeImportedModel).not.toHaveBeenCalled();
+    expect(mocks.removeImportedModel).toHaveBeenCalled();
     expect(() => accessSync(modelPath, constants.F_OK)).not.toThrow();
   });
 
@@ -334,7 +393,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     await expect(response.json()).resolves.toMatchObject({
       deleted: true,
       removedFiles: 2,
-      warnings: ["runtime_not_stopped"],
+      warnings: ["download_not_stopped", "runtime_not_stopped"],
     });
     expect(mocks.bridgeFetch).not.toHaveBeenCalled();
   });
@@ -356,7 +415,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     await expect(response.json()).resolves.toMatchObject({
       deleted: true,
       removedFiles: 2,
-      warnings: ["runtime_not_stopped"],
+      warnings: ["runtime_delete_lease_unavailable", "runtime_not_stopped"],
     });
   });
 
@@ -370,21 +429,19 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       jobId: "job-1",
       status: "ready",
     });
-    mocks.getBridgeDownloadStatus.mockResolvedValue({ status: "ready" });
-    mocks.bridgeFetch
-      .mockResolvedValueOnce(Response.json({ running: true, modelId }))
-      .mockResolvedValueOnce(Response.json({ ok: true }));
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint === "/llama-status") return Response.json({ running: true, modelId });
+      return Response.json({ ok: true, acquired: true, released: true });
+    });
 
     const response = await request(modelId);
     expect(response.status).toBe(200);
-    expect(mocks.bridgeFetch).toHaveBeenNthCalledWith(
-      1,
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
       bridge,
       "/llama-status",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-    expect(mocks.bridgeFetch).toHaveBeenNthCalledWith(
-      2,
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
       bridge,
       "/llama-stop",
       expect.objectContaining({ method: "POST" }),
@@ -405,9 +462,17 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       jobId: "job-active",
       status: "downloading",
     });
-    mocks.getBridgeDownloadStatus
-      .mockResolvedValueOnce({ status: "downloading" })
-      .mockResolvedValueOnce({ status: "canceled" });
+    mocks.getBridgeDownloadJobs
+      .mockResolvedValueOnce([{
+        jobId: "job-active",
+        status: "downloading",
+        destination: "/profile/models/llama-cpp/imported/download.gguf",
+      }])
+      .mockResolvedValueOnce([{
+        jobId: "job-active",
+        status: "canceled",
+        destination: "/profile/models/llama-cpp/imported/download.gguf",
+      }]);
     mocks.bridgeFetch.mockResolvedValue(Response.json({ ok: true, running: false }));
 
     const response = await request(modelId);
@@ -421,7 +486,49 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
         body: JSON.stringify({ jobId: "job-active" }),
       }),
     );
-    expect(mocks.getBridgeDownloadStatus).toHaveBeenCalledTimes(2);
+    expect(mocks.getBridgeDownloadJobs).toHaveBeenCalledTimes(2);
+    expect(mocks.removeManagedModelFiles).toHaveBeenCalledOnce();
+  });
+
+  it("finds and settles an active catalog download after client state was lost", async () => {
+    const modelPath = "/profile/models/llama-cpp/catalog.gguf";
+    mocks.findHfModelEntry.mockReturnValue({
+      id: "catalog-model",
+      runtimeTarget: "llama-cpp",
+      fileName: "catalog.gguf",
+    });
+    mocks.catalogModelFiles.mockReturnValue([{ fileName: "catalog.gguf" }]);
+    mocks.modelCachePath.mockReturnValue(modelPath);
+    mocks.getBridgeDownloadJobs
+      .mockResolvedValueOnce([{
+        jobId: "catalog-job",
+        status: "downloading",
+        destination: modelPath,
+      }])
+      .mockResolvedValueOnce([{
+        jobId: "catalog-job",
+        status: "canceled",
+        destination: modelPath,
+      }]);
+
+    const response = await request("catalog-model");
+
+    expect(response.status).toBe(200);
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/hf-download-delete-lease-acquire",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/hf-download-cancel",
+      expect.objectContaining({ body: JSON.stringify({ jobId: "catalog-job" }) }),
+    );
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/hf-download-delete-lease-release",
+      expect.objectContaining({ method: "POST" }),
+    );
     expect(mocks.removeManagedModelFiles).toHaveBeenCalledOnce();
   });
 
@@ -435,7 +542,11 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       jobId: "job-stuck",
       status: "downloading",
     });
-    mocks.getBridgeDownloadStatus.mockResolvedValue({ status: "downloading" });
+    mocks.getBridgeDownloadJobs.mockResolvedValue([{
+      jobId: "job-stuck",
+      status: "downloading",
+      destination: "/profile/models/llama-cpp/imported/download.gguf",
+    }]);
     mocks.bridgeFetch.mockResolvedValue(Response.json({ ok: true }));
 
     const response = await request(modelId);
@@ -458,21 +569,28 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       modelPath,
       status: "ready",
     });
-    mocks.bridgeFetch
-      .mockResolvedValueOnce(Response.json({ running: true, modelPath }))
-      .mockResolvedValueOnce(Response.json({ ok: true, stopped: true }));
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint === "/sd-status") return Response.json({ running: true, modelPath });
+      return Response.json({ ok: true, acquired: true, released: true, stopped: true });
+    });
 
     const response = await request(modelId);
 
     expect(response.status).toBe(200);
-    expect(mocks.bridgeFetch).toHaveBeenNthCalledWith(
-      1,
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/sd-delete-lease-acquire",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining(modelPath),
+      }),
+    );
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
       bridge,
       "/sd-status",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-    expect(mocks.bridgeFetch).toHaveBeenNthCalledWith(
-      2,
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
       bridge,
       "/sd-stop",
       expect.objectContaining({
@@ -484,6 +602,11 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       modelPath,
       `${modelPath}.part`,
     ]);
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/sd-delete-lease-release",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("refuses deletion when a matching SD runtime cannot be stopped", async () => {
@@ -496,9 +619,11 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       modelPath,
       status: "ready",
     });
-    mocks.bridgeFetch
-      .mockResolvedValueOnce(Response.json({ running: true, modelPath }))
-      .mockResolvedValueOnce(Response.json({ ok: true, stopped: false }));
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint === "/sd-status") return Response.json({ running: true, modelPath });
+      if (endpoint === "/sd-stop") return Response.json({ ok: true, stopped: false });
+      return Response.json({ ok: true, acquired: true, released: true });
+    });
 
     const response = await request(modelId);
 
