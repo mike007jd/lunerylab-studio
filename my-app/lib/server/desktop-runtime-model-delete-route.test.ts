@@ -3,9 +3,11 @@ import {
   accessSync,
   constants,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   renameSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -501,6 +503,45 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     );
     expect(mocks.getBridgeDownloadJobs).toHaveBeenCalledTimes(2);
     expect(mocks.removeManagedModelFiles).toHaveBeenCalledOnce();
+  });
+
+  it.runIf(process.platform !== "win32")("matches active downloads through a symlinked model root", async () => {
+    tempRoot = mkdtempSync(path.join(tmpdir(), "lunery-delete-symlink-"));
+    const physicalRoot = path.join(tempRoot, "physical-models");
+    const logicalRoot = path.join(tempRoot, "logical-models");
+    mkdirSync(physicalRoot, { recursive: true });
+    symlinkSync(physicalRoot, logicalRoot);
+    const logicalPath = path.join(logicalRoot, "download.gguf");
+    const physicalPath = path.join(physicalRoot, "download.gguf");
+    const modelId = "imported-llama-cpp-symlink-download-12345678";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath: logicalPath,
+      jobId: "job-symlink",
+      status: "downloading",
+    });
+    mocks.getBridgeDownloadJobs
+      .mockResolvedValueOnce([{
+        jobId: "job-symlink",
+        status: "downloading",
+        destination: physicalPath,
+      }])
+      .mockResolvedValueOnce([{
+        jobId: "job-symlink",
+        status: "canceled",
+        destination: physicalPath,
+      }]);
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(200);
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/hf-download-cancel",
+      expect.objectContaining({ body: JSON.stringify({ jobId: "job-symlink" }) }),
+    );
   });
 
   it("finds and settles an active catalog download after client state was lost", async () => {

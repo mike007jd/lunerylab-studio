@@ -69,11 +69,21 @@ function importedModelPaths(record: ImportedModelRecord): string[] {
   return [record.modelPath, `${record.modelPath}.part`];
 }
 
+async function canonicalModelPath(modelPath: string): Promise<string> {
+  const resolved = path.resolve(modelPath);
+  try {
+    return await fs.realpath(resolved);
+  } catch {
+    const parent = await fs.realpath(path.dirname(resolved)).catch(() => path.dirname(resolved));
+    return path.join(parent, path.basename(resolved));
+  }
+}
+
 async function settleActiveDownloadsForPaths(
   bridge: DesktopBridge,
   modelPaths: string[],
 ): Promise<void> {
-  const destinations = new Set(modelPaths.map((modelPath) => path.resolve(modelPath)));
+  const destinations = new Set(await Promise.all(modelPaths.map(canonicalModelPath)));
   const matchingActiveJobs = async () => {
     const jobs = await getBridgeDownloadJobs(bridge);
     if (!jobs) {
@@ -84,9 +94,10 @@ async function settleActiveDownloadsForPaths(
         retryable: true,
       });
     }
-    return jobs.filter((job) =>
+    const jobDestinations = await Promise.all(jobs.map((job) => canonicalModelPath(job.destination)));
+    return jobs.filter((job, index) =>
       ACTIVE_DOWNLOAD_STATUSES.has(job.status)
-      && destinations.has(path.resolve(job.destination))
+      && destinations.has(jobDestinations[index]!)
     );
   };
 

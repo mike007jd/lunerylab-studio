@@ -37,8 +37,14 @@ fn llama_model_state() -> &'static Mutex<LlamaModelState> {
 }
 
 fn normalize_llama_model_path(value: &str) -> String {
-    std::fs::canonicalize(value)
-        .unwrap_or_else(|_| PathBuf::from(value))
+    let path = PathBuf::from(value);
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical.to_string_lossy().to_string();
+    }
+    path.parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or(path)
         .to_string_lossy()
         .to_string()
 }
@@ -96,6 +102,7 @@ struct LlamaModelStartGuard {
 
 impl LlamaModelStartGuard {
     fn acquire(model_path: &str) -> Result<Self, String> {
+        let model_path = normalize_llama_model_path(model_path);
         let now = Instant::now();
         let mut state = llama_model_state()
             .lock()
@@ -103,13 +110,11 @@ impl LlamaModelStartGuard {
         state
             .delete_leases
             .retain(|_, lease| lease.expires_at > now);
-        if state.delete_leases.contains_key(model_path) {
+        if state.delete_leases.contains_key(&model_path) {
             return Err("Text model is being deleted".to_string());
         }
-        state.starting_path = Some(model_path.to_string());
-        Ok(Self {
-            model_path: model_path.to_string(),
-        })
+        state.starting_path = Some(model_path.clone());
+        Ok(Self { model_path })
     }
 }
 
@@ -432,6 +437,31 @@ mod tests {
         acquire_llama_model_delete_lease(&model_path, "racing-delete")
             .expect("start completion releases admission");
         release_llama_model_delete_lease(&model_path, "racing-delete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_model_lease_canonicalizes_a_symlinked_parent() {
+        let _g = test_global_lock();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lunery-llama-lease-symlink-{nonce}"));
+        let physical = root.join("physical");
+        let logical = root.join("logical");
+        std::fs::create_dir_all(&physical).expect("create physical root");
+        std::os::unix::fs::symlink(&physical, &logical).expect("create logical root symlink");
+        let logical_model = logical.join("pending.gguf").to_string_lossy().to_string();
+        let physical_model = physical.join("pending.gguf").to_string_lossy().to_string();
+
+        acquire_llama_model_delete_lease(&logical_model, "symlink-delete")
+            .expect("acquire missing model lease");
+        assert!(LlamaModelStartGuard::acquire(&physical_model).is_err());
+        release_llama_model_delete_lease(&logical_model, "symlink-delete");
+        drop(LlamaModelStartGuard::acquire(&physical_model).expect("release canonical lease"));
+
+        std::fs::remove_dir_all(root).expect("remove fixture");
     }
 
     // bridge_stop_llama must kill AND reap (wait) — the old code only killed,

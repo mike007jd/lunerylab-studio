@@ -45,6 +45,7 @@ interface ExternalModelDeleteJournal {
   originalPath: string;
   stagedPath: string;
   recoveryPath?: string;
+  preserveFile?: boolean;
   fileIdentity: ExternalPathIdentity;
   record: ImportedModelRecord;
 }
@@ -254,6 +255,7 @@ async function restoreUnexpectedStagedPath(
       originalPath: record.modelPath,
       stagedPath,
       recoveryPath: restoredPath === record.modelPath ? undefined : restoredPath,
+      preserveFile: true,
       fileIdentity: identity,
       record,
     };
@@ -519,6 +521,7 @@ function isExternalDeleteJournal(value: unknown): value is ExternalModelDeleteJo
       && path.dirname(journal.recoveryPath) === path.dirname(journal.originalPath)
       && path.basename(journal.recoveryPath).includes(".lunery-recovered-")
     ))
+    && (journal.preserveFile === undefined || typeof journal.preserveFile === "boolean")
     && typeof journal.fileIdentity === "object"
     && journal.fileIdentity !== null
     && typeof journal.fileIdentity.device === "string"
@@ -563,6 +566,70 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
     }
 
     const index = records.findIndex((record) => record.id === journal.modelId);
+    let stagedIdentity: ExternalPathIdentity | null = null;
+    try {
+      const stagedStat = await fs.lstat(journal.stagedPath, { bigint: true });
+      if (!externalIdentityMatches(journal.fileIdentity, stagedStat)) {
+        stagedIdentity = externalPathIdentity(stagedStat);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+    }
+    if (stagedIdentity) {
+      try {
+        const restoredPath = await restoreUnexpectedStagedPath(
+          journal.record,
+          journal.stagedPath,
+          journalPath,
+          stagedIdentity,
+        );
+        if (index >= 0) {
+          records[index] = {
+            ...records[index]!,
+            modelPath: restoredPath,
+            fileName: path.basename(restoredPath),
+          };
+          registryChanged = true;
+        }
+      } catch {
+        // The rewritten journal now owns the actual staged identity. Leave it
+        // for the next startup rather than losing the only recovery pointer.
+      }
+      continue;
+    }
+    if (journal.preserveFile) {
+      let restoredPath: string | null = null;
+      if (await statMatches(journal.stagedPath, journal.fileIdentity)) {
+        try {
+          restoredPath = await restoreUnexpectedStagedPath(
+            journal.record,
+            journal.stagedPath,
+            journalPath,
+            journal.fileIdentity,
+          );
+        } catch {
+          continue;
+        }
+      } else if (await statMatches(journal.originalPath, journal.fileIdentity)) {
+        restoredPath = journal.originalPath;
+      } else if (
+        journal.recoveryPath
+        && await statMatches(journal.recoveryPath, journal.fileIdentity)
+      ) {
+        restoredPath = journal.recoveryPath;
+      }
+      if (!restoredPath) continue;
+      if (index >= 0) {
+        records[index] = {
+          ...records[index]!,
+          modelPath: restoredPath,
+          fileName: path.basename(restoredPath),
+        };
+        registryChanged = true;
+      }
+      completed.push(journalPath);
+      continue;
+    }
     if (index < 0 && journal.recoveryPath) {
       let recoveredPath = journal.recoveryPath;
       if (!(await statMatches(recoveredPath, journal.fileIdentity))) {

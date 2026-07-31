@@ -54,8 +54,14 @@ fn sd_model_state() -> &'static Mutex<SdModelState> {
 }
 
 fn normalize_sd_model_path(value: &str) -> String {
-    std::fs::canonicalize(value)
-        .unwrap_or_else(|_| PathBuf::from(value))
+    let path = PathBuf::from(value);
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical.to_string_lossy().to_string();
+    }
+    path.parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or(path)
         .to_string_lossy()
         .to_string()
 }
