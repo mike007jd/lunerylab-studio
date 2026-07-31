@@ -45,9 +45,13 @@ interface ExternalModelDeleteJournal {
   originalPath: string;
   stagedPath: string;
   recoveryPath?: string;
-  fileIdentity: NonNullable<ImportedModelRecord["fileIdentity"]>;
+  fileIdentity: ExternalPathIdentity;
   record: ImportedModelRecord;
 }
+
+type ExternalPathIdentity = NonNullable<ImportedModelRecord["fileIdentity"]> & {
+  kind?: "file" | "symlink" | "other";
+};
 
 const IMPORTABLE_EXTENSIONS = new Set([".gguf", ".safetensors", ".bin"]);
 
@@ -85,24 +89,39 @@ function externalDeleteStagePath(record: ImportedModelRecord): string {
   const digest = createHash("sha256").update(record.id).digest("hex").slice(0, 16);
   return path.join(
     path.dirname(record.modelPath),
-    `.${path.basename(record.modelPath)}.lunery-delete-${digest}`,
+    `.${path.basename(record.modelPath)}.lunery-delete-${digest}-${randomUUID()}`,
   );
 }
 
 function externalIdentityMatches(
-  identity: NonNullable<ImportedModelRecord["fileIdentity"]>,
+  identity: ExternalPathIdentity,
   stat: import("node:fs").BigIntStats,
 ): boolean {
-  return stat.isFile()
+  const kindMatches = identity.kind === "symlink"
+    ? stat.isSymbolicLink()
+    : identity.kind === "other"
+      ? !stat.isFile() && !stat.isSymbolicLink()
+      : stat.isFile();
+  return kindMatches
     && stat.dev.toString() === identity.device
     && stat.ino.toString() === identity.inode
     && stat.size.toString() === identity.sizeBytes
     && stat.mtimeNs.toString() === identity.modifiedAtNs;
 }
 
+function externalPathIdentity(stat: import("node:fs").BigIntStats): ExternalPathIdentity {
+  return {
+    device: stat.dev.toString(),
+    inode: stat.ino.toString(),
+    sizeBytes: stat.size.toString(),
+    modifiedAtNs: stat.mtimeNs.toString(),
+    kind: stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other",
+  };
+}
+
 async function statMatches(
   filePath: string,
-  identity: NonNullable<ImportedModelRecord["fileIdentity"]>,
+  identity: ExternalPathIdentity,
 ): Promise<boolean> {
   try {
     return externalIdentityMatches(identity, await fs.lstat(filePath, { bigint: true }));
@@ -121,19 +140,43 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+async function syncDirectory(directoryPath: string): Promise<void> {
+  let handle: import("node:fs/promises").FileHandle | null = null;
+  try {
+    handle = await fs.open(directoryPath, "r");
+    await handle.sync();
+  } catch {
+    // Some filesystems do not expose directory fsync. The journal file itself
+    // is still synced before publication, and startup reconciliation remains safe.
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 async function writeExternalDeleteJournal(
   journalPath: string,
   journal: ExternalModelDeleteJournal,
   exclusive = false,
 ): Promise<void> {
   await fs.mkdir(path.dirname(journalPath), { recursive: true });
-  if (exclusive) {
-    await fs.writeFile(journalPath, JSON.stringify(journal), { encoding: "utf8", flag: "wx" });
-    return;
-  }
   const tmpPath = `${journalPath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(tmpPath, JSON.stringify(journal), "utf8");
-  await fs.rename(tmpPath, journalPath);
+  const handle = await fs.open(tmpPath, "wx");
+  try {
+    await handle.writeFile(JSON.stringify(journal), "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    if (exclusive) {
+      await fs.link(tmpPath, journalPath);
+    } else {
+      await fs.rename(tmpPath, journalPath);
+    }
+    await syncDirectory(path.dirname(journalPath));
+  } finally {
+    await fs.unlink(tmpPath).catch(() => undefined);
+  }
 }
 
 async function moveFileNoReplace(source: string, destination: string): Promise<void> {
@@ -147,6 +190,33 @@ async function moveFileNoReplace(source: string, destination: string): Promise<v
     await fs.copyFile(source, destination, fsConstants.COPYFILE_EXCL);
     await fs.unlink(source);
   }
+}
+
+async function movePathNoReplace(
+  source: string,
+  destination: string,
+  identity: ExternalPathIdentity,
+): Promise<void> {
+  if (identity.kind !== "other") {
+    await moveFileNoReplace(source, destination);
+    return;
+  }
+  const stat = await fs.lstat(source);
+  if (!stat.isDirectory()) {
+    throw new Error("Unsupported replacement path type.");
+  }
+  if (await pathExists(destination)) {
+    const error = new Error("Destination already exists.") as NodeJS.ErrnoException;
+    error.code = "EEXIST";
+    throw error;
+  }
+  await fs.cp(source, destination, {
+    recursive: true,
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: true,
+  });
+  await fs.rm(source, { recursive: true });
 }
 
 function recoveredExternalModelPath(originalPath: string, modelId: string, attempt = 0): string {
@@ -166,6 +236,39 @@ async function availableRecoveryPath(originalPath: string, modelId: string): Pro
     if (!(await pathExists(candidate))) return candidate;
   }
   throw new Error("Could not allocate a recovery path for the imported model file.");
+}
+
+async function restoreUnexpectedStagedPath(
+  record: ImportedModelRecord,
+  stagedPath: string,
+  journalPath: string,
+  identity: ExternalPathIdentity,
+): Promise<string> {
+  for (let attempt = -1; attempt < 100; attempt += 1) {
+    const restoredPath = attempt < 0
+      ? record.modelPath
+      : recoveredExternalModelPath(record.modelPath, record.id, attempt);
+    const journal: ExternalModelDeleteJournal = {
+      version: 1,
+      modelId: record.id,
+      originalPath: record.modelPath,
+      stagedPath,
+      recoveryPath: restoredPath === record.modelPath ? undefined : restoredPath,
+      fileIdentity: identity,
+      record,
+    };
+    await writeExternalDeleteJournal(journalPath, journal);
+    try {
+      await movePathNoReplace(stagedPath, restoredPath, identity);
+      await fs.unlink(journalPath).catch(() => undefined);
+      return restoredPath;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST" || code === "ERR_FS_CP_EEXIST") continue;
+      throw error;
+    }
+  }
+  throw new Error("Could not restore a concurrently replaced imported model path.");
 }
 
 export function importedModelDownloadDest(runtimeTarget: ModelRuntimeTarget, modelId: string, fileName: string): string {
@@ -282,17 +385,6 @@ export async function stageImportedExternalModelFile(
   };
   try {
     await writeExternalDeleteJournal(journalPath, journal, true);
-    await fs.rename(record.modelPath, stagedPath);
-    if (!(await statMatches(stagedPath, record.fileIdentity))) {
-      throw new Error("Staged imported model identity changed.");
-    }
-    return {
-      originalPath: record.modelPath,
-      stagedPath,
-      journalPath,
-      hadFile: true,
-      preservedChangedFile: false,
-    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       throw new ApiError({
@@ -302,26 +394,61 @@ export async function stageImportedExternalModelFile(
         retryable: true,
       });
     }
-    if (await statMatches(stagedPath, record.fileIdentity)) {
-      try {
-        await moveFileNoReplace(stagedPath, record.modelPath);
-        await fs.unlink(journalPath).catch(() => undefined);
-      } catch {
-        throw new ApiError({
-          status: 503,
-          code: "external_model_delete_rollback_failed",
-          message: "The imported model file was preserved in recovery staging. Restart Studio to recover it.",
-          retryable: true,
-        });
-      }
-    } else {
-      await fs.unlink(journalPath).catch(() => undefined);
-    }
+    throw new ApiError({
+      status: 503,
+      code: "external_model_file_delete_failed",
+      message: "Could not stage the imported model file for deletion. Please try again.",
+      retryable: true,
+    });
+  }
+
+  try {
+    await fs.rename(record.modelPath, stagedPath);
+  } catch (error) {
+    await fs.unlink(journalPath).catch(() => undefined);
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStage(false);
     throw new ApiError({
       status: 503,
       code: "external_model_file_delete_failed",
       message: "Could not stage the imported model file for deletion. Please try again.",
+      retryable: true,
+    });
+  }
+
+  let stagedIdentity: ExternalPathIdentity;
+  try {
+    const stagedStat = await fs.lstat(stagedPath, { bigint: true });
+    stagedIdentity = externalPathIdentity(stagedStat);
+    if (externalIdentityMatches(record.fileIdentity, stagedStat)) {
+      return {
+        originalPath: record.modelPath,
+        stagedPath,
+        journalPath,
+        hadFile: true,
+        preservedChangedFile: false,
+      };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      await fs.unlink(journalPath).catch(() => undefined);
+      return emptyStage(false);
+    }
+    throw new ApiError({
+      status: 503,
+      code: "external_model_delete_rollback_failed",
+      message: "The imported model file was preserved in recovery staging. Restart Studio to recover it.",
+      retryable: true,
+    });
+  }
+
+  try {
+    await restoreUnexpectedStagedPath(record, stagedPath, journalPath, stagedIdentity);
+    return emptyStage(true);
+  } catch {
+    throw new ApiError({
+      status: 503,
+      code: "external_model_delete_rollback_failed",
+      message: "The imported model file was preserved in recovery staging. Restart Studio to recover it.",
       retryable: true,
     });
   }
@@ -394,6 +521,16 @@ function isExternalDeleteJournal(value: unknown): value is ExternalModelDeleteJo
     ))
     && typeof journal.fileIdentity === "object"
     && journal.fileIdentity !== null
+    && typeof journal.fileIdentity.device === "string"
+    && typeof journal.fileIdentity.inode === "string"
+    && typeof journal.fileIdentity.sizeBytes === "string"
+    && typeof journal.fileIdentity.modifiedAtNs === "string"
+    && (
+      journal.fileIdentity.kind === undefined
+      || journal.fileIdentity.kind === "file"
+      || journal.fileIdentity.kind === "symlink"
+      || journal.fileIdentity.kind === "other"
+    )
     && isImportedModelRecord(journal.record)
     && journal.record.id === journal.modelId
     && journal.record.source === "local-path"
@@ -435,7 +572,7 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
           journal = { ...journal, recoveryPath: recoveredPath };
           await writeExternalDeleteJournal(journalPath, journal);
         }
-        await moveFileNoReplace(journal.stagedPath, recoveredPath);
+        await movePathNoReplace(journal.stagedPath, recoveredPath, journal.fileIdentity);
       }
       records.push({
         ...journal.record,
@@ -471,7 +608,7 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
           await writeExternalDeleteJournal(journalPath, journal);
         }
       }
-      await moveFileNoReplace(journal.stagedPath, restoredPath);
+      await movePathNoReplace(journal.stagedPath, restoredPath, journal.fileIdentity);
     } else if (
       journal.recoveryPath
       && await statMatches(journal.recoveryPath, journal.fileIdentity)

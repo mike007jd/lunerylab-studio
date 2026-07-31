@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 use crate::download::{
     canonical_download_destination, hf_download_start_inner, DownloadState, JobSnapshot,
 };
-use crate::engine_llama::{bridge_start_llama, bridge_stop_llama, llama_engine_slot};
+use crate::engine_llama::{
+    acquire_llama_model_delete_lease, bridge_start_llama, bridge_stop_llama, llama_engine_slot,
+    release_llama_model_delete_lease,
+};
 use crate::engine_mlx::{
     bridge_start_mlx, bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot,
 };
@@ -784,6 +787,45 @@ fn handle_bridge_request(
             })
             .to_string();
             write_http_response(&mut stream, "200 OK", &payload);
+        }
+        ("POST", "/llama-delete-lease-acquire") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(|lease| {
+                    acquire_llama_model_delete_lease(&lease.model_path, &lease.lease_id)
+                }) {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "acquired": true }).to_string(),
+                ),
+                Err(error) => bridge_error(&mut stream, "409 Conflict", &error),
+            }
+        }
+        ("POST", "/llama-delete-lease-release") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LeaseBody {
+                lease_id: String,
+                model_path: String,
+            }
+            match serde_json::from_str::<LeaseBody>(&body) {
+                Ok(lease) => {
+                    release_llama_model_delete_lease(&lease.model_path, &lease.lease_id);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &serde_json::json!({ "released": true }).to_string(),
+                    );
+                }
+                Err(error) => bridge_error(&mut stream, "400 Bad Request", &error.to_string()),
+            }
         }
         ("POST", "/sd-generate") => {
             match serde_json::from_str::<SdGenerateBody>(&body)

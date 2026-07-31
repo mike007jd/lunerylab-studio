@@ -438,6 +438,14 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     expect(response.status).toBe(200);
     expect(mocks.bridgeFetch).toHaveBeenCalledWith(
       bridge,
+      "/llama-delete-lease-acquire",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining("/profile/models/llama-cpp/imported/demo.gguf"),
+      }),
+    );
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
       "/llama-status",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
@@ -450,6 +458,11 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       "/profile/models/llama-cpp/imported/demo.gguf",
       "/profile/models/llama-cpp/imported/demo.gguf.part",
     ]);
+    expect(mocks.bridgeFetch).toHaveBeenCalledWith(
+      bridge,
+      "/llama-delete-lease-release",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("waits for an active Hugging Face import to cancel before deleting its files", async () => {

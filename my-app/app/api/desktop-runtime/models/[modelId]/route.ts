@@ -123,17 +123,20 @@ async function settleActiveDownloadsForPaths(
 interface ModelDeleteLeases {
   leaseId: string;
   downloadPaths: string[];
+  llamaModelPath: string | null;
   sdModelPath: string | null;
 }
 
 async function acquireModelDeleteLeases(
   bridge: DesktopBridge,
   downloadPaths: string[],
+  llamaModelPath: string | null,
   sdModelPath: string | null,
 ): Promise<ModelDeleteLeases> {
   const leases: ModelDeleteLeases = {
     leaseId: randomUUID(),
     downloadPaths: [],
+    llamaModelPath: null,
     sdModelPath: null,
   };
   if (downloadPaths.length > 0) {
@@ -159,6 +162,32 @@ async function acquireModelDeleteLeases(
       });
     }
     leases.downloadPaths = downloadPaths;
+  }
+  if (llamaModelPath) {
+    const response = await bridgeFetch(bridge, "/llama-delete-lease-acquire", {
+      method: "POST",
+      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: llamaModelPath }),
+      signal: AbortSignal.timeout(15_000),
+    }).catch(() => null);
+    if (!response) {
+      await releaseModelDeleteLeases(bridge, leases);
+      throw new ApiError({
+        status: 503,
+        code: "bridge_unreachable",
+        message: "Could not coordinate text-model deletion with the desktop runtime.",
+        retryable: true,
+      });
+    }
+    if (!response.ok) {
+      await releaseModelDeleteLeases(bridge, leases);
+      throw new ApiError({
+        status: 409,
+        code: "model_delete_in_progress",
+        message: "This text model is already being changed. Try again.",
+        retryable: true,
+      });
+    }
+    leases.llamaModelPath = llamaModelPath;
   }
   if (sdModelPath) {
     const response = await bridgeFetch(bridge, "/sd-delete-lease-acquire", {
@@ -201,6 +230,13 @@ async function releaseModelDeleteLeases(
         leaseId: leases.leaseId,
         destinations: leases.downloadPaths,
       }),
+      signal: AbortSignal.timeout(5_000),
+    }));
+  }
+  if (leases.llamaModelPath) {
+    releases.push(bridgeFetch(bridge, "/llama-delete-lease-release", {
+      method: "POST",
+      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.llamaModelPath }),
       signal: AbortSignal.timeout(5_000),
     }));
   }
@@ -410,12 +446,15 @@ export async function DELETE(
         : [];
     const isSdModel = catalogEntry?.runtimeTarget === "sd-cpp"
       || imported?.runtimeTarget === "sd-cpp";
+    const isLlamaModel = catalogEntry?.runtimeTarget === "llama-cpp"
+      || imported?.runtimeTarget === "llama-cpp";
     let leases: ModelDeleteLeases | null = null;
     if (bridge) {
       try {
         leases = await acquireModelDeleteLeases(
           bridge,
           downloadablePaths,
+          isLlamaModel ? modelPath : null,
           isSdModel ? modelPath : null,
         );
       } catch (error) {
