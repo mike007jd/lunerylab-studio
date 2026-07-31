@@ -1,10 +1,12 @@
 "use client";
 
 import { memo, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmActionDialog } from "@/components/ui/confirm-action-dialog";
 import { Progress } from "@/components/ui/progress";
-import { Check, Download, RotateCcw, X, Zap } from "@/components/ui/icons";
+import { Check, Download, RotateCcw, Trash2, X, Zap } from "@/components/ui/icons";
 import { readResponseError } from "@/lib/client/fetch-json";
 import { cn } from "@/lib/utils";
 import { modelRunnableState } from "@/lib/hf-model-catalog";
@@ -90,6 +92,7 @@ function ModelRowImpl({
   onQueueChange,
   onResumeImport,
   onOpenDiagnostics,
+  onDelete,
   importQueueEntry,
 }: {
   entry: HubModelEntry;
@@ -105,11 +108,16 @@ function ModelRowImpl({
   onQueueChange: (entry: QueueEntry) => void;
   onResumeImport: (entry: HubModelEntry) => Promise<void>;
   onOpenDiagnostics: () => void;
+  onDelete: (entry: HubModelEntry) => Promise<void>;
   importQueueEntry?: QueueEntry;
 }) {
   const dl = useHfDownload();
+  const router = useRouter();
   const [activating, setActivating] = useState(false);
   const [activationError, setActivationError] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const readyReportedRef = useRef(false);
 
   useEffect(() => {
@@ -161,12 +169,14 @@ function ModelRowImpl({
           : partial
             ? "partial"
             : baseState;
+  const canDelete = Boolean(entry.imported || installed || partial);
 
   const neededDisk = Math.ceil(entry.sizeBytes / 1_073_741_824);
   const diskOk = diskGb === 0 || diskGb >= neededDisk;
   const hardwareUnfit = baseState === "hardware_unfit";
   const blocked = hardwareUnfit || !diskOk;
   const canRunInline = entry.runtimeTarget === "llama-cpp";
+  const canUseInStudio = entry.runtimeTarget === "sd-cpp";
 
   function disabledReason(): string | undefined {
     if (!diskOk) return copy.disabledDisk(neededDisk);
@@ -221,6 +231,22 @@ function ModelRowImpl({
     }
   }
 
+  async function confirmDelete() {
+    setDeleteError(null);
+    setDeleting(true);
+    try {
+      if (dl.status === "queued" || dl.status === "downloading") {
+        await dl.cancel();
+      }
+      await onDelete(entry);
+      setDeleteOpen(false);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : copy.deleteError);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   const progress = activeImportDownload && importQueueEntry
     ? importQueueEntry
     : {
@@ -235,7 +261,9 @@ function ModelRowImpl({
     : installed
       ? canRunInline
         ? copy.primaryRun
-        : copy.primaryReadyStudio
+        : canUseInStudio
+          ? copy.primaryUseInStudio
+          : copy.primaryReadyStudio
       : canResumeImportedDownload || partial
         ? copy.primaryResume
         : dl.status === "canceled"
@@ -296,14 +324,36 @@ function ModelRowImpl({
             <Button
               type="button"
               size="sm"
-              disabled={blocked || importedUnavailable || activating || (installed && !canRunInline) || isActive}
+              disabled={blocked || importedUnavailable || activating || (installed && !canRunInline && !canUseInStudio) || isActive}
               title={blocked ? disabledReason() : undefined}
-              onClick={() => void installThenMaybeRun()}
+              onClick={() => {
+                if (installed && canUseInStudio) {
+                  router.push(`/studio?modelId=local:${encodeURIComponent(entry.id)}`);
+                  return;
+                }
+                void installThenMaybeRun();
+              }}
             >
               {installed ? <Zap className="h-3 w-3" /> : <Download className="h-3 w-3" />}
               {primaryLabel}
             </Button>
           )}
+          {canDelete ? (
+            <Button
+              type="button"
+              variant="ghostMuted"
+              size="icon-sm"
+              className="text-(--destructive) hover:bg-(--destructive-soft) hover:text-(--destructive)"
+              aria-label={copy.deleteModel}
+              onClick={() => {
+                setDeleteError(null);
+                setDeleteOpen(true);
+              }}
+              disabled={activating}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -335,6 +385,22 @@ function ModelRowImpl({
       {activationError && (
         <p className="text-xs text-(--destructive)">{activationError}</p>
       )}
+
+      <ConfirmActionDialog
+        open={deleteOpen}
+        onOpenChange={(open) => {
+          if (!deleting) setDeleteOpen(open);
+        }}
+        title={copy.deleteModelTitle(entry.label)}
+        description={entry.imported && entry.source === "local-path"
+          ? copy.deleteExternalModelDescription
+          : copy.deleteModelDescription}
+        confirmLabel={copy.deleteModel}
+        cancelLabel={copy.cancel}
+        pending={deleting}
+        error={deleteError ?? undefined}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }

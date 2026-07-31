@@ -6,6 +6,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import type { ImageModelEntry } from "@/lib/image-models";
 import { ComposerDeck } from "@/components/studio/studio-composer-deck";
 import { PresetPicker } from "@/components/studio/studio-preset-picker";
 import { StudioOptionsPopover } from "@/components/studio/studio-options-popover";
@@ -15,6 +25,82 @@ import {
 } from "@/components/studio/studio-constants";
 import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
+
+export interface ComposerImageModelPickerProps {
+  models: ImageModelEntry[];
+  value: string;
+  onChange: (value: string) => void;
+  isZh: boolean;
+  label: string;
+  placeholder: string;
+  noModelsLabel: string;
+}
+
+function ComposerImageModelPicker({
+  models,
+  value,
+  onChange,
+  isZh,
+  label,
+  placeholder,
+  noModelsLabel,
+}: ComposerImageModelPickerProps) {
+  const { t } = useI18n();
+  const localModels = models.filter((model) => model.source === "local");
+  const byokModels = models.filter((model) => model.source === "byok");
+  const cloudModels = models.filter((model) => !model.source || model.source === "cloud");
+  const groups: Array<{ key: string; label: string; models: ImageModelEntry[] }> = [];
+
+  if (localModels.length) groups.push({ key: "local", label: t("modelSource.local"), models: localModels });
+  if (byokModels.length) groups.push({ key: "byok", label: t("modelSource.byok"), models: byokModels });
+  if (cloudModels.length) groups.push({ key: "cloud", label: t("modelSource.cloud"), models: cloudModels });
+
+  const selected = models.find(
+    (model) => model.id === value || model.providerModelId === value,
+  );
+
+  return (
+    <Select
+      value={models.length ? value : "__no_image_backend__"}
+      onValueChange={onChange}
+      disabled={models.length === 0}
+    >
+      <SelectTrigger
+        size="sm"
+        aria-label={label}
+        className="h-8 w-40 justify-between border-(--border-subtle) bg-transparent px-2 text-xs font-medium text-(--text-secondary) shadow-none hover:border-(--border-active) sm:w-48"
+      >
+        <SelectValue placeholder={placeholder}>
+          {models.length === 0
+            ? noModelsLabel
+            : selected
+              ? isZh
+                ? selected.labelZh
+                : selected.label
+              : undefined}
+        </SelectValue>
+      </SelectTrigger>
+      <SelectContent>
+        {groups.length === 0 ? (
+          <SelectItem value="__no_image_backend__" disabled>
+            {noModelsLabel}
+          </SelectItem>
+        ) : (
+          groups.map((group) => (
+            <SelectGroup key={group.key}>
+              <SelectLabel>{group.label}</SelectLabel>
+              {group.models.map((model) => (
+                <SelectItem key={model.id} value={model.id}>
+                  {isZh ? model.labelZh : model.label}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          ))
+        )}
+      </SelectContent>
+    </Select>
+  );
+}
 
 export interface StudioComposerProps {
   fileInputRef: RefObject<HTMLInputElement | null>;
@@ -29,6 +115,7 @@ export interface StudioComposerProps {
   onModeChange: (mode: "image" | "video") => void;
   imageRunMode: "single" | "batch";
   onImageRunModeChange: (mode: "single" | "batch") => void;
+  imageModelPicker: ComposerImageModelPickerProps;
   presetPickerProps: ComponentProps<typeof PresetPicker>;
   optionsProps: ComponentProps<typeof StudioOptionsPopover>;
   activeProjectName?: string;
@@ -64,6 +151,7 @@ export function StudioComposer({
   onModeChange,
   imageRunMode,
   onImageRunModeChange,
+  imageModelPicker,
   presetPickerProps,
   optionsProps,
   activeProjectName,
@@ -173,6 +261,10 @@ export function StudioComposer({
                   {t("studio.batchMode")}
                 </ToggleGroupItem>
               </ToggleGroup>
+            ) : null}
+
+            {mode === "image" ? (
+              <ComposerImageModelPicker {...imageModelPicker} />
             ) : null}
 
             {mode === "image" ? <PresetPicker {...presetPickerProps} /> : null}

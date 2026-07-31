@@ -10,6 +10,9 @@
 //   openai            → GET /v1/models
 //   anthropic         → GET /v1/models with x-api-key + anthropic-version
 //   gemini            → GET /v1beta/models with x-goog-api-key
+//   xai / mistral / deepseek / groq / cerebras
+//                    → GET /models with Authorization
+//   perplexity        → GET /v1/models with Authorization
 //   openrouter        → GET /api/v1/models with Authorization
 //   minimax           → GET /v1/models with Authorization
 //   replicate         → GET /v1/account
@@ -71,6 +74,12 @@ const PROVIDER_PROBES: Record<string, ProviderProbeSpec> = {
     }),
   },
   gemini: { path: "/v1beta/models", headers: (apiKey) => ({ "x-goog-api-key": apiKey }) },
+  xai: { path: "/models", headers: bearerAuth },
+  mistral: { path: "/models", headers: bearerAuth },
+  deepseek: { path: "/models", headers: bearerAuth },
+  groq: { path: "/models", headers: bearerAuth },
+  perplexity: { path: "/v1/models", headers: bearerAuth },
+  cerebras: { path: "/models", headers: bearerAuth },
   openrouter: { path: "/models", headers: bearerAuth },
   minimax: { path: "/models", headers: bearerAuth },
   replicate: { path: "/account", headers: (apiKey) => ({ Authorization: `Token ${apiKey}` }) },

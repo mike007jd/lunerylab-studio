@@ -40,10 +40,77 @@ export const AGENT_DATA_PART = {
 // through assistant-ui primitives.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Model routing — the Canvas Agent Chat composer can run on the bootstrap
+// defaults (Auto) or on explicit per-slot overrides (Manual). Auto is a
+// dedicated sentinel, never a model id, so no real catalog id can collide.
+// ---------------------------------------------------------------------------
+
+export const AGENT_MODEL_ROUTING_AUTO = "__model_routing_auto__";
+
+export interface AgentModelRoutingOption {
+  id: string;
+  label: string;
+}
+
+export interface AgentModelRouting {
+  /** Per-slot selections: the Auto sentinel or a concrete model id. */
+  textSelection: string;
+  imageSelection: string;
+  onTextSelectionChange: (next: string) => void;
+  onImageSelectionChange: (next: string) => void;
+  textOptions: AgentModelRoutingOption[];
+  imageOptions: AgentModelRoutingOption[];
+  /** Resolved Auto defaults, surfaced so Auto mode shows what will run. */
+  autoTextModelId: string;
+  autoImageModelId: string;
+  /**
+   * Effective ids sent in uiContext — "" means "no model configured". Manual
+   * picks are already validated against the live options, so a non-empty
+   * Manual id is a genuinely configured model.
+   */
+  textModelId: string;
+  imageModelId: string;
+}
+
+/**
+ * Effective text model for a routing selection. Auto passes the persisted
+ * Settings default verbatim (the server validates it). A Manual pick passes
+ * only when it still exists in the live options — a stale pick resolves to ""
+ * so no invented or first-row fallback id is ever sent.
+ */
+export function resolveAgentTextModelId(
+  selection: string,
+  autoDefault: string,
+  textOptions: readonly AgentModelRoutingOption[],
+): string {
+  if (selection === AGENT_MODEL_ROUTING_AUTO) return autoDefault.trim();
+  return textOptions.some((option) => option.id === selection) ? selection : "";
+}
+
+/**
+ * Effective image model for a routing selection. Auto trusts only the
+ * bootstrap default — never a first-catalog fallback — and any concrete id is
+ * validated against the live catalog so a removed model is never sent. A null
+ * catalog means it has not loaded yet; trust the requested id until it lands.
+ */
+export function resolveAgentImageModelId(
+  selection: string,
+  autoDefault: string,
+  liveModels: readonly { id: string }[] | null,
+): string {
+  const requested = selection === AGENT_MODEL_ROUTING_AUTO ? autoDefault : selection;
+  if (!requested) return "";
+  if (liveModels === null) return requested;
+  return liveModels.some((model) => model.id === requested) ? requested : "";
+}
+
 export interface AgentChatUI {
   options: GenerationOptions;
   setOptions: Dispatch<SetStateAction<GenerationOptions>>;
   showGenerationOptions: boolean;
+  /** Auto/manual model routing for the composer. Absent on surfaces that do not offer routing. */
+  modelRouting?: AgentModelRouting;
   onFocusAsset?: (assetId: string) => void;
   /**
    * Whether a persisted chat asset still exists on the current Canvas. Chat

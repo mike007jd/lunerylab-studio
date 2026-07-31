@@ -6,8 +6,8 @@
  * provider. Never logs the key.
  *
  * Supported providers (maps provider id → AI SDK provider factory):
- *   openai, anthropic, gemini, openrouter, minimax, together, fireworks,
- *   openai-compatible
+ *   openai, anthropic, gemini, xai, mistral, deepseek, groq, perplexity,
+ *   cerebras, openrouter, minimax, together, fireworks, openai-compatible
  *   replicate and fal are image-only — they throw byok_text_unsupported.
  *
  * Exported signatures mirror the local text/object helpers so callers can swap
@@ -73,7 +73,8 @@ async function buildByokModel(config: ResolvedByokProviderConfig): Promise<Langu
       });
       return provider(modelId) as LanguageModel;
     }
-    // openrouter / minimax / together / fireworks are OpenAI-compatible and
+    // xAI / Mistral / DeepSeek / Groq / Perplexity / Cerebras / openrouter /
+    // minimax / together / fireworks are OpenAI-compatible and
     // carry their baseURL as `defaultEndpoint` in byok-providers.ts (the single
     // source of truth). They fall through to the `default` branch below rather
     // than re-declaring the same createOpenAICompatible call with a duplicated

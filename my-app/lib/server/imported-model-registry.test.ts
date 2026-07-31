@@ -75,4 +75,19 @@ describe("imported-model-registry profile paths", () => {
     expect(records).toHaveLength(0);
     expect(fs.existsSync(path.join(modelsDir, "imported-models.json"))).toBe(false);
   });
+
+  it("removes one imported record without touching the remaining registry", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    await registry.upsertImportedModel(record());
+    await registry.upsertImportedModel(record({
+      id: "imported-llama-cpp-other-87654321",
+      fileName: "other.gguf",
+      modelPath: path.join(modelsDir, "llama-cpp", "other.gguf"),
+    }));
+
+    await expect(registry.removeImportedModel(record().id)).resolves.toMatchObject({ id: record().id });
+    await expect(registry.readImportedModels()).resolves.toEqual([
+      expect.objectContaining({ id: "imported-llama-cpp-other-87654321" }),
+    ]);
+  });
 });

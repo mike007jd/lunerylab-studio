@@ -100,6 +100,27 @@ describe("resolveByokModelGuidance", () => {
       },
     });
   });
+
+  it("exposes current OpenAI-compatible text providers with exact model guidance", () => {
+    const expectations = [
+      ["xai", "grok-4.5", "https://docs.x.ai/developers/models/grok-4.5"],
+      ["mistral", "mistral-large-latest", "https://docs.mistral.ai/resources/migration-guides"],
+      ["deepseek", "deepseek-v4-flash", "https://api-docs.deepseek.com/api/create-chat-completion"],
+      ["groq", "openai/gpt-oss-120b", "https://console.groq.com/docs/models"],
+      ["perplexity", "sonar-pro", "https://docs.perplexity.ai/docs/sonar/openai-compatibility"],
+      ["cerebras", "gpt-oss-120b", "https://inference-docs.cerebras.ai/models/overview"],
+    ] as const;
+
+    for (const [providerId, modelId, sourceUrl] of expectations) {
+      const provider = meta(providerId);
+      expect(provider.capabilities).toEqual(["text"]);
+      expect(provider.imageApiMode).toBe("none");
+      expect(resolveByokModelGuidance(provider, ["text"])).toMatchObject({
+        placeholderModelId: modelId,
+        sourceEvidence: { url: sourceUrl, lastVerifiedAt: "2026-07-31" },
+      });
+    }
+  });
 });
 
 describe("normalizeByokModels", () => {

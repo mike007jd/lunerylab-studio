@@ -90,6 +90,11 @@ function revalidate() {
   void fetchCatalog();
 }
 
+export function invalidateModelCatalog(): void {
+  lastFetchAt = 0;
+  void fetchCatalog();
+}
+
 function handleVisibilityChange() {
   if (document.visibilityState === "visible") revalidate();
 }

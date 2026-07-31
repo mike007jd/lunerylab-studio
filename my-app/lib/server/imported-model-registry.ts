@@ -145,6 +145,14 @@ export async function upsertImportedModel(record: ImportedModelRecord): Promise<
   return record;
 }
 
+export async function removeImportedModel(id: string): Promise<ImportedModelRecord | undefined> {
+  const records = await readImportedModels();
+  const removed = records.find((record) => record.id === id);
+  if (!removed) return undefined;
+  await writeImportedModels(records.filter((record) => record.id !== id));
+  return removed;
+}
+
 async function writeImportedModels(records: ImportedModelRecord[]): Promise<void> {
   const registryPath = importedModelsRegistryPath();
   await fs.mkdir(path.dirname(registryPath), { recursive: true });

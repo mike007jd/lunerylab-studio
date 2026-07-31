@@ -78,18 +78,40 @@ export function StudioPage({
   );
   const [generationParameters, setGenerationParameters] = useState<GenerationParameters>({});
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const requestedModelParam = searchParams.get("modelId");
+  const querySelectedModelId = useMemo(() => {
+    if (!requestedModelParam) return undefined;
+    const strippedParam = requestedModelParam.startsWith("local:")
+      ? requestedModelParam.slice("local:".length)
+      : requestedModelParam;
+    return imageModels.find(
+      (model) =>
+        model.id === requestedModelParam ||
+        model.providerModelId === requestedModelParam ||
+        model.id === strippedParam ||
+        model.providerModelId === strippedParam,
+    )?.id;
+  }, [imageModels, requestedModelParam]);
   // Local-first default: only an explicit choice resolves — the user's
   // in-session pick or the saved defaultImageModel. There is NO catalog or
   // single-model fallback: a ready local model without a selected default is
   // not ready, never silently dispatches, and the UI blocks generation with
   // visible setup guidance plus a Settings Image action instead.
-  const requestedImageModelId = selectedModel ?? bootstrapSnapshot?.app.defaultImageModel ?? "";
-  const activeImageModelId = imageModels.some(
+  const requestedImageModelId = selectedModel ?? querySelectedModelId ?? bootstrapSnapshot?.app.defaultImageModel ?? "";
+  const normalizedLocalImageModelId = requestedImageModelId.startsWith("local:")
+    ? requestedImageModelId.slice("local:".length)
+    : requestedImageModelId;
+  const activeImageModel = imageModels.find(
     (model) =>
       model.id === requestedImageModelId ||
-      model.providerModelId === requestedImageModelId,
-  )
-    ? requestedImageModelId
+      model.providerModelId === requestedImageModelId ||
+      model.id === normalizedLocalImageModelId ||
+      model.providerModelId === normalizedLocalImageModelId,
+  );
+  const activeImageModelId = activeImageModel
+    ? requestedImageModelId.startsWith("local:")
+      ? activeImageModel.id
+      : requestedImageModelId
     : "";
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -154,6 +176,33 @@ export function StudioPage({
   const modeReadiness = generationMode === "image"
     ? readiness.byId.imageGeneration
     : readiness.byId.videoGeneration;
+  const studioReadiness = useMemo(() => {
+    if (generationMode !== "image" || !activeImageModelId) return readiness;
+    const focused = readiness.byId.imageGeneration;
+    if (focused.status === "ready") return readiness;
+    const activeLabel = activeImageModel
+      ? isZh
+        ? activeImageModel.labelZh
+        : activeImageModel.label
+      : undefined;
+    const imageGeneration: typeof focused = {
+      ...focused,
+      status: "ready",
+      title: t("capabilityReadiness.image.readyTitle"),
+      detail: activeLabel
+        ? t("capabilityReadiness.image.readyDetailWithModel", { model: activeLabel })
+        : t("capabilityReadiness.image.readyDetail"),
+      shortLabel: t("capabilityReadiness.sidebar.ready"),
+      activeLabel,
+      reason: undefined,
+      href: "/settings?panel=image",
+      actionLabel: t("capabilityReadiness.actions.manageModels"),
+    };
+    return {
+      ...readiness,
+      byId: { ...readiness.byId, imageGeneration },
+    };
+  }, [activeImageModel, activeImageModelId, generationMode, isZh, readiness, t]);
   const disabledGenerateReason = videoNeedsReference
     ? t("studio.batchRequiresRef")
     : !modeCanGenerate
@@ -206,8 +255,6 @@ export function StudioPage({
       model: t("studio.model"),
       output: t("studio.output"),
       project: t("studio.projectLabel"),
-      imageModel: t("canvas.imageModel"),
-      noBackend: t("studio.taskIntents.noBackend"),
       aspectRatio: t("studio.aspectRatio"),
       variants: t("studio.variants"),
       selectProject: t("studio.selectProject"),
@@ -307,7 +354,7 @@ export function StudioPage({
       <StudioGenerationSurface
         hydrated={history.hydrated}
         hasResults={hasResults}
-        readiness={readiness}
+        readiness={studioReadiness}
         focusId={generationMode === "image" ? "imageGeneration" : "videoGeneration"}
         composerProps={{
           fileInputRef,
@@ -338,6 +385,15 @@ export function StudioPage({
           onModeChange: setGenerationMode,
           imageRunMode,
           onImageRunModeChange: setImageRunMode,
+          imageModelPicker: {
+            models: imageModels,
+            value: activeImageModelId,
+            onChange: handleImageModelChange,
+            isZh,
+            label: t("canvas.imageModel"),
+            placeholder: t("capabilityReadiness.sidebar.imageModelMissing"),
+            noModelsLabel: t("studio.taskIntents.noBackend"),
+          },
           presetPickerProps: {
             open: presetPickerOpen,
             onOpenChange: setPresetPickerOpen,
@@ -356,8 +412,6 @@ export function StudioPage({
             mode: generationMode,
             imageModels,
             activeImageModelId,
-            hasImageModels,
-            onImageModelChange: handleImageModelChange,
             aspectRatio,
             onAspectRatioChange: setAspectRatio,
             candidateCount: imageOutputCount,
@@ -373,7 +427,6 @@ export function StudioPage({
             onProjectChange: projectTarget.changeProject,
             onCreateProject: projectTarget.openCreateDialog,
             isCreatingProject,
-            isZh,
             generationParameters,
             onGenerationParametersChange: setGenerationParameters,
             labels: optionsLabels,

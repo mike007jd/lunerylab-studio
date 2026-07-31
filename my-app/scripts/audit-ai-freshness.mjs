@@ -122,6 +122,36 @@ const exactSourceChecks = [
     strategy: "source-text",
   },
   {
+    id: "grok-4.5",
+    url: "https://docs.x.ai/developers/models/grok-4.5",
+    strategy: "source-text",
+  },
+  {
+    id: "mistral-large-latest",
+    url: "https://docs.mistral.ai/resources/migration-guides",
+    strategy: "source-text",
+  },
+  {
+    id: "deepseek-v4-flash",
+    url: "https://api-docs.deepseek.com/api/create-chat-completion",
+    strategy: "source-text",
+  },
+  {
+    id: "openai/gpt-oss-120b",
+    url: "https://console.groq.com/docs/models",
+    strategy: "source-text",
+  },
+  {
+    id: "sonar-pro",
+    url: "https://docs.perplexity.ai/docs/sonar/openai-compatibility",
+    strategy: "source-text",
+  },
+  {
+    id: "gpt-oss-120b",
+    url: "https://inference-docs.cerebras.ai/models/overview",
+    strategy: "source-text",
+  },
+  {
     id: "anthropic/claude-sonnet-4.6",
     url: "https://openrouter.ai/api/v1/models",
     strategy: "openrouter-models",

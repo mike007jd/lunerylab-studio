@@ -7,13 +7,10 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import {
   Select,
   SelectContent,
-  SelectGroup,
   SelectItem,
-  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useI18n } from "@/lib/i18n/provider";
 import { ASPECT_RATIOS } from "@/lib/constants/generation";
 import {
   resolveImageAdvancedParameters,
@@ -38,70 +35,6 @@ function FieldLabel({ children }: { children: ReactNode }) {
     <span className="text-xs font-semibold text-(--text-muted)">
       {children}
     </span>
-  );
-}
-
-function ImageModelSelect({
-  value,
-  models,
-  disabled,
-  onChange,
-  isZh,
-  noBackendLabel,
-  ariaLabel,
-}: {
-  value: string;
-  models: ImageModelEntry[];
-  disabled: boolean;
-  onChange: (value: string) => void;
-  isZh: boolean;
-  noBackendLabel: string;
-  ariaLabel: string;
-}) {
-  const { t } = useI18n();
-  const localModels = models.filter((model) => model.source === "local");
-  const byokModels = models.filter((model) => model.source === "byok");
-  const cloudModels = models.filter((model) => !model.source || model.source === "cloud");
-  const groups: Array<{ key: string; label: string; models: ImageModelEntry[] }> = [];
-
-  if (localModels.length) groups.push({ key: "local", label: t("modelSource.local"), models: localModels });
-  if (byokModels.length) groups.push({ key: "byok", label: t("modelSource.byok"), models: byokModels });
-  if (cloudModels.length) groups.push({ key: "cloud", label: t("modelSource.cloud"), models: cloudModels });
-
-  return (
-    <div className="space-y-1.5">
-      <Select
-        value={models.length ? value : "__no_image_backend__"}
-        onValueChange={onChange}
-        disabled={disabled}
-      >
-        <SelectTrigger
-          size="sm"
-          aria-label={ariaLabel}
-          className="h-8 w-full justify-between border-(--border-subtle) bg-transparent px-2 text-xs font-medium text-(--text-secondary) shadow-none hover:border-(--border-active)"
-        >
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {groups.length === 0 ? (
-            <SelectItem value="__no_image_backend__" disabled>
-              {noBackendLabel}
-            </SelectItem>
-          ) : (
-            groups.map((group) => (
-              <SelectGroup key={group.key}>
-                <SelectLabel>{group.label}</SelectLabel>
-                {group.models.map((model) => (
-                  <SelectItem key={model.id} value={model.id}>
-                    {isZh ? model.labelZh : model.label}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            ))
-          )}
-        </SelectContent>
-      </Select>
-    </div>
   );
 }
 
@@ -173,8 +106,6 @@ interface StudioOptionsPopoverProps {
   mode: "image" | "video";
   imageModels: ImageModelEntry[];
   activeImageModelId: string;
-  hasImageModels: boolean;
-  onImageModelChange: (value: string) => void;
   aspectRatio: string;
   onAspectRatioChange: (value: string) => void;
   candidateCount: number;
@@ -190,7 +121,6 @@ interface StudioOptionsPopoverProps {
   onProjectChange: (value: string) => void;
   onCreateProject: () => void;
   isCreatingProject: boolean;
-  isZh: boolean;
   generationParameters: GenerationParameters;
   onGenerationParametersChange: (parameters: GenerationParameters) => void;
   labels: {
@@ -198,8 +128,6 @@ interface StudioOptionsPopoverProps {
     model: string;
     output: string;
     project: string;
-    imageModel: string;
-    noBackend: string;
     aspectRatio: string;
     variants: string;
     selectProject: string;
@@ -219,8 +147,6 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
   mode,
   imageModels,
   activeImageModelId,
-  hasImageModels,
-  onImageModelChange,
   aspectRatio,
   onAspectRatioChange,
   candidateCount,
@@ -236,7 +162,6 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
   onProjectChange,
   onCreateProject,
   isCreatingProject,
-  isZh,
   generationParameters,
   onGenerationParametersChange,
   labels,
@@ -276,19 +201,9 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
         sideOffset={8}
         className="w-[min(380px,calc(100vw-24px))] space-y-4 rounded-xl border border-(--border-active) bg-(--bg-elevated) p-3 shadow-[var(--shadow-lg)]"
       >
-        <div className="space-y-1.5">
-          <FieldLabel>{labels.model}</FieldLabel>
-          {mode === "image" ? (
-            <ImageModelSelect
-              value={activeImageModelId}
-              models={imageModels}
-              disabled={!hasImageModels}
-              onChange={onImageModelChange}
-              isZh={isZh}
-              noBackendLabel={labels.noBackend}
-              ariaLabel={labels.imageModel}
-            />
-          ) : (
+        {mode === "video" ? (
+          <div className="space-y-1.5">
+            <FieldLabel>{labels.model}</FieldLabel>
             <div className="flex flex-wrap items-center gap-2">
               <VideoControls
                 modelId={selectedVideoModelId}
@@ -299,8 +214,8 @@ export const StudioOptionsPopover = memo(function StudioOptionsPopover({
                 hasReferenceImage={hasVideoReference}
               />
             </div>
-          )}
-        </div>
+          </div>
+        ) : null}
 
         {mode === "image" ? (
           <div className="space-y-3">
