@@ -44,3 +44,6 @@ pnpm build
 Add the conditional desktop/Rust gates from
 [Developer Setup](../docs/DEV_SETUP.md). Verify behavior and UI in the current
 Tauri build, not a browser or stale installed app.
+
+For manual acceptance, use the [Manual QA Guide](../docs/QA_MANUAL.md) and
+attach evidence for any failed or conditional case.

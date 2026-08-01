@@ -1,54 +1,91 @@
-# Lunery Lab Studio
+<p align="center">
+  <img src=".github/readme/studio-composer.jpeg" alt="Lunery Lab Studio composer with a prompt, reference image, format, style, and generation controls" width="970" />
+</p>
 
-A local-first, open-source desktop Studio for AI image and video creation.
-No accounts, no credits, no hosted workspace. Local projects and downloaded
-models live on your machine; BYOK credentials are stored in the OS keychain,
-and optional cloud requests go directly to the provider you choose.
+<h1 align="center">Lunery Lab Studio</h1>
 
-[![Latest release](https://img.shields.io/github/v/release/mike007jd/lunerylab-studio)](https://github.com/mike007jd/lunerylab-studio/releases)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platforms: macOS and Windows](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Windows-lightgrey.svg)](https://github.com/mike007jd/lunerylab-studio/releases)
+<p align="center">
+  <strong>Make images. Shape ideas. Keep the work yours.</strong><br />
+  A local-first, open-source desktop Studio for AI image and video creation.
+</p>
 
-![The Studio composer with an image prompt, a reference image, and Image/Video, Single/Batch, Style, aspect-ratio, and reference controls](.github/readme/studio-composer.jpeg)
+<p align="center">
+  <a href="https://github.com/mike007jd/lunerylab-studio/releases"><strong>Download the desktop app</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#how-it-flows">See the workflow</a>
+  &nbsp;·&nbsp;
+  <a href="#build-locally">Build locally</a>
+</p>
 
-**[Download](#download) · [Documentation](#documentation) · [Build locally](#build-locally)**
+<p align="center">
+  <a href="https://github.com/mike007jd/lunerylab-studio/releases"><img src="https://img.shields.io/github/v/release/mike007jd/lunerylab-studio?label=latest%20release" alt="Latest release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0 license" /></a>
+  <a href="https://github.com/mike007jd/lunerylab-studio/releases"><img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Windows-lightgrey.svg" alt="Available for macOS and Windows" /></a>
+</p>
 
-## Why Lunery Lab Studio
+Lunery Lab Studio is a focused creative workspace for turning an idea into an
+image or video, then carrying it through refinement and organization. Use
+Local AI when it fits your machine, or connect a cloud service you already use.
+There is no Studio account, credit system, hosted workspace, or platform-owned
+model gateway in the middle.
 
-- **Local where supported.** Run image generation with SD.cpp or ComfyUI; use
-  Ollama, LM Studio, llama.cpp, MLX, or an OpenAI-compatible local endpoint
-  for text and prompt workflows. Hugging Face model discovery and download are
-  built into the app.
-- **Cloud by choice.** Cloud image and video generation stay BYOK: select an
-  available provider and model, with credentials stored in the OS keychain.
-  Requests go directly to that provider, never through a platform gateway.
-- **Free and open source.** Apache-2.0, single-user, and account-less. No Pro
-  tier, no billing, no platform-funded model gateway.
+## Built around your creative choices
 
-## Inside the Studio
+| Start where you are | Choose every connection | Keep the work close |
+| --- | --- | --- |
+| Discover and download compatible local models, or connect a local engine already running on your computer. | Add your own cloud API connection only when you want it, and select the model used for each capability. | Projects, media, canvases, settings, and downloaded models live in a visible folder on your machine. Keys stay in the OS keychain. |
 
-- **Composer** — image and video generation with single/batch modes, styles,
-  aspect ratios, and reference images.
-- **Model settings** — local models recommended for your hardware, plus BYOK
-  cloud connections, in one place.
-- **Canvas and library** — iterate on results and organize generated media.
+The result is deliberately simple: no surprise model fallback, no platform
+subscription layer, and no need to move a project into someone else's
+workspace just to create.
 
-![Image settings showing a local Stable Diffusion model ready for this computer and a cloud-service connection form whose keys stay on the computer](.github/readme/settings-models-and-keys.jpeg)
+## How it flows
+
+1. **Compose a direction.** Start with a prompt, add reference images, choose
+   image or video, and set the style, aspect ratio, count, or batch.
+2. **Generate with intent.** Create locally or with the cloud connection and
+   exact model you selected — Studio never silently chooses one for you.
+3. **Keep iterating.** Send a result to Canvas, reuse it as a reference, and
+   organize the finished work in your Library and projects.
+
+<table>
+  <tr>
+    <td width="33%"><img src="my-app/public/showcase/demo-ref-moon.webp" alt="A moon image from a built-in Lunery Lab Studio sample project" /></td>
+    <td width="33%"><img src="my-app/public/showcase/demo-stylize-oil.webp" alt="An oil-painting style image from a built-in Lunery Lab Studio sample project" /></td>
+    <td width="33%"><img src="my-app/public/samples/ceramic-vase.webp" alt="A ceramic vase image from a built-in Lunery Lab Studio sample project" /></td>
+  </tr>
+</table>
+
+<p align="center"><em>Built-in sample projects give every new local workspace a starting point.</em></p>
+
+## A Studio, not a model picker
+
+The composer keeps the creative decision in front: prompt, references, format,
+style, and generation controls live together. Recent results remain close so
+you can compare, branch, or carry one forward.
+
+When a project needs a different tool, Settings stays out of the way until you
+need it. Studio can recommend a local image model for the computer, show its
+readiness, and let you add an optional cloud connection without sending keys to
+a platform gateway.
+
+![Lunery Lab Studio settings showing a ready local Stable Diffusion model and an optional cloud-service connection whose key stays on the computer](.github/readme/settings-models-and-keys.jpeg)
 
 ## Download
 
-Get the latest installers from
-[GitHub Releases](https://github.com/mike007jd/lunerylab-studio/releases)
-(macOS releases are signed and notarized):
+Get the current installers and checksums from
+[GitHub Releases](https://github.com/mike007jd/lunerylab-studio/releases).
 
-- macOS (Apple Silicon): `Lunery-Lab-Studio-macOS-arm64.dmg`
-- Windows (x64): `Lunery-Lab-Studio-Windows-x64.exe` (CPU inference)
-- `SHA256SUMS.txt` for checksum verification
+| Platform | Release asset |
+| --- | --- |
+| macOS (Apple Silicon) | `Lunery-Lab-Studio-macOS-arm64.dmg` — signed and notarized |
+| Windows (x64) | `Lunery-Lab-Studio-Windows-x64.exe` — CPU inference |
 
-The desktop app stores its workspace under `~/.lunerylab/studio`. Local model
-files can consume tens of gigabytes. **Settings → Workspace Data** backs up
-projects, images, canvases, and settings; downloaded models and OS-keychain
-secrets are intentionally excluded.
+Every release includes `SHA256SUMS.txt` so you can verify the installer before
+opening it. Studio stores its workspace at `~/.lunerylab/studio`; local models
+may need tens of gigabytes. **Settings → Workspace Data** backs up projects,
+images, canvases, and settings. Downloaded models and OS-keychain secrets are
+intentionally excluded.
 
 ## Build locally
 
@@ -60,34 +97,24 @@ pnpm prisma:generate
 pnpm desktop:dev
 ```
 
-Requires Node.js `>=22.23.1`, pnpm `>=10`, and Rust (for the Tauri desktop
-shell). Desktop uses embedded PGlite — no external Postgres needed. The full
-workflow and verification gates are in
+You need Node.js `>=22.23.1`, pnpm `>=10`, and Rust for the Tauri desktop
+shell. Desktop uses embedded PGlite, so no external Postgres is required. For
+the full setup and verification flow, read
 [Developer Setup](docs/DEV_SETUP.md).
 
-## Local-first and private
-
-Studio runs as a desktop app (Tauri 2) with a private local server; its
-workspace APIs only answer the desktop shell, and there is no browser Studio,
-account system, or platform-hosted generation chain. Provider keys are stored
-in the OS keychain, and your workspace — configuration, database, media, and
-models — lives in a visible folder on your disk.
-
-## Documentation
+## Documentation and contributing
 
 | Need | Start here |
 | --- | --- |
-| Setup and validation | [docs/DEV_SETUP.md](docs/DEV_SETUP.md) |
-| Documentation map | [docs/README.md](docs/README.md) |
-| Product and engineering rules | [spec](spec) |
-| Contribution checklist | [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md) |
+| Set up, run, and validate Studio | [docs/DEV_SETUP.md](docs/DEV_SETUP.md) |
+| Run human desktop acceptance | [docs/QA_MANUAL.md](docs/QA_MANUAL.md) |
+| Find the engineering documentation | [docs/README.md](docs/README.md) |
+| Understand product and engineering rules | [spec](spec) |
+| Contribute a change | [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md) |
 
-## Contributing
-
-Issues and pull requests are welcome. Read the
-[contribution checklist](.github/CONTRIBUTING.md) first — it covers the
-required verification gates and the product boundaries that are not open for
-change.
+Issues and pull requests are welcome. Please read the
+[contribution checklist](.github/CONTRIBUTING.md) before opening one; it covers
+the verification gates and product boundaries that keep Studio dependable.
 
 ## License
 

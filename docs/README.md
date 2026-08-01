@@ -8,6 +8,7 @@ files over 180 lines / 1,000 words; legal notices are exempt from the size cap.
 | Need | Document |
 | --- | --- |
 | Fresh setup and verification | [DEV_SETUP.md](DEV_SETUP.md) |
+| Manual desktop QA | [QA_MANUAL.md](QA_MANUAL.md) |
 | System and path map | [SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md) |
 | Implemented features | [features/README.md](features/README.md) |
 | Release and cleanup | [OPERATIONS.md](OPERATIONS.md) |
