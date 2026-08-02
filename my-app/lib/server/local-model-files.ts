@@ -4,7 +4,14 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { type HfModelEntry } from "@/lib/hf-model-catalog";
-import { modelCachePath, modelsCacheRoot } from "@/lib/server/imported-model-registry";
+import {
+  isImportedModelRecord,
+  modelCachePath,
+  modelsCacheRoot,
+  upsertImportedModel,
+  type ImportedModelRecord,
+} from "@/lib/server/imported-model-registry";
+import { prisma } from "@/lib/server/prisma";
 import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 import {
   nativeProfileMkdir,
@@ -92,8 +99,22 @@ export interface StagedManagedModelFile {
 }
 
 interface ManagedModelCleanupJournal {
-  version: 1;
+  version: 2;
   stages: StagedManagedModelFile[];
+  recovery?: ManagedModelDeletionRecovery;
+}
+
+export interface ManagedModelDeletionRecovery {
+  ownerId: string;
+  modelId: string;
+  importedModel?: ImportedModelRecord;
+  defaults: {
+    cleared: Array<"text" | "image">;
+    previous: {
+      defaultTextModel: string;
+      defaultImageModel: string;
+    };
+  };
 }
 
 export class ManagedModelCleanupPendingError extends Error {
@@ -110,6 +131,7 @@ export const __localModelFilesTestHooks = {
   beforeMutation: null as null | ((filePath: string) => Promise<void> | void),
   afterPreparedJournal: null as null | ((journalPath: string) => Promise<void> | void),
   afterStage: null as null | ((stage: StagedManagedModelFile) => Promise<void> | void),
+  afterRecoveryJournal: null as null | ((journalPath: string) => Promise<void> | void),
   afterCommittedMarker: null as null | ((journalPath: string) => Promise<void> | void),
 };
 
@@ -120,8 +142,12 @@ export class SimulatedManagedModelCrashError extends Error {
   }
 }
 
+const journalPaths = new WeakMap<object, string>();
+
 function journalPathFor(stagedFiles: readonly StagedManagedModelFile[]): string | null {
-  return stagedFiles.find((stage) => stage.journalPath)?.journalPath ?? null;
+  return journalPaths.get(stagedFiles as object)
+    ?? stagedFiles.find((stage) => stage.journalPath)?.journalPath
+    ?? null;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -187,6 +213,7 @@ export async function stageManagedModelFiles(
   if (plans.length === 0) return [];
   const journalPath = await writeManagedCleanupJournal(plans);
   const staged: StagedManagedModelFile[] = [];
+  journalPaths.set(staged, journalPath);
   try {
     if (process.env.NODE_ENV === "test" && __localModelFilesTestHooks.afterPreparedJournal) {
       await __localModelFilesTestHooks.afterPreparedJournal(journalPath);
@@ -289,32 +316,99 @@ function validateCleanupStages(value: unknown): StagedManagedModelFile[] {
   });
 }
 
+function validateDeletionRecovery(value: unknown): ManagedModelDeletionRecovery {
+  if (!value || typeof value !== "object") {
+    throw new Error("Corrupt managed model deletion recovery journal.");
+  }
+  const recovery = value as Partial<ManagedModelDeletionRecovery>;
+  const defaults = recovery.defaults;
+  if (
+    typeof recovery.ownerId !== "string"
+    || recovery.ownerId.length === 0
+    || typeof recovery.modelId !== "string"
+    || recovery.modelId.length === 0
+    || !defaults
+    || !Array.isArray(defaults.cleared)
+    || !defaults.cleared.every((entry) => entry === "text" || entry === "image")
+    || typeof defaults.previous?.defaultTextModel !== "string"
+    || typeof defaults.previous?.defaultImageModel !== "string"
+    || (recovery.importedModel !== undefined && !isImportedModelRecord(recovery.importedModel))
+  ) {
+    throw new Error("Corrupt managed model deletion recovery journal.");
+  }
+  if (recovery.importedModel && recovery.importedModel.id !== recovery.modelId) {
+    throw new Error("Managed model deletion recovery journal has mismatched metadata.");
+  }
+  return {
+    ownerId: recovery.ownerId,
+    modelId: recovery.modelId,
+    ...(recovery.importedModel ? { importedModel: recovery.importedModel } : {}),
+    defaults: {
+      cleared: [...new Set(defaults.cleared)],
+      previous: {
+        defaultTextModel: defaults.previous.defaultTextModel,
+        defaultImageModel: defaults.previous.defaultImageModel,
+      },
+    },
+  };
+}
+
 async function writeManagedCleanupJournal(
   stagedFiles: readonly StagedManagedModelFile[],
+  options: { journalPath?: string; recovery?: ManagedModelDeletionRecovery } = {},
 ): Promise<string> {
   const directory = managedCleanupJournalDir();
   await nativeProfileMkdir("models", profileRelativePath("models", directory));
-  const journalPath = path.join(directory, `${randomUUID()}.json`);
+  const journalPath = options.journalPath ?? path.join(directory, `${randomUUID()}.json`);
   const payload: ManagedModelCleanupJournal = {
-    version: 1,
+    version: 2,
     stages: validateCleanupStages([...stagedFiles]),
+    ...(options.recovery ? { recovery: validateDeletionRecovery(options.recovery) } : {}),
   };
   await nativeProfileWrite(
     "models",
     profileRelativePath("models", journalPath),
     Buffer.from(JSON.stringify(payload), "utf8"),
-    { replace: false },
+    { replace: Boolean(options.journalPath) },
   );
   return journalPath;
 }
 
-async function readManagedCleanupJournal(journalPath: string): Promise<StagedManagedModelFile[]> {
+async function readManagedCleanupJournal(journalPath: string): Promise<ManagedModelCleanupJournal> {
   const parsed = JSON.parse(await fs.readFile(journalPath, "utf8")) as {
     version?: unknown;
     stages?: unknown;
+    recovery?: unknown;
   };
-  if (parsed.version !== 1) throw new Error("Corrupt managed model cleanup journal.");
-  return validateCleanupStages(parsed.stages);
+  if (parsed.version !== 2) throw new Error("Corrupt managed model cleanup journal.");
+  return {
+    version: 2,
+    stages: validateCleanupStages(parsed.stages),
+    ...(parsed.recovery !== undefined
+      ? { recovery: validateDeletionRecovery(parsed.recovery) }
+      : {}),
+  };
+}
+
+/**
+ * Durably attach the metadata/default rollback snapshot before either is
+ * changed. A crash before this publication only needs to restore staged bytes;
+ * a crash afterwards can restore every logical owner before making bytes
+ * visible again.
+ */
+export async function attachManagedModelDeletionRecovery(
+  stagedFiles: readonly StagedManagedModelFile[],
+  recovery: ManagedModelDeletionRecovery,
+): Promise<void> {
+  const existingJournalPath = journalPathFor(stagedFiles);
+  const journalPath = await writeManagedCleanupJournal(stagedFiles, {
+    ...(existingJournalPath ? { journalPath: existingJournalPath } : {}),
+    recovery,
+  });
+  journalPaths.set(stagedFiles as object, journalPath);
+  if (process.env.NODE_ENV === "test" && __localModelFilesTestHooks.afterRecoveryJournal) {
+    await __localModelFilesTestHooks.afterRecoveryJournal(journalPath);
+  }
 }
 
 /**
@@ -325,8 +419,8 @@ async function readManagedCleanupJournal(journalPath: string): Promise<StagedMan
 export async function markManagedModelFilesCommitted(
   stagedFiles: readonly StagedManagedModelFile[],
 ): Promise<void> {
-  if (stagedFiles.length === 0) return;
   const journalPath = journalPathFor(stagedFiles);
+  if (stagedFiles.length === 0 && !journalPath) return;
   if (!journalPath) throw new Error("Managed model deletion has no prepared journal.");
   await nativeProfileWrite(
     "models",
@@ -342,8 +436,8 @@ export async function markManagedModelFilesCommitted(
 export async function finalizeManagedModelFiles(
   stagedFiles: readonly StagedManagedModelFile[],
 ): Promise<number> {
-  if (stagedFiles.length === 0) return 0;
   const journalPath = journalPathFor(stagedFiles);
+  if (stagedFiles.length === 0 && !journalPath) return 0;
   if (!journalPath || !(await pathExists(`${journalPath}.committed`))) {
     throw new Error("Managed model deletion has no durable committed marker.");
   }
@@ -381,13 +475,36 @@ async function listManagedCleanupJournals(): Promise<string[]> {
     .map((entry) => path.join(directory, entry.name));
 }
 
+async function restoreManagedModelDeletionMetadata(
+  recovery: ManagedModelDeletionRecovery,
+): Promise<void> {
+  if (recovery.importedModel) {
+    await upsertImportedModel(recovery.importedModel);
+  }
+  const data: { defaultTextModel?: string; defaultImageModel?: string } = {};
+  if (recovery.defaults.cleared.includes("text")) {
+    data.defaultTextModel = recovery.defaults.previous.defaultTextModel;
+  }
+  if (recovery.defaults.cleared.includes("image")) {
+    data.defaultImageModel = recovery.defaults.previous.defaultImageModel;
+  }
+  if (Object.keys(data).length > 0) {
+    await prisma.userSettings.update({
+      where: { userId: recovery.ownerId },
+      data,
+    });
+  }
+}
+
 /** Roll prepared work back; finish committed cleanup after a process crash. */
 export async function reconcileStagedManagedModelFiles(): Promise<number> {
   return withSharedMutationLease(async () => {
     let removed = 0;
     for (const journalPath of await listManagedCleanupJournals()) {
-      const stages = (await readManagedCleanupJournal(journalPath))
+      const journal = await readManagedCleanupJournal(journalPath);
+      const stages = journal.stages
         .map((stage) => stageWithJournal(stage, journalPath));
+      journalPaths.set(stages, journalPath);
       if (await pathExists(`${journalPath}.committed`)) {
         removed += await commitManagedModelFiles(stages);
         await nativeProfileUnlink("models", profileRelativePath("models", `${journalPath}.committed`), {
@@ -397,6 +514,12 @@ export async function reconcileStagedManagedModelFiles(): Promise<number> {
           missingOk: true,
         });
       } else {
+        // Restore logical owners first. If this fails, leave bytes staged and
+        // retain the journal so the next cold-start barrier retries without
+        // exposing a record/default that points at missing bytes.
+        if (journal.recovery) {
+          await restoreManagedModelDeletionMetadata(journal.recovery);
+        }
         await rollbackManagedModelFiles(stages);
       }
     }

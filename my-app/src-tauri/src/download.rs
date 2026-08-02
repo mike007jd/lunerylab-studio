@@ -436,6 +436,56 @@ impl DownloadState {
         Ok(())
     }
 
+    pub(crate) fn renew_destination_delete_lease(
+        &self,
+        destination: PathBuf,
+        lease_id: &str,
+    ) -> Result<(), String> {
+        self.renew_destination_delete_lease_at(destination, lease_id, Instant::now())
+    }
+
+    fn renew_destination_delete_lease_at(
+        &self,
+        destination: PathBuf,
+        lease_id: &str,
+        now: Instant,
+    ) -> Result<(), String> {
+        let mut leases = self
+            .1
+            .lock()
+            .map_err(|_| "Download deletion lease lock poisoned".to_string())?;
+        leases.retain(|_, lease| lease.expires_at > now);
+        if leases
+            .get(&destination)
+            .map(|lease| lease.lease_id.as_str())
+            != Some(lease_id)
+        {
+            return Err("Model deletion lease was lost".to_string());
+        }
+        // Check the job table while holding locks in the same lease->jobs order
+        // as reservation. A racing download either observes this live lease or
+        // is visible here before the expiry is extended.
+        let jobs = self
+            .0
+            .lock()
+            .map_err(|_| "Download state lock poisoned".to_string())?;
+        if jobs.values().any(|job| {
+            job.owns_destination
+                && !is_terminal_download_status(&job.status)
+                && job.destination == destination
+        }) {
+            return Err("Download destination ownership was lost during deletion".to_string());
+        }
+        leases.insert(
+            destination,
+            DestinationDeleteLease {
+                lease_id: lease_id.to_string(),
+                expires_at: now + DESTINATION_DELETE_LEASE_TTL,
+            },
+        );
+        Ok(())
+    }
+
     pub(crate) fn release_destination_delete_lease(&self, destination: &Path, lease_id: &str) {
         if let Ok(mut leases) = self.1.lock() {
             if leases.get(destination).map(|lease| lease.lease_id.as_str()) == Some(lease_id) {
@@ -697,12 +747,12 @@ impl SecureDownloadTarget {
         identity: &Mutex<Option<SecureFileIdentity>>,
         label: &str,
     ) -> std::io::Result<()> {
-        use rustix::fs::{renameat_with, RenameFlags};
+        use rustix::fs::{renameat_with, unlinkat, AtFlags, RenameFlags};
 
         let expected = Self::expected_identity(identity, label)?;
         let current = match self.open_at(name, rustix::fs::OFlags::RDONLY) {
             Ok(file) => SecureFileIdentity::from_file(&file)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(error),
             Err(error) => return Err(error),
         };
         let sequence = DOWNLOAD_QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -727,6 +777,12 @@ impl SecureDownloadTarget {
                 quarantine_name.to_string_lossy()
             )));
         }
+        drop(quarantined);
+        unlinkat(&self.parent, &quarantine_name, AtFlags::empty())?;
+        // Persist both the quarantine rename and its removal. Reporting
+        // cleanup success before the parent directory is synced can leave the
+        // failed hash/write occupying disk after a power loss.
+        self.parent.sync_all()?;
         Ok(())
     }
 
@@ -2443,7 +2499,7 @@ mod tests {
             .acquire_destination_delete_lease_at(destination.clone(), "renew", t0)
             .expect("initial lease");
         state
-            .acquire_destination_delete_lease_at(
+            .renew_destination_delete_lease_at(
                 destination.clone(),
                 "renew",
                 t0 + Duration::from_secs(59),
@@ -2460,12 +2516,37 @@ mod tests {
             )
             .is_err());
         assert!(state
-            .acquire_destination_delete_lease_at(
+            .renew_destination_delete_lease_at(
                 destination,
                 "different-owner",
                 t0 + Duration::from_secs(61),
             )
             .is_err());
+    }
+
+    #[test]
+    fn renewal_fails_closed_after_expiry_even_when_a_download_took_ownership() {
+        let state = DownloadState::default();
+        let destination = unique_test_path("renewal-active-download.gguf");
+        let t0 = Instant::now();
+        state
+            .acquire_destination_delete_lease_at(destination.clone(), "renew", t0)
+            .expect("initial lease");
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+        state
+            .reserve_job_at(
+                "active-after-expiry",
+                destination.clone(),
+                Arc::new(DownloadCancel::new()),
+                tx,
+                t0 + Duration::from_secs(61),
+            )
+            .expect("job starts after lease expiry");
+
+        assert!(state
+            .renew_destination_delete_lease_at(destination, "renew", t0 + Duration::from_secs(62),)
+            .expect_err("expired renewal must fail closed")
+            .contains("lease was lost"));
     }
 
     #[cfg(unix)]
@@ -2633,6 +2714,47 @@ mod tests {
         assert_eq!(
             std::fs::read(quarantined.path()).expect("replacement preserved"),
             b"replacement-b"
+        );
+        std::fs::remove_dir_all(&root).expect("remove model fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_unlinks_the_verified_quarantine_before_reporting_removed() {
+        use std::io::Write;
+
+        let root = unique_test_path("cleanup-unlinks-quarantine-root");
+        std::fs::create_dir_all(&root).expect("create model root");
+        let canonical_root = root.canonicalize().expect("canonical model root");
+        let target = SecureDownloadTarget::pin_in_root(
+            canonical_root.clone(),
+            canonical_root.join("model.gguf"),
+        )
+        .expect("pin destination");
+        let part_path = root.join("model.gguf.part");
+
+        let mut part = target
+            .open_at(
+                &target.part_name,
+                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::TRUNC,
+            )
+            .expect("open part");
+        part.write_all(b"bad-hash-bytes").expect("write part");
+        let identity = SecureFileIdentity::from_file(&part).expect("part identity");
+        *target.part_identity.lock().expect("identity lock") = Some(identity);
+        drop(part);
+
+        target.unlink_part().expect("verified cleanup");
+        assert!(!part_path.exists());
+        assert!(
+            std::fs::read_dir(&root)
+                .expect("list model root")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("lunery-quarantine")),
+            "successful cleanup must not leave quarantine bytes behind"
         );
         std::fs::remove_dir_all(&root).expect("remove model fixture");
     }

@@ -55,6 +55,10 @@ export async function PATCH(request: Request) {
     // message in the top-level `message` for plain callers.
     const body = await parseJsonBody(request, settingsPatchSchema);
 
+    // Hold one authority from local-model validation through the settings
+    // write. Destructive model deletion takes workspace exclusivity, so it
+    // either waits for this commit and clears the chosen model afterwards, or
+    // blocks this request before it can validate stale inventory.
     return await withSharedMutationLease(async () => {
       const data: {
         defaultTextModel?: string;

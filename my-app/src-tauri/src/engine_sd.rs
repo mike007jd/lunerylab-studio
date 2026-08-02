@@ -260,6 +260,43 @@ pub(crate) fn acquire_sd_model_delete_lease(
     acquire_sd_model_delete_lease_at(model_path, lease_id, Instant::now())
 }
 
+pub(crate) fn renew_sd_model_delete_lease(model_path: &str, lease_id: &str) -> Result<(), String> {
+    renew_sd_model_delete_lease_at(model_path, lease_id, Instant::now())
+}
+
+fn renew_sd_model_delete_lease_at(
+    model_path: &str,
+    lease_id: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if lease_id.is_empty() || lease_id.len() > 128 {
+        return Err("Invalid SD model deletion lease".to_string());
+    }
+    let model_path = normalize_sd_model_path(model_path);
+    let mut state = sd_model_state()
+        .lock()
+        .map_err(|_| "SD model state lock poisoned".to_string())?;
+    state
+        .delete_leases
+        .retain(|_, lease| lease.expires_at > now);
+    if state
+        .delete_leases
+        .get(&model_path)
+        .map(|lease| lease.lease_id.as_str())
+        != Some(lease_id)
+    {
+        return Err("Image model deletion lease was lost".to_string());
+    }
+    state.delete_leases.insert(
+        model_path,
+        SdModelDeleteLease {
+            lease_id: lease_id.to_string(),
+            expires_at: now + SD_MODEL_DELETE_LEASE_TTL,
+        },
+    );
+    Ok(())
+}
+
 fn acquire_sd_model_delete_lease_at(
     model_path: &str,
     lease_id: &str,
@@ -1350,11 +1387,12 @@ mod tests {
     use super::{
         acquire_sd_model_delete_lease, acquire_sd_model_delete_lease_at, advance_sd_runtime_epoch,
         begin_sd_run, bridge_cancel_sd, bridge_stop_sd, bridge_stop_sd_if_model_path,
-        queue_pending_cancel, release_sd_model_delete_lease, sd_active_model_path, sd_cancel_flag,
-        sd_inflight_child, sd_may_spawn, sd_model_id_from_argv, sd_progress_for_run,
-        sd_runtime_epoch, sd_spawn_decision, sd_spawn_gate, set_sd_image_phase, set_sd_progress,
-        validate_sd_run_argv, ActiveSdModelGuard, PinnedSdOutput, SdProgress, SdProgressParser,
-        SdProgressPhase, SdSpawnDecision,
+        queue_pending_cancel, release_sd_model_delete_lease, renew_sd_model_delete_lease_at,
+        sd_active_model_path, sd_cancel_flag, sd_inflight_child, sd_may_spawn,
+        sd_model_id_from_argv, sd_progress_for_run, sd_runtime_epoch, sd_spawn_decision,
+        sd_spawn_gate, set_sd_image_phase, set_sd_progress, validate_sd_run_argv,
+        ActiveSdModelGuard, PinnedSdOutput, SdProgress, SdProgressParser, SdProgressPhase,
+        SdSpawnDecision,
     };
     use crate::test_global_lock;
     use std::sync::atomic::Ordering;
@@ -1443,7 +1481,7 @@ mod tests {
         let model_path = "/models/renewed-delete.safetensors";
         let t0 = Instant::now();
         acquire_sd_model_delete_lease_at(model_path, "renew", t0).expect("initial lease");
-        acquire_sd_model_delete_lease_at(model_path, "renew", t0 + Duration::from_secs(59))
+        renew_sd_model_delete_lease_at(model_path, "renew", t0 + Duration::from_secs(59))
             .expect("same-id renewal");
 
         assert!(ActiveSdModelGuard::set_at(
@@ -1458,6 +1496,19 @@ mod tests {
         )
         .is_err());
         release_sd_model_delete_lease(model_path, "renew");
+    }
+
+    #[test]
+    fn expired_sd_delete_lease_cannot_be_reacquired_as_a_renewal() {
+        let _g = test_global_lock();
+        let model_path = "/tmp/lunery-expired-sd-delete-lease.safetensors";
+        let t0 = Instant::now();
+        acquire_sd_model_delete_lease_at(model_path, "renew", t0).expect("initial lease");
+        assert!(
+            renew_sd_model_delete_lease_at(model_path, "renew", t0 + Duration::from_secs(61),)
+                .expect_err("expired lease must fail closed")
+                .contains("was lost")
+        );
     }
 
     #[test]

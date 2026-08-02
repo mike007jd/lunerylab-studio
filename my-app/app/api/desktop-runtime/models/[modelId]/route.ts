@@ -27,6 +27,7 @@ import {
   type StagedExternalModelFile,
 } from "@/lib/server/imported-model-registry";
 import {
+  attachManagedModelDeletionRecovery,
   catalogModelFiles,
   finalizeManagedModelFiles,
   markManagedModelFilesCommitted,
@@ -38,7 +39,7 @@ import {
 import { invalidateLocalModelInstallStatusCache } from "@/lib/server/local-model-inventory";
 import { prisma } from "@/lib/server/prisma";
 import { getLocalWorkspacePreferences, requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
-import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
+import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
 
 export const dynamic = "force-dynamic";
 
@@ -257,14 +258,20 @@ async function releaseModelDeleteLeases(
   if (leases.llamaModelPath) {
     releases.push(bridgeFetch(bridge, "/llama-delete-lease-release", {
       method: "POST",
-      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.llamaModelPath }),
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.llamaModelPath,
+      }),
       signal: AbortSignal.timeout(5_000),
     }));
   }
   if (leases.sdModelPath) {
     releases.push(bridgeFetch(bridge, "/sd-delete-lease-release", {
       method: "POST",
-      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.sdModelPath }),
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.sdModelPath,
+      }),
       signal: AbortSignal.timeout(5_000),
     }));
   }
@@ -282,39 +289,48 @@ async function renewModelDeleteLeases(
       body: JSON.stringify({
         leaseId: leases.leaseId,
         destinations: leases.downloadPaths,
+        renew: true,
       }),
     });
   }
   if (leases.llamaModelPath) {
     renewals.push({
       endpoint: "/llama-delete-lease-acquire",
-      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.llamaModelPath }),
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.llamaModelPath,
+        renew: true,
+      }),
     });
   }
   if (leases.sdModelPath) {
     renewals.push({
       endpoint: "/sd-delete-lease-acquire",
-      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.sdModelPath }),
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.sdModelPath,
+        renew: true,
+      }),
     });
   }
-  for (const renewal of renewals) {
-    const response = await bridgeFetch(bridge, renewal.endpoint, {
+  const responses = await Promise.all(renewals.map((renewal) =>
+    bridgeFetch(bridge, renewal.endpoint, {
       method: "POST",
       body: renewal.body,
-      signal: AbortSignal.timeout(15_000),
-    }).catch(() => null);
-    if (!response?.ok) {
-      throw new ApiError({
-        status: 503,
-        code: "model_delete_lease_expired",
-        message: "Model deletion coordination expired. Try again.",
-        retryable: true,
-      });
-    }
+      signal: AbortSignal.timeout(5_000),
+    }).catch(() => null)));
+  if (responses.some((response) => !response?.ok)) {
+    throw new ApiError({
+      status: 503,
+      code: "model_delete_lease_expired",
+      message: "Model deletion coordination expired. Try again.",
+      retryable: true,
+    });
   }
+
 }
 
-const MODEL_DELETE_LEASE_HEARTBEAT_MS = 15_000;
+const MODEL_DELETE_LEASE_HEARTBEAT_MS = 10_000;
 
 interface ModelDeleteLeaseHeartbeat {
   assertHealthy(): Promise<void>;
@@ -474,29 +490,36 @@ async function stopActiveSd(bridge: DesktopBridge, modelPath: string | null): Pr
 }
 
 interface ClearedModelDefaults {
-  cleared: string[];
+  cleared: Array<"text" | "image">;
   previous: { defaultTextModel: string; defaultImageModel: string };
 }
 
 async function clearDeletedModelDefaults(
   ownerId: string,
+  defaults: ClearedModelDefaults,
+): Promise<ClearedModelDefaults> {
+  const data: { defaultTextModel?: string; defaultImageModel?: string } = {};
+  if (defaults.cleared.includes("text")) data.defaultTextModel = "";
+  if (defaults.cleared.includes("image")) data.defaultImageModel = "";
+  if (Object.keys(data).length > 0) {
+    await prisma.userSettings.update({ where: { userId: ownerId }, data });
+  }
+  return defaults;
+}
+
+async function inspectDeletedModelDefaults(
+  ownerId: string,
   modelId: string,
 ): Promise<ClearedModelDefaults> {
   const settings = await getLocalWorkspacePreferences(ownerId);
   const ids = modelSelectionIds(modelId);
-  const data: { defaultTextModel?: string; defaultImageModel?: string } = {};
-  const cleared: string[] = [];
+  const cleared: Array<"text" | "image"> = [];
 
   if (ids.has(settings.defaultTextModel)) {
-    data.defaultTextModel = "";
     cleared.push("text");
   }
   if (ids.has(settings.defaultImageModel)) {
-    data.defaultImageModel = "";
     cleared.push("image");
-  }
-  if (cleared.length > 0) {
-    await prisma.userSettings.update({ where: { userId: ownerId }, data });
   }
   return {
     cleared,
@@ -531,7 +554,11 @@ export async function DELETE(
       );
     }
     const owner = await requireLocalWorkspaceOwner();
-    return await withSharedMutationLease(async () => {
+    // Model deletion spans native cancellation/leases, profile bytes, registry
+    // metadata, and default selections. Exclusive workspace ownership makes
+    // that whole transaction atomic with settings validation+commit while
+    // remaining re-entrant for Prisma/profile mutations below.
+    return await withWorkspaceExclusive("model-delete", async () => {
     const rawModelId = (await params).modelId;
     const parsed = MODEL_ID.safeParse(rawModelId);
     if (!parsed.success) {
@@ -627,7 +654,17 @@ export async function DELETE(
       }
       stagedManaged = await stageManagedModelFiles(paths);
       await heartbeat.assertHealthy();
-      clearedDefaults = await clearDeletedModelDefaults(owner.id, modelId);
+      clearedDefaults = await inspectDeletedModelDefaults(owner.id, modelId);
+      await attachManagedModelDeletionRecovery(stagedManaged, {
+        ownerId: owner.id,
+        modelId,
+        ...(imported ? { importedModel: imported } : {}),
+        defaults: {
+          cleared: clearedDefaults.cleared,
+          previous: clearedDefaults.previous,
+        },
+      });
+      await clearDeletedModelDefaults(owner.id, clearedDefaults);
       await heartbeat.assertHealthy();
       if (imported) {
         await removeImportedModelIfUnchanged(imported);

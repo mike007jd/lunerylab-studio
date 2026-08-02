@@ -1012,7 +1012,7 @@ export async function resolveLocalModelPath(input: string): Promise<{
   }
 }
 
-function isImportedModelRecord(value: unknown): value is ImportedModelRecord {
+export function isImportedModelRecord(value: unknown): value is ImportedModelRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<ImportedModelRecord>;
   return (

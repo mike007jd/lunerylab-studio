@@ -36,6 +36,7 @@ import {
   acquireWorkspaceExclusive,
   getWorkspaceOperationGateStateForTests,
   resetWorkspaceOperationGateForTests,
+  withWorkspaceExclusive,
 } from "@/lib/server/workspace-operation-gate";
 
 function patch(defaultTextModel: string) {
@@ -165,5 +166,65 @@ describe("settings text-model server validation", () => {
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
       data: { defaultTextModel: "local:qwen" },
     }));
+  });
+
+  it("holds validation through commit so an in-flight model deletion waits then clears it", async () => {
+    let releaseInventory!: () => void;
+    const inventoryBlocked = new Promise<void>((resolve) => {
+      releaseInventory = resolve;
+    });
+    let validationStarted!: () => void;
+    const validationReady = new Promise<void>((resolve) => {
+      validationStarted = resolve;
+    });
+    mocks.listLocalModelInstallStatuses.mockImplementation(async () => {
+      validationStarted();
+      await inventoryBlocked;
+      return [{ id: "qwen", installed: true, capability: "planner-llm" }];
+    });
+    mocks.update.mockResolvedValue({
+      defaultLocale: "en",
+      defaultTextModel: "local:qwen",
+      defaultImageModel: "",
+      defaultVideoModel: "",
+    });
+
+    const settingsCommit = patch("local:qwen");
+    await validationReady;
+    let deletionEntered = false;
+    const deletion = withWorkspaceExclusive("model-delete", async () => {
+      deletionEntered = true;
+    });
+    await Promise.resolve();
+    expect(deletionEntered).toBe(false);
+
+    releaseInventory();
+    await expect(settingsCommit).resolves.toMatchObject({ status: 200 });
+    await deletion;
+    expect(deletionEntered).toBe(true);
+  });
+
+  it("rejects a stale local default while model deletion owns exclusivity", async () => {
+    const deletion = await acquireWorkspaceExclusive("model-delete");
+    try {
+      const response = await patch("local:qwen");
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({ code: "workspace_busy" });
+      expect(mocks.listLocalModelInstallStatuses).not.toHaveBeenCalled();
+      expect(mocks.update).not.toHaveBeenCalled();
+    } finally {
+      deletion.release();
+    }
+  });
+
+  it("revalidates inventory after a completed model deletion", async () => {
+    await withWorkspaceExclusive("model-delete", async () => undefined);
+    mocks.listLocalModelInstallStatuses.mockResolvedValue([]);
+
+    const response = await patch("local:qwen");
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "invalid_model" });
+    expect(mocks.update).not.toHaveBeenCalled();
   });
 });

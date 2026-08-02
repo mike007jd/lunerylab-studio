@@ -13,15 +13,16 @@ use crate::download::{
 };
 use crate::engine_llama::{
     acquire_llama_model_delete_lease, bridge_start_llama, bridge_stop_llama, llama_engine_slot,
-    release_llama_model_delete_lease,
+    release_llama_model_delete_lease, renew_llama_model_delete_lease,
 };
 use crate::engine_mlx::{
     bridge_start_mlx, bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot,
 };
 use crate::engine_sd::{
     acquire_sd_model_delete_lease, bridge_cancel_sd, bridge_finish_sd, bridge_sd_generate,
-    bridge_stop_sd_if_model_path, release_sd_model_delete_lease, sd_active_model_path,
-    sd_binary_path, sd_progress_for_run, valid_sd_run_id, SdGenerateBody, SdProgressPhase,
+    bridge_stop_sd_if_model_path, release_sd_model_delete_lease, renew_sd_model_delete_lease,
+    sd_active_model_path, sd_binary_path, sd_progress_for_run, valid_sd_run_id, SdGenerateBody,
+    SdProgressPhase,
 };
 use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
@@ -903,6 +904,8 @@ fn handle_bridge_request(
             struct LeaseBody {
                 lease_id: String,
                 destinations: Vec<String>,
+                #[serde(default)]
+                renew: bool,
             }
             let result = serde_json::from_str::<LeaseBody>(&body)
                 .map_err(|error| error.to_string())
@@ -921,9 +924,18 @@ fn handle_bridge_request(
                         .collect::<Result<Vec<_>, _>>()?;
                     let mut acquired: Vec<std::path::PathBuf> = Vec::new();
                     for destination in destinations {
-                        if let Err(error) = download_state
-                            .acquire_destination_delete_lease(destination.clone(), &lease.lease_id)
-                        {
+                        let result = if lease.renew {
+                            download_state.renew_destination_delete_lease(
+                                destination.clone(),
+                                &lease.lease_id,
+                            )
+                        } else {
+                            download_state.acquire_destination_delete_lease(
+                                destination.clone(),
+                                &lease.lease_id,
+                            )
+                        };
+                        if let Err(error) = result {
                             for prior in &acquired {
                                 download_state
                                     .release_destination_delete_lease(prior, &lease.lease_id);
@@ -1010,11 +1022,17 @@ fn handle_bridge_request(
             struct LeaseBody {
                 lease_id: String,
                 model_path: String,
+                #[serde(default)]
+                renew: bool,
             }
             match serde_json::from_str::<LeaseBody>(&body)
                 .map_err(|error| error.to_string())
                 .and_then(|lease| {
-                    acquire_llama_model_delete_lease(&lease.model_path, &lease.lease_id)
+                    if lease.renew {
+                        renew_llama_model_delete_lease(&lease.model_path, &lease.lease_id)
+                    } else {
+                        acquire_llama_model_delete_lease(&lease.model_path, &lease.lease_id)
+                    }
                 }) {
                 Ok(()) => write_http_response(
                     &mut stream,
@@ -1061,11 +1079,18 @@ fn handle_bridge_request(
             struct LeaseBody {
                 lease_id: String,
                 model_path: String,
+                #[serde(default)]
+                renew: bool,
             }
             match serde_json::from_str::<LeaseBody>(&body)
                 .map_err(|error| error.to_string())
-                .and_then(|lease| acquire_sd_model_delete_lease(&lease.model_path, &lease.lease_id))
-            {
+                .and_then(|lease| {
+                    if lease.renew {
+                        renew_sd_model_delete_lease(&lease.model_path, &lease.lease_id)
+                    } else {
+                        acquire_sd_model_delete_lease(&lease.model_path, &lease.lease_id)
+                    }
+                }) {
                 Ok(()) => write_http_response(
                     &mut stream,
                     "200 OK",

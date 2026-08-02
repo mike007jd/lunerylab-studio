@@ -4,6 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 vi.mock("server-only", () => ({}));
+const mocks = vi.hoisted(() => ({ userSettingsUpdate: vi.fn() }));
+vi.mock("@/lib/server/prisma", () => ({
+  prisma: { userSettings: { update: mocks.userSettingsUpdate } },
+}));
 
 let tmpDir: string;
 let modelsDir: string;
@@ -12,6 +16,8 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "local-model-files-"));
   modelsDir = path.join(tmpDir, "profile", "models");
   vi.stubEnv("LUNERY_MODELS_DIR", modelsDir);
+  mocks.userSettingsUpdate.mockReset();
+  mocks.userSettingsUpdate.mockResolvedValue({});
   vi.resetModules();
 });
 
@@ -151,6 +157,77 @@ describe("managed local model file deletion", () => {
 
     await expect(files.reconcileStagedManagedModelFiles()).resolves.toBe(1);
     expect(fs.existsSync(staged[0]!.stagedPath)).toBe(false);
+  });
+
+  it("restores registry, defaults, and bytes after a crash between metadata changes and commit marker", async () => {
+    const files = await import("@/lib/server/local-model-files");
+    const registry = await import("@/lib/server/imported-model-registry");
+    const modelPath = path.join(modelsDir, "llama-cpp", "crash-window.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "model");
+    const imported = {
+      id: "imported-llama-cpp-crash-window-12345678",
+      label: "Crash window",
+      source: "huggingface-url" as const,
+      runtimeTarget: "llama-cpp" as const,
+      capability: "planner-llm" as const,
+      format: "gguf" as const,
+      fileName: "crash-window.gguf",
+      modelPath,
+      sizeBytes: 5,
+      sha256: "a".repeat(64),
+      status: "ready" as const,
+      createdAt: "2026-08-03T00:00:00.000Z",
+      url: "https://huggingface.co/org/model/resolve/main/crash-window.gguf",
+    };
+    await registry.upsertImportedModel(imported);
+    const staged = await files.stageManagedModelFiles([modelPath]);
+    await files.attachManagedModelDeletionRecovery(staged, {
+      ownerId: "owner-1",
+      modelId: imported.id,
+      importedModel: imported,
+      defaults: {
+        cleared: ["text"],
+        previous: { defaultTextModel: `local:${imported.id}`, defaultImageModel: "" },
+      },
+    });
+
+    await registry.removeImportedModel(imported.id);
+    expect(await registry.findImportedModel(imported.id)).toBeUndefined();
+    expect(fs.existsSync(modelPath)).toBe(false);
+
+    await expect(files.reconcileStagedManagedModelFiles()).resolves.toBe(0);
+    expect(await registry.findImportedModel(imported.id)).toEqual(imported);
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("model");
+    expect(mocks.userSettingsUpdate).toHaveBeenCalledWith({
+      where: { userId: "owner-1" },
+      data: { defaultTextModel: `local:${imported.id}` },
+    });
+  });
+
+  it("keeps bytes staged until crash metadata restoration succeeds", async () => {
+    const files = await import("@/lib/server/local-model-files");
+    const modelPath = path.join(modelsDir, "sd-cpp", "retry-recovery.safetensors");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "model");
+    const staged = await files.stageManagedModelFiles([modelPath]);
+    await files.attachManagedModelDeletionRecovery(staged, {
+      ownerId: "owner-1",
+      modelId: "catalog-image",
+      defaults: {
+        cleared: ["image"],
+        previous: { defaultTextModel: "", defaultImageModel: "catalog-image" },
+      },
+    });
+    mocks.userSettingsUpdate.mockRejectedValueOnce(new Error("database unavailable"));
+
+    await expect(files.reconcileStagedManagedModelFiles()).rejects.toThrow("database unavailable");
+    expect(fs.existsSync(modelPath)).toBe(false);
+    expect(fs.existsSync(staged[0]!.stagedPath)).toBe(true);
+
+    mocks.userSettingsUpdate.mockResolvedValue({});
+    await expect(files.reconcileStagedManagedModelFiles()).resolves.toBe(0);
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("model");
   });
 
   it.runIf(process.platform !== "win32")(

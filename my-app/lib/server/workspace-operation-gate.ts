@@ -17,6 +17,7 @@ export type WorkspaceExclusiveOperation =
   | "backup"
   | "restore"
   | "destructive-reconcile"
+  | "model-delete"
   | "provider-unlink";
 
 interface GateState {

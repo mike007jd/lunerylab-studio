@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => ({
   commitImportedExternalModelFile: vi.fn(),
   catalogModelFiles: vi.fn(),
   stageManagedModelFiles: vi.fn(),
+  attachManagedModelDeletionRecovery: vi.fn(),
   finalizeManagedModelFiles: vi.fn(),
   markManagedModelFilesCommitted: vi.fn(),
   rollbackManagedModelFiles: vi.fn(),
@@ -81,6 +82,7 @@ vi.mock("@/lib/server/local-model-files", () => ({
   },
   catalogModelFiles: mocks.catalogModelFiles,
   stageManagedModelFiles: mocks.stageManagedModelFiles,
+  attachManagedModelDeletionRecovery: mocks.attachManagedModelDeletionRecovery,
   finalizeManagedModelFiles: mocks.finalizeManagedModelFiles,
   markManagedModelFilesCommitted: mocks.markManagedModelFilesCommitted,
   rollbackManagedModelFiles: mocks.rollbackManagedModelFiles,
@@ -151,6 +153,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       paths.map((originalPath) => ({ originalPath, stagedPath: `${originalPath}.stage` })),
     );
     mocks.finalizeManagedModelFiles.mockResolvedValue(0);
+    mocks.attachManagedModelDeletionRecovery.mockResolvedValue(undefined);
     mocks.markManagedModelFilesCommitted.mockResolvedValue(undefined);
     mocks.rollbackManagedModelFiles.mockResolvedValue(undefined);
     mocks.getBridgeDownloadJobs.mockResolvedValue([]);
@@ -774,6 +777,77 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     });
     expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
     expect(mocks.removeImportedModel).not.toHaveBeenCalled();
+  });
+
+  it("renews download and runtime leases concurrently within one heartbeat deadline", async () => {
+    const modelId = "imported-llama-cpp-concurrent-renew-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/concurrent.gguf";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    const renewalResolvers = new Map<string, (response: Response) => void>();
+    const acquireCounts = new Map<string, number>();
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint.endsWith("delete-lease-acquire")) {
+        const count = (acquireCounts.get(endpoint) ?? 0) + 1;
+        acquireCounts.set(endpoint, count);
+        if (count === 2) {
+          return new Promise<Response>((resolve) => {
+            renewalResolvers.set(endpoint, resolve);
+          });
+        }
+        return Response.json({ acquired: true });
+      }
+      if (endpoint === "/llama-status") return Response.json({ running: false });
+      return Response.json({ ok: true, released: true });
+    });
+
+    const deletion = request(modelId);
+    await vi.waitFor(() => {
+      expect(renewalResolvers.has("/hf-download-delete-lease-acquire")).toBe(true);
+      expect(renewalResolvers.has("/llama-delete-lease-acquire")).toBe(true);
+    });
+    for (const resolve of renewalResolvers.values()) {
+      resolve(Response.json({ acquired: true }));
+    }
+
+    await expect(deletion).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("fails closed when native renewal reports lost download ownership", async () => {
+    const modelId = "imported-llama-cpp-lease-stolen-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/stolen.gguf";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    let hfAcquireCalls = 0;
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint === "/hf-download-delete-lease-acquire") {
+        hfAcquireCalls += 1;
+        return hfAcquireCalls === 1
+          ? Response.json({ acquired: true })
+          : Response.json({ error: "ownership lost" }, { status: 409 });
+      }
+      if (endpoint === "/llama-status") return Response.json({ running: false });
+      return Response.json({ ok: true, acquired: true, released: true });
+    });
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "model_delete_lease_expired",
+      retryable: true,
+    });
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
   });
 
   it("heartbeats every delete lease across a stalled stage beyond the native TTL", async () => {

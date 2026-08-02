@@ -57,6 +57,46 @@ pub(crate) fn acquire_llama_model_delete_lease(
     acquire_llama_model_delete_lease_at(model_path, lease_id, Instant::now())
 }
 
+pub(crate) fn renew_llama_model_delete_lease(
+    model_path: &str,
+    lease_id: &str,
+) -> Result<(), String> {
+    renew_llama_model_delete_lease_at(model_path, lease_id, Instant::now())
+}
+
+fn renew_llama_model_delete_lease_at(
+    model_path: &str,
+    lease_id: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if lease_id.is_empty() || lease_id.len() > 128 {
+        return Err("Invalid llama model deletion lease".to_string());
+    }
+    let model_path = normalize_llama_model_path(model_path);
+    let mut state = llama_model_state()
+        .lock()
+        .map_err(|_| "Llama model state lock poisoned".to_string())?;
+    state
+        .delete_leases
+        .retain(|_, lease| lease.expires_at > now);
+    if state
+        .delete_leases
+        .get(&model_path)
+        .map(|lease| lease.lease_id.as_str())
+        != Some(lease_id)
+    {
+        return Err("Text model deletion lease was lost".to_string());
+    }
+    state.delete_leases.insert(
+        model_path,
+        LlamaModelDeleteLease {
+            lease_id: lease_id.to_string(),
+            expires_at: now + LLAMA_MODEL_DELETE_LEASE_TTL,
+        },
+    );
+    Ok(())
+}
+
 fn acquire_llama_model_delete_lease_at(
     model_path: &str,
     lease_id: &str,
@@ -407,8 +447,8 @@ mod tests {
     use super::{
         acquire_llama_model_delete_lease, acquire_llama_model_delete_lease_at, bridge_stop_llama,
         cleanup_llama_exit_if_current, llama_bridge_child, llama_engine_slot, llama_residency_slot,
-        prepare_llama_start, release_llama_model_delete_lease, validate_model_alias,
-        LlamaEngineInfo, LlamaModelStartGuard, LLAMA_LIFECYCLE,
+        prepare_llama_start, release_llama_model_delete_lease, renew_llama_model_delete_lease_at,
+        validate_model_alias, LlamaEngineInfo, LlamaModelStartGuard, LLAMA_LIFECYCLE,
     };
     use crate::llama_resident::LlamaResident;
     use crate::model_residency::ResidencyManager;
@@ -469,7 +509,7 @@ mod tests {
             .to_string();
         let t0 = Instant::now();
         acquire_llama_model_delete_lease_at(&model_path, "renew", t0).expect("initial lease");
-        acquire_llama_model_delete_lease_at(&model_path, "renew", t0 + Duration::from_secs(59))
+        renew_llama_model_delete_lease_at(&model_path, "renew", t0 + Duration::from_secs(59))
             .expect("same-id renewal");
 
         assert!(
@@ -482,6 +522,24 @@ mod tests {
         )
         .is_err());
         release_llama_model_delete_lease(&model_path, "renew");
+    }
+
+    #[test]
+    fn expired_llama_delete_lease_cannot_be_reacquired_as_a_renewal() {
+        let _g = test_global_lock();
+        let model_path = std::env::temp_dir()
+            .join("lunery-expired-llama-delete-lease.gguf")
+            .to_string_lossy()
+            .to_string();
+        let t0 = Instant::now();
+        acquire_llama_model_delete_lease_at(&model_path, "renew", t0).expect("initial lease");
+        assert!(renew_llama_model_delete_lease_at(
+            &model_path,
+            "renew",
+            t0 + Duration::from_secs(61),
+        )
+        .expect_err("expired lease must fail closed")
+        .contains("was lost"));
     }
 
     #[cfg(unix)]
