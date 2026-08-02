@@ -664,7 +664,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       code: "bridge_timeout",
       retryable: true,
     });
-    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
   });
 
   it("stops an active SD model before removing its cache", async () => {
