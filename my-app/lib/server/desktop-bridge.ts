@@ -178,26 +178,207 @@ export async function bridgeErrorText(response: Response): Promise<string> {
   return response.text().catch(() => "");
 }
 
+/** Hard deadline for bridge download start control calls. */
+export const BRIDGE_DOWNLOAD_START_TIMEOUT_MS = 15_000;
+
+/** Hard deadline for bridge download status probes. */
+export const BRIDGE_DOWNLOAD_PROBE_TIMEOUT_MS = 15_000;
+
+export type BridgeDownloadAmbiguityCode =
+  | "bridge_timeout"
+  | "bridge_unreachable"
+  | "bridge_start_unknown";
+
+/**
+ * Typed control-plane failure for start/status bridge calls.
+ *
+ * Timeout and unreachable outcomes are retryable ambiguity: the bridge may
+ * already own the client-supplied jobId. Callers must not treat these as
+ * definitive rejection or local cancellation.
+ */
+export class BridgeDownloadControlError extends Error {
+  readonly code: BridgeDownloadAmbiguityCode;
+  readonly retryable: true;
+  readonly jobId?: string;
+
+  constructor(
+    message: string,
+    options: {
+      code: BridgeDownloadAmbiguityCode;
+      jobId?: string;
+      cause?: unknown;
+    },
+  ) {
+    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = "BridgeDownloadControlError";
+    this.code = options.code;
+    this.retryable = true;
+    this.jobId = options.jobId;
+  }
+}
+
+export type BridgeDownloadProbeResult =
+  | {
+      outcome: "observed";
+      jobId: string;
+      status: string;
+      body: { status?: unknown; [key: string]: unknown };
+    }
+  | { outcome: "not_found"; jobId: string }
+  | {
+      outcome: "ambiguous";
+      jobId: string;
+      code: BridgeDownloadAmbiguityCode;
+      cause?: unknown;
+    };
+
+function bridgeDeadlineSignal(timeoutMs: number, callerSignal?: AbortSignal): AbortSignal {
+  const deadline = AbortSignal.timeout(timeoutMs);
+  return callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline;
+}
+
+function classifyBridgeControlFailure(
+  error: unknown,
+  callerSignal?: AbortSignal,
+): BridgeDownloadAmbiguityCode | "caller_aborted" {
+  if (callerSignal?.aborted) return "caller_aborted";
+  if (error instanceof Error && error.name === "TimeoutError") return "bridge_timeout";
+  // AbortSignal.any may surface the timeout as AbortError whose reason is TimeoutError.
+  if (error instanceof Error && error.name === "AbortError") {
+    const reason = (error as { cause?: unknown }).cause;
+    if (reason instanceof Error && reason.name === "TimeoutError") return "bridge_timeout";
+    if (!callerSignal) return "bridge_timeout";
+  }
+  return "bridge_unreachable";
+}
+
+function toBridgeControlError(
+  error: unknown,
+  options: { jobId?: string; callerSignal?: AbortSignal },
+): BridgeDownloadControlError {
+  const code = classifyBridgeControlFailure(error, options.callerSignal);
+  if (code === "caller_aborted") {
+    // Preserve the caller's abort as a plain Error so AbortSignal semantics stay intact.
+    throw error instanceof Error ? error : new Error("Bridge request aborted", { cause: error });
+  }
+  return new BridgeDownloadControlError(
+    code === "bridge_timeout"
+      ? "Desktop runtime bridge timed out"
+      : "Desktop runtime bridge is unreachable",
+    { code, jobId: options.jobId, cause: error },
+  );
+}
+
+/**
+ * Start a bridge download with a hard deadline.
+ *
+ * Optional `signal` is combined with the deadline via AbortSignal.any — the
+ * caller signal is never replaced. Timeout/unreachable throw
+ * BridgeDownloadControlError (retryable ambiguity). An HTTP rejection body is
+ * returned as a normal Response for callers to treat as definitive.
+ */
 export async function startBridgeDownloadJob(
   bridge: DesktopBridge,
   payload: BridgeDownloadStartPayload,
+  init?: { signal?: AbortSignal; timeoutMs?: number },
 ): Promise<Response> {
-  return bridgeFetch(bridge, "/hf-download-start", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  try {
+    return await bridgeFetch(bridge, "/hf-download-start", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      signal: bridgeDeadlineSignal(
+        init?.timeoutMs ?? BRIDGE_DOWNLOAD_START_TIMEOUT_MS,
+        init?.signal,
+      ),
+    });
+  } catch (error) {
+    throw toBridgeControlError(error, {
+      jobId: payload.jobId,
+      callerSignal: init?.signal,
+    });
+  }
 }
 
+/**
+ * Probe bridge download status with a hard deadline and typed ownership outcome.
+ *
+ * `observed` means the bridge reported a job snapshot. `not_found` is a
+ * definitive absence. `ambiguous` covers timeout/unreachable — ownership under
+ * the known jobId must stay non-terminal.
+ */
+export async function probeBridgeDownloadJob(
+  bridge: DesktopBridge,
+  jobId: string,
+  init?: { signal?: AbortSignal; timeoutMs?: number },
+): Promise<BridgeDownloadProbeResult> {
+  let response: Response;
+  try {
+    response = await bridgeFetch(
+      bridge,
+      `/hf-download-status?jobId=${encodeURIComponent(jobId)}`,
+      {
+        signal: bridgeDeadlineSignal(
+          init?.timeoutMs ?? BRIDGE_DOWNLOAD_PROBE_TIMEOUT_MS,
+          init?.signal,
+        ),
+      },
+    );
+  } catch (error) {
+    try {
+      const controlError = toBridgeControlError(error, {
+        jobId,
+        callerSignal: init?.signal,
+      });
+      return {
+        outcome: "ambiguous",
+        jobId,
+        code: controlError.code,
+        cause: error,
+      };
+    } catch (aborted) {
+      throw aborted;
+    }
+  }
+
+  if (response.status === 404) {
+    return { outcome: "not_found", jobId };
+  }
+  if (!response.ok) {
+    return {
+      outcome: "ambiguous",
+      jobId,
+      code: "bridge_start_unknown",
+      cause: new Error(`HTTP ${response.status}`),
+    };
+  }
+
+  const body = (await response.json().catch(() => null)) as
+    | { status?: unknown; [key: string]: unknown }
+    | null;
+  if (!body || typeof body.status !== "string") {
+    return {
+      outcome: "ambiguous",
+      jobId,
+      code: "bridge_start_unknown",
+      cause: new Error("Bridge status payload missing status"),
+    };
+  }
+  return { outcome: "observed", jobId, status: body.status, body };
+}
+
+/**
+ * Source-compatible status helper for existing imported-model callsites.
+ * Uses probeBridgeDownloadJob under the hood; null means not observed
+ * (missing, timeout, or unreachable).
+ */
 export async function getBridgeDownloadStatus(
   bridge: DesktopBridge,
   jobId: string,
+  init?: { signal?: AbortSignal; timeoutMs?: number },
 ): Promise<{ status?: unknown } | null> {
-  const response = await bridgeFetch(
-    bridge,
-    `/hf-download-status?jobId=${encodeURIComponent(jobId)}`,
-  ).catch(() => null);
-  if (!response?.ok) return null;
-  return response.json().catch(() => null) as Promise<{ status?: unknown } | null>;
+  const probe = await probeBridgeDownloadJob(bridge, jobId, init);
+  if (probe.outcome !== "observed") return null;
+  return probe.body;
 }
 
 export async function getBridgeDownloadJobs(

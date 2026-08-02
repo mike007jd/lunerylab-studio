@@ -7,6 +7,7 @@ import {
   normalizeDownloadStatus,
   reduceBridgeDownloadSnapshot,
   resolveHfDownloadKit,
+  resolveHfDownloadStartOwnership,
   type BridgeDownloadSnapshot,
   type DownloadSpeedSample,
   type HfDownloadKit,
@@ -20,6 +21,10 @@ import {
 // stream, so the browser does not need custom EventSource headers.
 // Multi-file kits download sequentially: one normal single-file resumable bridge
 // job per file, aggregated into one DownloadProgress.
+//
+// Job IDs are client-preassigned before the start POST so a lost response never
+// drops ownership into failJobRequest/local-canceled. Ambiguous ownership stays
+// non-terminal under the known UUID; only a definitive rejection fails.
 // ---------------------------------------------------------------------------
 
 export function useHfDownload() {
@@ -29,7 +34,7 @@ export function useHfDownload() {
   const currentTerminalResolverRef = useRef<
     ((status: "ready" | "error" | "canceled") => void) | null
   >(null);
-  if (!cancelCoordinatorRef.current) {
+  if (cancelCoordinatorRef.current == null) {
     cancelCoordinatorRef.current = new HfDownloadCancelCoordinator();
   }
   const cancelCoordinator = cancelCoordinatorRef.current;
@@ -148,60 +153,83 @@ export function useHfDownload() {
       for (let i = 0; i < kit.files.length; i += 1) {
         if (!cancelCoordinator.prepareJobRequest()) return;
         const f = kit.files[i]!; // safe: i < kit.files.length loop bound guarantees presence
-        try {
-          const response = await fetch("/api/desktop-runtime/hf-download", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(kit.multi ? { modelId, file: f.name } : { modelId }),
-            cache: "no-store",
-          });
-          if (!response.ok) {
-            cancelCoordinator.failJobRequest();
-            const text = await response.text();
-            setProgress((prev) => ({
-              ...prev,
-              status: "error",
-              error: `Failed to start download: ${text}`,
-            }));
-            return;
-          }
-          const { jobId } = (await response.json()) as { jobId: string };
-          cancelCoordinator.registerJob(jobId);
+        // Pre-assign and register ownership before any network await so a lost
+        // POST response cannot fall into failJobRequest/local-canceled.
+        const jobId = crypto.randomUUID();
+        cancelCoordinator.registerJob(jobId);
+        setProgress((prev) => ({
+          ...prev,
+          jobId,
+          status: "queued",
+          fileIndex: i,
+          error: null,
+        }));
+
+        const outcome = await resolveHfDownloadStartOwnership({
+          modelId,
+          jobId,
+          ...(kit.multi ? { file: f.name } : {}),
+        });
+
+        if (outcome.kind === "rejected") {
+          cancelCoordinator.finishJob(jobId);
+          setProgress((prev) => ({
+            ...prev,
+            status: "error",
+            error: outcome.error,
+          }));
+          return;
+        }
+
+        if (outcome.kind === "ambiguous") {
+          // Retain known jobId; cancel/probe remain available. Never call
+          // failJobRequest — that would resolve ownership to local-canceled.
           const pendingCancel = cancelCoordinator.activeCancelAttempt();
           if (pendingCancel) {
             try {
               await pendingCancel;
               return;
             } catch {
-              // Cancel was rejected or transport failed; keep watching the
-              // still-active server job and allow a retry.
+              // Cancel transport failed; ownership stays retryable under jobId.
             }
           }
           setProgress((prev) => ({
             ...prev,
             jobId,
-            status: "downloading",
-            fileIndex: i,
-          }));
-          const outcome = await streamOne(jobId, completedBytes, i, kit);
-          cancelCoordinator.finishJob(jobId);
-          if (outcome !== "ready") {
-            // streamOne already set the terminal status (error/canceled).
-            if (outcome === "canceled") {
-              setProgress((prev) => ({ ...prev, status: "canceled" }));
-            }
-            return;
-          }
-          completedBytes += f.size;
-        } catch (err) {
-          cancelCoordinator.failJobRequest();
-          setProgress((prev) => ({
-            ...prev,
-            status: "error",
-            error: err instanceof Error ? err.message : "Could not start download",
+            // Keep non-terminal ownership; informational error stays retryable.
+            status: prev.status === "downloading" ? "downloading" : "queued",
+            error: outcome.error,
           }));
           return;
         }
+
+        const pendingCancel = cancelCoordinator.activeCancelAttempt();
+        if (pendingCancel) {
+          try {
+            await pendingCancel;
+            return;
+          } catch {
+            // Cancel was rejected or transport failed; keep watching the
+            // still-active server job and allow a retry.
+          }
+        }
+        setProgress((prev) => ({
+          ...prev,
+          jobId,
+          status: "downloading",
+          fileIndex: i,
+          error: null,
+        }));
+        const streamOutcome = await streamOne(jobId, completedBytes, i, kit);
+        cancelCoordinator.finishJob(jobId);
+        if (streamOutcome !== "ready") {
+          // streamOne already set the terminal status (error/canceled).
+          if (streamOutcome === "canceled") {
+            setProgress((prev) => ({ ...prev, status: "canceled" }));
+          }
+          return;
+        }
+        completedBytes += f.size;
       }
 
       setProgress((prev) => ({

@@ -103,6 +103,208 @@ async function responseMessage(response: Response): Promise<string> {
   return text.trim() || `HTTP ${response.status}`;
 }
 
+/** Next/bridge start codes that mean ownership under jobId is still ambiguous. */
+export const HF_START_AMBIGUOUS_CODES = new Set([
+  "bridge_timeout",
+  "bridge_unreachable",
+  "bridge_start_unknown",
+]);
+
+export type HfDownloadStartOutcome =
+  | { kind: "accepted"; jobId: string }
+  | { kind: "rejected"; jobId: string; error: string; status: number }
+  | { kind: "ambiguous"; jobId: string; error: string; code: string };
+
+export type HfDownloadOwnershipProbe =
+  | { kind: "observed"; jobId: string; status: DownloadStatus; snapshot: BridgeDownloadSnapshot }
+  | { kind: "missing"; jobId: string }
+  | { kind: "ambiguous"; jobId: string; error: string };
+
+function ownsAmbiguousJobId(payloadJobId: unknown, jobId: string): boolean {
+  return payloadJobId == null || payloadJobId === jobId;
+}
+
+function isAmbiguousStartPayload(
+  status: number,
+  payload: { code?: unknown; retryable?: unknown; jobId?: unknown; error?: unknown } | null,
+  jobId: string,
+): boolean {
+  if (payload && !ownsAmbiguousJobId(payload.jobId, jobId)) return false;
+  if (
+    payload?.retryable === true
+    && typeof payload.code === "string"
+    && HF_START_AMBIGUOUS_CODES.has(payload.code)
+  ) {
+    return true;
+  }
+  // Transport-class statuses without a definitive rejection body stay ambiguous
+  // under the client-preassigned jobId.
+  return status === 503 || status === 504;
+}
+
+/**
+ * POST the client-preassigned jobId to the Next HF download route.
+ *
+ * Network loss and retryable ambiguity codes never become `rejected` — the
+ * caller retains the known jobId for probe/cancel. Only an actual received
+ * definitive rejection is terminal.
+ */
+export async function requestHfDownloadStart(
+  input: { modelId: string; jobId: string; file?: string },
+  fetcher: DownloadFetch = fetch,
+): Promise<HfDownloadStartOutcome> {
+  const { modelId, jobId, file } = input;
+  const body =
+    file !== undefined && file.length > 0
+      ? { modelId, file, jobId }
+      : { modelId, jobId };
+
+  let response: Response;
+  try {
+    response = await fetcher("/api/desktop-runtime/hf-download", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch (error) {
+    return {
+      kind: "ambiguous",
+      jobId,
+      code: "bridge_start_unknown",
+      error: error instanceof Error ? error.message : "Download start response was lost.",
+    };
+  }
+
+  if (response.ok) {
+    const ack = (await response.json().catch(() => null)) as { jobId?: unknown } | null;
+    if (ack?.jobId != null && ack.jobId !== jobId) {
+      return {
+        kind: "rejected",
+        jobId,
+        status: 500,
+        error: "Download start returned a mismatched job id.",
+      };
+    }
+    return { kind: "accepted", jobId };
+  }
+
+  const payload = (await response.json().catch(() => null)) as {
+    error?: unknown;
+    code?: unknown;
+    retryable?: unknown;
+    jobId?: unknown;
+  } | null;
+
+  if (isAmbiguousStartPayload(response.status, payload, jobId)) {
+    return {
+      kind: "ambiguous",
+      jobId,
+      code: typeof payload?.code === "string" ? payload.code : "bridge_start_unknown",
+      error:
+        typeof payload?.error === "string" && payload.error.trim()
+          ? payload.error
+          : `Download start outcome is unknown (HTTP ${response.status}).`,
+    };
+  }
+
+  return {
+    kind: "rejected",
+    jobId,
+    status: response.status,
+    error:
+      typeof payload?.error === "string" && payload.error.trim()
+        ? payload.error
+        : `Failed to start download: HTTP ${response.status}`,
+  };
+}
+
+/**
+ * Probe Next status for a client-owned jobId after an ambiguous start.
+ * Hard transport failures stay ambiguous — never invent local cancellation.
+ */
+export async function probeHfDownloadOwnership(
+  jobId: string,
+  fetcher: DownloadFetch = fetch,
+): Promise<HfDownloadOwnershipProbe> {
+  let response: Response;
+  try {
+    response = await fetcher(
+      `/api/desktop-runtime/hf-download/${encodeURIComponent(jobId)}`,
+      { cache: "no-store" },
+    );
+  } catch (error) {
+    return {
+      kind: "ambiguous",
+      jobId,
+      error: error instanceof Error ? error.message : "Download status probe failed.",
+    };
+  }
+
+  if (response.status === 404) {
+    return { kind: "missing", jobId };
+  }
+  if (!response.ok) {
+    return {
+      kind: "ambiguous",
+      jobId,
+      error: await responseMessage(response),
+    };
+  }
+
+  const snapshot = (await response.json().catch(() => null)) as BridgeDownloadSnapshot | null;
+  if (!snapshot || typeof snapshot.status !== "string") {
+    return { kind: "ambiguous", jobId, error: "Download status payload was incomplete." };
+  }
+  return {
+    kind: "observed",
+    jobId,
+    status: normalizeDownloadStatus(snapshot.status),
+    snapshot: {
+      status: normalizeDownloadStatus(snapshot.status),
+      received: typeof snapshot.received === "number" ? snapshot.received : 0,
+      total: typeof snapshot.total === "number" ? snapshot.total : 0,
+      error: typeof snapshot.error === "string" ? snapshot.error : null,
+    },
+  };
+}
+
+/**
+ * Resolve a start attempt that may have lost its response.
+ * Observed bridge ownership upgrades ambiguity to accepted; missing allows an
+ * idempotent same-ID retry; persistent ambiguity stays non-terminal.
+ */
+export async function resolveHfDownloadStartOwnership(
+  input: { modelId: string; jobId: string; file?: string },
+  options: {
+    fetcher?: DownloadFetch;
+    /** When true, retry the start POST once with the same jobId after a miss. */
+    retryIdempotentStart?: boolean;
+  } = {},
+): Promise<HfDownloadStartOutcome> {
+  const fetcher = options.fetcher ?? fetch;
+  const first = await requestHfDownloadStart(input, fetcher);
+  if (first.kind !== "ambiguous") return first;
+
+  const probe = await probeHfDownloadOwnership(input.jobId, fetcher);
+  if (probe.kind === "observed") {
+    return { kind: "accepted", jobId: input.jobId };
+  }
+
+  if (probe.kind === "missing" && options.retryIdempotentStart !== false) {
+    const retry = await requestHfDownloadStart(input, fetcher);
+    if (retry.kind === "ambiguous") {
+      const retryProbe = await probeHfDownloadOwnership(input.jobId, fetcher);
+      if (retryProbe.kind === "observed") {
+        return { kind: "accepted", jobId: input.jobId };
+      }
+    }
+    return retry;
+  }
+
+  return first;
+}
+
 export async function requestHfDownloadCancel(
   jobId: string,
   fetcher: DownloadFetch = fetch,
@@ -202,6 +404,11 @@ export class HfDownloadCancelCoordinator {
     this.pending = null;
   }
 
+  /**
+   * Abandon a start that never obtained a known jobId.
+   * Must not be used after registerJob — ambiguous ownership under a
+   * client-preassigned id stays cancelable via that id.
+   */
   failJobRequest(): void {
     this.pending?.resolve(null);
     this.pending = null;

@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { findHfModelEntry } from "@/lib/hf-model-catalog";
 import {
+  BridgeDownloadControlError,
   bridgeErrorText,
+  probeBridgeDownloadJob,
   proxyToBridge,
   requireDesktopBridge,
   startBridgeDownloadJob,
@@ -16,12 +18,28 @@ export const dynamic = "force-dynamic";
 const hfDownloadBodySchema = z.object({
   modelId: z.string().optional(),
   file: z.string().optional(),
+  /** Client-preassigned UUID; required so lost responses keep known ownership. */
+  jobId: z.string().uuid(),
 });
+
+function ambiguousStartResponse(jobId: string, code: string, error: string, status = 503) {
+  return NextResponse.json(
+    {
+      error,
+      code,
+      jobId,
+      retryable: true,
+      partialState: true,
+    },
+    { status },
+  );
+}
 
 /**
  * POST /api/desktop-runtime/hf-download
- * Body: { modelId: string }
- * Resolves dest path, starts a bridge download job, returns { jobId }.
+ * Body: { modelId: string, jobId: string, file?: string }
+ * Forwards the client-supplied jobId to the bridge. Lost/timeout start
+ * responses probe status and keep ownership non-terminal under that jobId.
  */
 export async function POST(request: NextRequest) {
   const bridge = requireDesktopBridge();
@@ -34,7 +52,7 @@ export async function POST(request: NextRequest) {
     return jsonError(error);
   }
 
-  const { modelId, file } = body;
+  const { modelId, file, jobId } = body;
   if (!modelId) {
     return NextResponse.json({ error: "modelId is required" }, { status: 400 });
   }
@@ -72,20 +90,44 @@ export async function POST(request: NextRequest) {
   // Dest path: <Lunery profile>/models/<runtimeTarget>/<targetName> — one
   // shared convention with the engine-start and catalog-install-status sites.
   const dest = modelCachePath(entry.runtimeTarget, targetName);
-
-  const jobId = crypto.randomUUID();
-
-  const bridgeRes = await startBridgeDownloadJob(bridge, {
+  const startPayload = {
     url: targetUrl,
     dest,
     sha256: targetSha,
     jobId,
-  });
+  };
+
+  let bridgeRes: Response;
+  try {
+    bridgeRes = await startBridgeDownloadJob(bridge, startPayload);
+  } catch (error) {
+    // Start accept may have occurred before the response was lost/timed out.
+    // Probe by the known client jobId before any terminal failure.
+    const probe = await probeBridgeDownloadJob(bridge, jobId);
+    if (probe.outcome === "observed") {
+      return NextResponse.json({ jobId, dest, modelId, file: targetName, recovered: true });
+    }
+    const code =
+      error instanceof BridgeDownloadControlError
+        ? error.code
+        : probe.outcome === "ambiguous"
+          ? probe.code
+          : "bridge_start_unknown";
+    return ambiguousStartResponse(
+      jobId,
+      code,
+      error instanceof Error
+        ? error.message
+        : "Desktop bridge start outcome is unknown; client job ownership was retained.",
+      code === "bridge_timeout" ? 504 : 503,
+    );
+  }
 
   if (!bridgeRes.ok) {
+    // Definitive bridge rejection (including same-ID / different-payload conflict).
     const errText = await bridgeErrorText(bridgeRes);
     return NextResponse.json(
-      { error: `Bridge start failed: ${errText}` },
+      { error: `Bridge start failed: ${errText}`, jobId, retryable: false },
       { status: bridgeRes.status },
     );
   }

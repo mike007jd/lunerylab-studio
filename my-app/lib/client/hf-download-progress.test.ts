@@ -3,9 +3,12 @@ import {
   HfDownloadCancelCoordinator,
   measureDownloadSpeed,
   normalizeDownloadStatus,
+  probeHfDownloadOwnership,
   requestHfDownloadCancel,
+  requestHfDownloadStart,
   reduceBridgeDownloadSnapshot,
   resolveHfDownloadKit,
+  resolveHfDownloadStartOwnership,
   waitForHfDownloadTerminal,
 } from "./hf-download-progress";
 
@@ -266,5 +269,152 @@ describe("hf-download progress helpers", () => {
     });
     expect(coordinator.prepareJobRequest()).toBe(false);
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("treats a lost start response as ambiguous ownership under the known jobId", async () => {
+    const fetcher = vi.fn(async () => {
+      throw new TypeError("network connection lost after write");
+    });
+
+    await expect(
+      requestHfDownloadStart(
+        { modelId: "qwen3.6-35b-a3b-ud-q4-k-m", jobId: "job-lost" },
+        fetcher,
+      ),
+    ).resolves.toEqual({
+      kind: "ambiguous",
+      jobId: "job-lost",
+      code: "bridge_start_unknown",
+      error: "network connection lost after write",
+    });
+  });
+
+  it("recovers lost start ownership when a later status probe observes the job", async () => {
+    const fetcher = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("response lost after accept"))
+      .mockResolvedValueOnce(
+        jsonResponse({ status: "downloading", received: 1, total: 10, error: null }),
+      );
+
+    await expect(
+      resolveHfDownloadStartOwnership(
+        { modelId: "qwen3.6-35b-a3b-ud-q4-k-m", jobId: "job-recovered" },
+        { fetcher, retryIdempotentStart: false },
+      ),
+    ).resolves.toEqual({ kind: "accepted", jobId: "job-recovered" });
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/desktop-runtime/hf-download/job-recovered",
+      { cache: "no-store" },
+    );
+  });
+
+  it("cancels with the preassigned jobId during an ambiguous start", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ ok: true, cancelRequested: true, jobId: "job-ambiguous" }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ status: "canceled", received: 0, total: 10, error: null }),
+      );
+    const coordinator = new HfDownloadCancelCoordinator(fetcher, async () => {});
+    expect(coordinator.prepareJobRequest()).toBe(true);
+    // Ownership is registered before the start await, matching the hook contract.
+    coordinator.registerJob("job-ambiguous");
+
+    const cancel = coordinator.requestCancel();
+    await expect(cancel).resolves.toMatchObject({ status: "canceled" });
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/desktop-runtime/hf-download/job-ambiguous",
+      { method: "DELETE", cache: "no-store" },
+    );
+    // failJobRequest must not collapse known ownership into local-canceled.
+    coordinator.failJobRequest();
+    expect(coordinator.activeCancelAttempt()).toBeNull();
+  });
+
+  it("retries an idempotent same-ID start after a missing status probe", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: "Desktop runtime bridge timed out",
+            code: "bridge_timeout",
+            jobId: "job-retry",
+            retryable: true,
+            partialState: true,
+          },
+          504,
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(jsonResponse({ jobId: "job-retry", dest: "/models/x" }));
+
+    await expect(
+      resolveHfDownloadStartOwnership(
+        { modelId: "qwen3.6-35b-a3b-ud-q4-k-m", jobId: "job-retry" },
+        { fetcher },
+      ),
+    ).resolves.toEqual({ kind: "accepted", jobId: "job-retry" });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/desktop-runtime/hf-download",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          modelId: "qwen3.6-35b-a3b-ud-q4-k-m",
+          jobId: "job-retry",
+        }),
+      }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      3,
+      "/api/desktop-runtime/hf-download",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          modelId: "qwen3.6-35b-a3b-ud-q4-k-m",
+          jobId: "job-retry",
+        }),
+      }),
+    );
+  });
+
+  it("treats a definitive start rejection as terminal and non-retryable ownership loss", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse(
+        { error: "Bridge start failed: conflict", jobId: "job-reject", retryable: false },
+        409,
+      ),
+    );
+
+    await expect(
+      requestHfDownloadStart(
+        { modelId: "qwen3.6-35b-a3b-ud-q4-k-m", jobId: "job-reject" },
+        fetcher,
+      ),
+    ).resolves.toEqual({
+      kind: "rejected",
+      jobId: "job-reject",
+      status: 409,
+      error: "Bridge start failed: conflict",
+    });
+  });
+
+  it("keeps status probe transport loss ambiguous instead of missing", async () => {
+    const fetcher = vi.fn(async () => {
+      throw new TypeError("status server never responded");
+    });
+
+    await expect(probeHfDownloadOwnership("job-status-hang", fetcher)).resolves.toEqual({
+      kind: "ambiguous",
+      jobId: "job-status-hang",
+      error: "status server never responded",
+    });
   });
 });
