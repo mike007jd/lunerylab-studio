@@ -433,12 +433,12 @@ describe("desktop status cache revision", () => {
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    bumpDesktopStatusRevision();
+    await bumpDesktopStatusRevision();
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set());
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set());
     expect(fetchMock).toHaveBeenCalledOnce();
 
-    bumpDesktopStatusRevision();
+    await bumpDesktopStatusRevision();
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set(["openai"]));
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -460,7 +460,7 @@ describe("desktop status cache revision", () => {
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    bumpDesktopStatusRevision();
+    await bumpDesktopStatusRevision();
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set());
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set(["openai"]));
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -482,7 +482,7 @@ describe("desktop status cache revision", () => {
       ),
     );
 
-    bumpDesktopStatusRevision();
+    await bumpDesktopStatusRevision();
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set(["openai"]));
   });
 
@@ -508,7 +508,7 @@ describe("desktop status cache revision", () => {
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    bumpDesktopStatusRevision();
+    await bumpDesktopStatusRevision();
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set());
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set(["openai"]));
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -538,7 +538,7 @@ describe("desktop status cache revision", () => {
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    bumpDesktopStatusRevision();
+    await bumpDesktopStatusRevision();
     await expect(fetchDesktopStatusSnapshot()).resolves.toMatchObject({
       local_runtimes: [{ status: "idle" }],
     });

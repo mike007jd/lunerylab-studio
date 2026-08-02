@@ -1,9 +1,14 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { luneryRuntimeDir } from "@/lib/server/lunery-profile";
+import {
+  nativeProfileRename,
+  nativeProfileUnlink,
+  nativeProfileWrite,
+} from "@/lib/server/native-profile-fs";
 
 const REVISION_FILE_NAME = "provider-status.revision";
 
@@ -29,20 +34,19 @@ export function readDesktopStatusRevision(): string | null {
  * the visible profile runtime directory, and atomic rename prevents readers
  * from observing a partially-written revision.
  */
-export function bumpDesktopStatusRevision(): string {
+export async function bumpDesktopStatusRevision(): Promise<string> {
   const filePath = revisionFilePath();
   const revision = randomUUID();
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  const temporaryPath = `${filePath}.${process.pid}.${revision}.tmp`;
+  const temporaryName = `${REVISION_FILE_NAME}.${process.pid}.${revision}.tmp`;
   try {
-    writeFileSync(temporaryPath, revision, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, filePath);
+    await nativeProfileWrite("runtime", temporaryName, Buffer.from(revision, "utf8"), {
+      replace: false,
+    });
+    await nativeProfileRename("runtime", temporaryName, path.basename(filePath), {
+      replace: true,
+    });
   } finally {
-    try {
-      unlinkSync(temporaryPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    await nativeProfileUnlink("runtime", temporaryName, { missingOk: true });
   }
   return revision;
 }

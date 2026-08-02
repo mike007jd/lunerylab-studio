@@ -2,10 +2,15 @@ import "server-only";
 
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { ApiError } from "@/lib/server/errors";
 import { sniffImageMime } from "@/lib/server/byok-shared";
 import { luneryRuntimeDir } from "@/lib/server/lunery-profile";
+import {
+  nativeProfileMkdir,
+  nativeProfileUnlink,
+  nativeProfileWrite,
+} from "@/lib/server/native-profile-fs";
 
 const TOKEN_PATTERN = /^cm_(\d{13})_([a-f0-9]{32})$/;
 const MAX_MASK_AGE_MS = 15 * 60_000;
@@ -40,7 +45,7 @@ async function cleanupExpiredMasks(): Promise<void> {
       const token = entry.name.endsWith(".png") ? entry.name.slice(0, -4) : "";
       const match = TOKEN_PATTERN.exec(token);
       if (!match || now - Number(match[1]) <= MAX_MASK_AGE_MS) return;
-      await unlink(path.join(directory, entry.name));
+      await nativeProfileUnlink("runtime", `canvas-masks/${entry.name}`, { missingOk: true });
     }),
   );
 }
@@ -56,9 +61,9 @@ export async function storeTemporaryCanvasMask(bytes: Buffer): Promise<string> {
   }
 
   const token = `cm_${Date.now()}_${randomUUID().replaceAll("-", "")}`;
-  await mkdir(temporaryMaskDirectory(), { recursive: true, mode: 0o700 });
+  await nativeProfileMkdir("runtime", "canvas-masks");
   await cleanupExpiredMasks();
-  await writeFile(temporaryMaskPath(token), bytes, { flag: "wx", mode: 0o600 });
+  await nativeProfileWrite("runtime", `canvas-masks/${token}.png`, bytes, { replace: false });
   const expiry = setTimeout(() => {
     void deleteTemporaryCanvasMask(token).catch(() => {});
   }, MAX_MASK_AGE_MS);
@@ -95,10 +100,6 @@ export async function readTemporaryCanvasMask(token: string): Promise<Buffer> {
 }
 
 export async function deleteTemporaryCanvasMask(token: string): Promise<void> {
-  try {
-    await unlink(temporaryMaskPath(token));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
-    throw error;
-  }
+  temporaryMaskPath(token);
+  await nativeProfileUnlink("runtime", `canvas-masks/${token}.png`, { missingOk: true });
 }

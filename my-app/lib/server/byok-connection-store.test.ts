@@ -36,7 +36,7 @@ function writeFixture(data: unknown) {
 describe("byok-connection-store per-capability models (#1)", () => {
   it("keeps text and image model ids separate for one OpenAI connection", async () => {
     const store = await loadStore();
-    store.setByokConnectionMeta("openai", {
+    await store.setByokConnectionMeta("openai", {
       endpoint: "https://api.openai.com/v1",
       models: { text: "gpt-5-chat-latest", imageGenerate: "gpt-image-1.5" },
       updatedAt: new Date().toISOString(),
@@ -51,7 +51,7 @@ describe("byok-connection-store per-capability models (#1)", () => {
 
   it("persists models to disk and reloads them after a fresh module load", async () => {
     const first = await loadStore();
-    first.setByokConnectionMeta("fal", {
+    await first.setByokConnectionMeta("fal", {
       endpoint: "https://queue.fal.run",
       models: { imageGenerate: "fal-ai/flux-pro/v1.1", video: "fal-ai/some-video" },
       updatedAt: new Date().toISOString(),
@@ -69,7 +69,7 @@ describe("byok-connection-store per-capability models (#1)", () => {
 
     vi.resetModules();
     const settingsBundle = await loadStore();
-    settingsBundle.setByokConnectionMeta("openai", {
+    await settingsBundle.setByokConnectionMeta("openai", {
       endpoint: "https://api.openai.com/v1",
       models: { text: "gpt-5-chat-latest" },
       updatedAt: "2026-07-13T00:00:00.000Z",
@@ -80,7 +80,7 @@ describe("byok-connection-store per-capability models (#1)", () => {
     );
     expect(bootstrapBundle.listByokConnectionMeta()).toHaveProperty("openai");
 
-    settingsBundle.deleteByokConnectionMeta("openai");
+    await settingsBundle.deleteByokConnectionMeta("openai");
     expect(bootstrapBundle.listByokConnectionMeta()).toEqual({});
   });
 
@@ -93,13 +93,13 @@ describe("byok-connection-store per-capability models (#1)", () => {
     vi.resetModules();
     const store = await loadStore();
 
-    expect(() =>
+    await expect(
       store.setByokConnectionMeta("anthropic", {
         endpoint: "https://api.anthropic.com",
         models: { text: "claude-opus-4-8" },
         updatedAt: new Date().toISOString(),
       }),
-    ).toThrow();
+    ).rejects.toThrow();
     // No false success: the failed write must not be visible in memory.
     expect(store.getByokConnectionModelId("anthropic", "text")).toBeUndefined();
   });
@@ -108,7 +108,7 @@ describe("byok-connection-store per-capability models (#1)", () => {
     const store = await loadStore();
     // normalizeByokModels keeps known role keys, but anthropic only resolves
     // `text`; a stray video slot must never be readable as a video model.
-    store.setByokConnectionMeta("anthropic", {
+    await store.setByokConnectionMeta("anthropic", {
       endpoint: "https://api.anthropic.com",
       models: { text: "claude-opus-4-8" },
       updatedAt: new Date().toISOString(),

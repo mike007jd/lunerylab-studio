@@ -111,7 +111,7 @@ export async function POST(request: NextRequest) {
     }
 
     try {
-      setByokConnectionMeta(providerId, {
+      await setByokConnectionMeta(providerId, {
         endpoint: endpointCheck.url,
         ...(hasModel ? { models } : {}),
         updatedAt: new Date().toISOString(),
@@ -152,7 +152,7 @@ export async function DELETE(request: NextRequest) {
     const clearedDefaults = await withWorkspaceExclusive("provider-unlink", async () => {
       const cleared = await clearDefaultsOwnedByProvider(user.id, providerId);
       try {
-        deleteByokConnectionMeta(providerId);
+        await deleteByokConnectionMeta(providerId);
       } catch (error) {
         try {
           await restoreClearedProviderDefaults(user.id, cleared);

@@ -13,12 +13,12 @@ async function forwardSecretRequest(method: "POST" | "DELETE", request: NextRequ
     // Bump before the mutation so a concurrent consumer cannot keep a prior
     // cached snapshot. Bump again after success so any status read that raced
     // the bridge write is invalidated across independently bundled routes.
-    bumpDesktopStatusRevision();
+    await bumpDesktopStatusRevision();
     const response = await proxyToBridge(bridge, "/provider-secret", {
       method,
       body: await request.text(),
     });
-    if (response.ok) bumpDesktopStatusRevision();
+    if (response.ok) await bumpDesktopStatusRevision();
     return response;
   } catch (error) {
     return jsonError(error);
