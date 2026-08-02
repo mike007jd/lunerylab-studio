@@ -42,7 +42,21 @@ type ProfileFsRequest =
 
 export const __nativeProfileFsTestHooks = {
   execute: null as null | ((request: ProfileFsRequest) => Promise<void> | void),
+  sleep: null as null | ((delayMs: number) => Promise<void> | void),
 };
+
+// A 429 is emitted before the native bridge executes the mutation, so it is
+// the only failure that is safe to retry. Network failures and other statuses
+// may be ambiguous or definitive and must remain single-attempt operations.
+const CAPACITY_RETRY_DELAYS_MS = [25, 50, 100, 200, 400] as const;
+
+async function waitForCapacity(delayMs: number): Promise<void> {
+  if (__nativeProfileFsTestHooks.sleep) {
+    await __nativeProfileFsTestHooks.sleep(delayMs);
+    return;
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
 
 function validateRelativePath(relativePath: string): string {
   if (
@@ -169,18 +183,24 @@ async function execute(request: ProfileFsRequest): Promise<void> {
       retryable: true,
     });
   }
-  const response = await bridgeFetch(bridge, "/profile-fs", {
-    method: "POST",
-    body: JSON.stringify(request),
-    signal: AbortSignal.timeout(30_000),
-  }).catch(() => null);
-  if (!response?.ok) {
-    throw new ApiError({
-      status: 503,
-      code: "safe_file_mutation_failed",
-      message: "The desktop safe-file service rejected the operation.",
-      retryable: true,
-    });
+  const body = JSON.stringify(request);
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await bridgeFetch(bridge, "/profile-fs", {
+      method: "POST",
+      body,
+      signal: AbortSignal.timeout(30_000),
+    }).catch(() => null);
+    if (response?.ok) return;
+    if (response?.status !== 429 || attempt >= CAPACITY_RETRY_DELAYS_MS.length) {
+      throw new ApiError({
+        status: 503,
+        code: "safe_file_mutation_failed",
+        message: "The desktop safe-file service rejected the operation.",
+        retryable: true,
+      });
+    }
+    await response.body?.cancel().catch(() => undefined);
+    await waitForCapacity(CAPACITY_RETRY_DELAYS_MS[attempt]!);
   }
 }
 
