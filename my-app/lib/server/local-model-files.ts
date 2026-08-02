@@ -131,6 +131,7 @@ export const __localModelFilesTestHooks = {
   beforeMutation: null as null | ((filePath: string) => Promise<void> | void),
   afterPreparedJournal: null as null | ((journalPath: string) => Promise<void> | void),
   afterStage: null as null | ((stage: StagedManagedModelFile) => Promise<void> | void),
+  beforeRecoveryJournalReplace: null as null | ((tempPath: string) => Promise<void> | void),
   afterRecoveryJournal: null as null | ((journalPath: string) => Promise<void> | void),
   afterCommittedMarker: null as null | ((journalPath: string) => Promise<void> | void),
 };
@@ -365,12 +366,54 @@ async function writeManagedCleanupJournal(
     stages: validateCleanupStages([...stagedFiles]),
     ...(options.recovery ? { recovery: validateDeletionRecovery(options.recovery) } : {}),
   };
-  await nativeProfileWrite(
-    "models",
-    profileRelativePath("models", journalPath),
-    Buffer.from(JSON.stringify(payload), "utf8"),
-    { replace: Boolean(options.journalPath) },
-  );
+  const bytes = Buffer.from(JSON.stringify(payload), "utf8");
+  if (!options.journalPath) {
+    await nativeProfileWrite(
+      "models",
+      profileRelativePath("models", journalPath),
+      bytes,
+      { replace: false },
+    );
+    return journalPath;
+  }
+
+  // Never truncate a live prepared journal. Publish the enriched recovery
+  // record under a same-directory temporary name, fsync it through the native
+  // service, then atomically replace+fsync the old journal. A kill before the
+  // rename leaves the old prepared plan intact for byte rollback.
+  const tempPath = `${journalPath}.${randomUUID()}.replace-tmp`;
+  let preserveTempForCrashTest = false;
+  try {
+    await nativeProfileWrite(
+      "models",
+      profileRelativePath("models", tempPath),
+      bytes,
+      { replace: false },
+    );
+    if (
+      process.env.NODE_ENV === "test"
+      && __localModelFilesTestHooks.beforeRecoveryJournalReplace
+    ) {
+      try {
+        await __localModelFilesTestHooks.beforeRecoveryJournalReplace(tempPath);
+      } catch (error) {
+        preserveTempForCrashTest = error instanceof SimulatedManagedModelCrashError;
+        throw error;
+      }
+    }
+    await nativeProfileRename(
+      "models",
+      profileRelativePath("models", tempPath),
+      profileRelativePath("models", journalPath),
+      { replace: true },
+    );
+  } finally {
+    if (!preserveTempForCrashTest) {
+      await nativeProfileUnlink("models", profileRelativePath("models", tempPath), {
+        missingOk: true,
+      }).catch(() => undefined);
+    }
+  }
   return journalPath;
 }
 
@@ -470,6 +513,13 @@ async function listManagedCleanupJournals(): Promise<string[]> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
+  const orphanTemps = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".replace-tmp"))
+    .map((entry) => path.join(directory, entry.name));
+  await Promise.all(orphanTemps.map((tempPath) =>
+    nativeProfileUnlink("models", profileRelativePath("models", tempPath), {
+      missingOk: true,
+    })));
   return entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
     .map((entry) => path.join(directory, entry.name));

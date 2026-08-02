@@ -139,6 +139,40 @@ describe("managed local model file deletion", () => {
     expect(fs.readFileSync(second, "utf8")).toBe("second");
   });
 
+  it("keeps the old prepared journal recoverable when enriched publication is interrupted", async () => {
+    const files = await import("@/lib/server/local-model-files");
+    const modelPath = path.join(modelsDir, "llama-cpp", "replace-crash.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "model");
+    const staged = await files.stageManagedModelFiles([modelPath]);
+    const journalPath = staged[0]!.journalPath!;
+    files.__localModelFilesTestHooks.beforeRecoveryJournalReplace = () => {
+      throw new files.SimulatedManagedModelCrashError();
+    };
+
+    await expect(files.attachManagedModelDeletionRecovery(staged, {
+      ownerId: "owner-1",
+      modelId: "catalog-text",
+      defaults: {
+        cleared: ["text"],
+        previous: { defaultTextModel: "catalog-text", defaultImageModel: "" },
+      },
+    })).rejects.toBeInstanceOf(files.SimulatedManagedModelCrashError);
+
+    expect(JSON.parse(fs.readFileSync(journalPath, "utf8"))).toMatchObject({
+      version: 2,
+      stages: [{ originalPath: modelPath }],
+    });
+    expect(fs.existsSync(staged[0]!.stagedPath)).toBe(true);
+    files.__localModelFilesTestHooks.beforeRecoveryJournalReplace = null;
+
+    await expect(files.reconcileStagedManagedModelFiles()).resolves.toBe(0);
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("model");
+    expect(
+      fs.readdirSync(path.dirname(journalPath)).filter((name) => name.endsWith(".replace-tmp")),
+    ).toEqual([]);
+  });
+
   it("finishes a committed journal after a post-metadata strong crash", async () => {
     const files = await import("@/lib/server/local-model-files");
     const modelPath = path.join(modelsDir, "llama-cpp", "committed.gguf");
