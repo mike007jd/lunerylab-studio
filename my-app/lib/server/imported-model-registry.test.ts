@@ -316,8 +316,12 @@ describe("imported-model-registry profile paths", () => {
     await registry.removeImportedModel(imported.id);
     const inodeBefore = fs.statSync(staged.stagedPath, { bigint: true }).ino;
     registry.__importedModelRegistryTestHooks.beforeExternalReconcileDelete = () => {
-      fs.unlinkSync(staged.stagedPath);
-      fs.writeFileSync(staged.stagedPath, "replacement-model");
+      const replacementPath = `${staged.stagedPath}.replacement`;
+      // Allocate the replacement while the original inode is still live.
+      // Creating it only after unlink lets Linux immediately reuse the inode,
+      // which does not exercise the intended pathname-replacement seam.
+      fs.writeFileSync(replacementPath, "replacement-model");
+      fs.renameSync(replacementPath, staged.stagedPath);
     };
 
     await registry.reconcileExternalModelDeleteJournals();

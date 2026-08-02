@@ -504,6 +504,21 @@ describe("workspace operation gate", () => {
 });
 
 describe("restore crash reconciliation", () => {
+  async function replaceDirectoryWithFixture(
+    target: string,
+    relativeFile: string,
+    contents: string,
+  ): Promise<void> {
+    const replacement = `${target}.test-replacement`;
+    await fs.rm(replacement, { recursive: true, force: true });
+    await fs.mkdir(path.dirname(path.join(replacement, relativeFile)), { recursive: true });
+    await fs.writeFile(path.join(replacement, relativeFile), contents);
+    // Allocate the replacement before removing the target so its inode cannot
+    // be recycled from the directory whose durable identity is under test.
+    await fs.rm(target, { recursive: true, force: true });
+    await fs.rename(replacement, target);
+  }
+
   async function seedPromotedTrees(token: string) {
     const expected = buildExpectedRestoreSwaps(token);
     const media = expected[0]!;
@@ -580,9 +595,11 @@ describe("restore crash reconciliation", () => {
       token,
       swaps,
     });
-    await fs.rm(swaps[0]!.previous, { recursive: true, force: true });
-    await fs.mkdir(path.join(swaps[0]!.previous, "generated"), { recursive: true });
-    await fs.writeFile(path.join(swaps[0]!.previous, "generated/replacement.png"), "replacement");
+    await replaceDirectoryWithFixture(
+      swaps[0]!.previous,
+      "generated/replacement.png",
+      "replacement",
+    );
     mocks.models.workspaceRestoreCommit = makeModel();
     mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
 
@@ -668,9 +685,11 @@ describe("restore crash reconciliation", () => {
       token,
       swaps,
     });
-    await fs.rm(swaps[0]!.root, { recursive: true, force: true });
-    await fs.mkdir(path.join(swaps[0]!.root, "replacement"), { recursive: true });
-    await fs.writeFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "replacement");
+    await replaceDirectoryWithFixture(
+      swaps[0]!.root,
+      "replacement/keep.txt",
+      "replacement",
+    );
     resetNativeProfileFsRestoreForTests();
     mocks.models.workspaceRestoreCommit = makeModel();
     mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue({ token });
@@ -698,9 +717,11 @@ describe("restore crash reconciliation", () => {
       token,
       swaps,
     });
-    await fs.rm(swaps[0]!.root, { recursive: true, force: true });
-    await fs.mkdir(path.join(swaps[0]!.root, "replacement"), { recursive: true });
-    await fs.writeFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "replacement");
+    await replaceDirectoryWithFixture(
+      swaps[0]!.root,
+      "replacement/keep.txt",
+      "replacement",
+    );
     resetNativeProfileFsRestoreForTests();
     mocks.models.workspaceRestoreCommit = makeModel();
     mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
