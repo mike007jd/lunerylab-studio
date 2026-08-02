@@ -6,6 +6,7 @@
 import "server-only";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   findByokProvider,
   resolveByokConnectionModels,
@@ -13,6 +14,12 @@ import {
   type ByokModelRole,
 } from "@/lib/byok-providers";
 import { luneryConfigDir } from "@/lib/server/lunery-profile";
+import {
+  nativeProfileRename,
+  nativeProfileUnlink,
+  nativeProfileWrite,
+} from "@/lib/server/native-profile-fs";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export interface ByokConnectionMeta {
   endpoint: string;
@@ -26,6 +33,26 @@ function resolveConnectionStoreDir(): string {
 }
 
 const connectionStorePath = path.join(resolveConnectionStoreDir(), "provider-connections.json");
+
+const CONNECTION_STORE_LOCK = "__luneryByokConnectionStoreLockV1" as const;
+const connectionStoreGlobal = globalThis as typeof globalThis & {
+  [CONNECTION_STORE_LOCK]?: Promise<void>;
+};
+
+async function withConnectionStoreLock<T>(work: () => Promise<T>): Promise<T> {
+  const previous = connectionStoreGlobal[CONNECTION_STORE_LOCK] ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  connectionStoreGlobal[CONNECTION_STORE_LOCK] = previous.then(() => current, () => current);
+  await previous.catch(() => undefined);
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
 
 function normalizeConnectionMeta(providerId: string, value: unknown): ByokConnectionMeta | null {
   const provider = findByokProvider(providerId);
@@ -77,36 +104,51 @@ function loadConnectionStorePath(filePath: string): Map<string, ByokConnectionMe
   }
 }
 
-// Atomic tmp-write + rename. Throws on failure — callers MUST surface the error
+// Atomic native tmp-write + descriptor-relative rename. Throws on failure — callers MUST surface the error
 // (and not mutate in-memory state) so the API never reports success for a config
 // that never reached disk.
-function writeConnectionStore(state: Map<string, ByokConnectionMeta>): void {
-  fs.mkdirSync(path.dirname(connectionStorePath), { recursive: true });
-  const tmpPath = `${connectionStorePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(Object.fromEntries(state.entries()), null, 2), "utf8");
-  fs.renameSync(tmpPath, connectionStorePath);
+async function writeConnectionStore(state: Map<string, ByokConnectionMeta>): Promise<void> {
+  const tmpName = `provider-connections.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await nativeProfileWrite(
+      "config",
+      tmpName,
+      Buffer.from(JSON.stringify(Object.fromEntries(state.entries()), null, 2), "utf8"),
+      { replace: false },
+    );
+    await nativeProfileRename("config", tmpName, path.basename(connectionStorePath), {
+      replace: true,
+    });
+  } finally {
+    await nativeProfileUnlink("config", tmpName, { missingOk: true }).catch(() => undefined);
+  }
 }
 
 export function getByokConnectionMeta(providerId: string): ByokConnectionMeta | undefined {
   return loadConnectionStore().get(providerId);
 }
 
-export function setByokConnectionMeta(providerId: string, meta: ByokConnectionMeta): void {
-  const provider = findByokProvider(providerId);
-  if (!provider) return;
-  // Canonicalize on write: keep only known/non-blank slots. Never persist
-  // unknown model fields.
-  const models = resolveByokConnectionModels(meta);
-  const nextMeta: ByokConnectionMeta = {
-    endpoint: provider.requiresEndpoint ? meta.endpoint : provider.defaultEndpoint,
-    ...(models ? { models } : {}),
-    updatedAt: meta.updatedAt,
-  };
-  // Always merge against the latest disk state. Next app routes are compiled as
-  // independent bundles, so a module-level Map can remain stale forever after a
-  // sibling route writes the profile file.
-  const next = loadConnectionStore().set(providerId, nextMeta);
-  writeConnectionStore(next);
+export async function setByokConnectionMeta(
+  providerId: string,
+  meta: ByokConnectionMeta,
+): Promise<void> {
+  await withSharedMutationLease(() => withConnectionStoreLock(async () => {
+    const provider = findByokProvider(providerId);
+    if (!provider) return;
+    // Canonicalize on write: keep only known/non-blank slots. Never persist
+    // unknown model fields.
+    const models = resolveByokConnectionModels(meta);
+    const nextMeta: ByokConnectionMeta = {
+      endpoint: provider.requiresEndpoint ? meta.endpoint : provider.defaultEndpoint,
+      ...(models ? { models } : {}),
+      updatedAt: meta.updatedAt,
+    };
+    // Always merge against the latest disk state. Next app routes are compiled as
+    // independent bundles, so a module-level Map can remain stale forever after a
+    // sibling route writes the profile file.
+    const next = loadConnectionStore().set(providerId, nextMeta);
+    await writeConnectionStore(next);
+  }));
 }
 
 /** Read the model id a provider has configured for a specific capability. */
@@ -117,11 +159,13 @@ export function getByokConnectionModelId(
   return loadConnectionStore().get(providerId)?.models?.[role];
 }
 
-export function deleteByokConnectionMeta(providerId: string): void {
-  const next = loadConnectionStore();
-  if (!next.has(providerId)) return;
-  next.delete(providerId);
-  writeConnectionStore(next);
+export async function deleteByokConnectionMeta(providerId: string): Promise<void> {
+  await withSharedMutationLease(() => withConnectionStoreLock(async () => {
+    const next = loadConnectionStore();
+    if (!next.has(providerId)) return;
+    next.delete(providerId);
+    await writeConnectionStore(next);
+  }));
 }
 
 export function listByokConnectionMeta(): Record<string, ByokConnectionMeta> {

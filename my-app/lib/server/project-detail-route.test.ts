@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
+vi.mock("server-only", () => ({}));
+
 const mocks = vi.hoisted(() => ({
   fetchProjectActivity: vi.fn(),
   requireLocalWorkspaceOwner: vi.fn(),
@@ -18,8 +20,10 @@ vi.mock("@/lib/server/local-workspace-owner", () => ({
 }));
 
 import { GET, PATCH } from "@/app/api/projects/[id]/route";
+import { acquireWorkspaceExclusive, resetWorkspaceOperationGateForTests } from "@/lib/server/workspace-operation-gate";
 
 beforeEach(() => {
+  resetWorkspaceOperationGateForTests();
   vi.clearAllMocks();
   mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
   mocks.fetchProjectActivity.mockResolvedValue({
@@ -37,6 +41,21 @@ beforeEach(() => {
 });
 
 describe("project detail route", () => {
+  it("fails closed without reading split project state while restore is paused", async () => {
+    const exclusive = await acquireWorkspaceExclusive("restore");
+    try {
+      const response = await GET(
+        new NextRequest("http://localhost/api/projects/project-1"),
+        { params: Promise.resolve({ id: "project-1" }) },
+      );
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({ code: "workspace_busy" });
+      expect(mocks.fetchProjectActivity).not.toHaveBeenCalled();
+    } finally {
+      exclusive.release();
+    }
+  });
+
   it("forwards an independent jobs cursor without loading the canvas page", async () => {
     const response = await GET(
       new NextRequest(

@@ -4,6 +4,15 @@ import path from "node:path";
 import type { ModelCapability, ModelFormat, ModelRuntimeTarget } from "@/lib/hf-model-catalog";
 import { ApiError } from "@/lib/server/errors";
 import { luneryModelsDir } from "@/lib/server/lunery-profile";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
+import {
+  nativeProfileMkdir,
+  nativeProfileRename,
+  nativeProfileUnlink,
+  nativeProfileWrite,
+  nativeUnlinkExternalIdentity,
+  profileRelativePath,
+} from "@/lib/server/native-profile-fs";
 
 export type ImportedModelSource = "local-path" | "huggingface-url";
 export type ImportedModelStatus = "ready" | "queued";
@@ -37,6 +46,7 @@ export interface StagedExternalModelFile {
   journalPath: string;
   hadFile: boolean;
   preservedChangedFile: boolean;
+  expectedIdentity: ExternalPathIdentity | null;
 }
 
 interface ExternalModelDeleteJournal {
@@ -141,17 +151,12 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function syncDirectory(directoryPath: string): Promise<void> {
-  let handle: import("node:fs/promises").FileHandle | null = null;
-  try {
-    handle = await fs.open(directoryPath, "r");
-    await handle.sync();
-  } catch {
-    // Some filesystems do not expose directory fsync. The journal file itself
-    // is still synced before publication, and startup reconciliation remains safe.
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
+function modelsRelative(filePath: string): string {
+  return profileRelativePath("models", filePath);
+}
+
+async function unlinkModelsFile(filePath: string): Promise<void> {
+  await nativeProfileUnlink("models", modelsRelative(filePath), { missingOk: true });
 }
 
 async function writeExternalDeleteJournal(
@@ -159,24 +164,23 @@ async function writeExternalDeleteJournal(
   journal: ExternalModelDeleteJournal,
   exclusive = false,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(journalPath), { recursive: true });
+  await nativeProfileMkdir("models", modelsRelative(path.dirname(journalPath)));
   const tmpPath = `${journalPath}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await fs.open(tmpPath, "wx");
   try {
-    await handle.writeFile(JSON.stringify(journal), "utf8");
-    await handle.sync();
+    await nativeProfileWrite(
+      "models",
+      modelsRelative(tmpPath),
+      Buffer.from(JSON.stringify(journal), "utf8"),
+      { replace: false },
+    );
+    await nativeProfileRename(
+      "models",
+      modelsRelative(tmpPath),
+      modelsRelative(journalPath),
+      { replace: !exclusive },
+    );
   } finally {
-    await handle.close();
-  }
-  try {
-    if (exclusive) {
-      await fs.link(tmpPath, journalPath);
-    } else {
-      await fs.rename(tmpPath, journalPath);
-    }
-    await syncDirectory(path.dirname(journalPath));
-  } finally {
-    await fs.unlink(tmpPath).catch(() => undefined);
+    await unlinkModelsFile(tmpPath).catch(() => undefined);
   }
 }
 
@@ -262,7 +266,7 @@ async function restoreUnexpectedStagedPath(
     await writeExternalDeleteJournal(journalPath, journal);
     try {
       await movePathNoReplace(stagedPath, restoredPath, identity);
-      await fs.unlink(journalPath).catch(() => undefined);
+      await unlinkModelsFile(journalPath).catch(() => undefined);
       return restoredPath;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -343,6 +347,7 @@ export async function stageImportedExternalModelFile(
     journalPath: "",
     hadFile: false,
     preservedChangedFile,
+    expectedIdentity: null,
   });
   if (record.source !== "local-path" || !record.fileIdentity) {
     return emptyStage(true);
@@ -407,7 +412,7 @@ export async function stageImportedExternalModelFile(
   try {
     await fs.rename(record.modelPath, stagedPath);
   } catch (error) {
-    await fs.unlink(journalPath).catch(() => undefined);
+    await unlinkModelsFile(journalPath).catch(() => undefined);
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStage(false);
     throw new ApiError({
       status: 503,
@@ -428,11 +433,12 @@ export async function stageImportedExternalModelFile(
         journalPath,
         hadFile: true,
         preservedChangedFile: false,
+        expectedIdentity: record.fileIdentity,
       };
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      await fs.unlink(journalPath).catch(() => undefined);
+      await unlinkModelsFile(journalPath).catch(() => undefined);
       return emptyStage(false);
     }
     throw new ApiError({
@@ -486,15 +492,24 @@ export async function rollbackImportedExternalModelFile(
 export async function finishImportedExternalModelRollback(
   stage: StagedExternalModelFile,
 ): Promise<void> {
-  if (stage.journalPath) await fs.unlink(stage.journalPath).catch(() => undefined);
+  if (stage.journalPath) await unlinkModelsFile(stage.journalPath).catch(() => undefined);
 }
 
 export async function commitImportedExternalModelFile(
   stage: StagedExternalModelFile,
 ): Promise<number> {
   if (!stage.hadFile) return 0;
-  await fs.unlink(stage.stagedPath);
-  await fs.unlink(stage.journalPath).catch(() => undefined);
+  if (!stage.expectedIdentity) {
+    throw new Error("Staged external model deletion is missing its expected identity.");
+  }
+  if (process.env.NODE_ENV === "test" && __importedModelRegistryTestHooks.beforeExternalFinalize) {
+    await __importedModelRegistryTestHooks.beforeExternalFinalize(stage);
+  }
+  // Keep the journal until the native descriptor-relative unlink has matched
+  // the exact file staged earlier. A replacement at the staging name is user
+  // data: preserve it and leave the journal actionable for startup recovery.
+  await nativeUnlinkExternalIdentity(stage.stagedPath, stage.expectedIdentity);
+  await unlinkModelsFile(stage.journalPath).catch(() => undefined);
   return 1;
 }
 
@@ -540,6 +555,26 @@ function isExternalDeleteJournal(value: unknown): value is ExternalModelDeleteJo
     && journal.record.modelPath === journal.originalPath;
 }
 
+async function unlinkExpectedExternalDeleteStage(
+  journal: ExternalModelDeleteJournal,
+): Promise<boolean> {
+  if (
+    process.env.NODE_ENV === "test"
+    && __importedModelRegistryTestHooks.beforeExternalReconcileDelete
+  ) {
+    await __importedModelRegistryTestHooks.beforeExternalReconcileDelete(journal.stagedPath);
+  }
+  try {
+    // The native service resolves and verifies the staged file through one
+    // descriptor-relative operation. A replacement after our recovery scan is
+    // user data, so leave both it and the journal for the next reconciliation.
+    await nativeUnlinkExternalIdentity(journal.stagedPath, journal.fileIdentity);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function reconcileExternalModelDeleteJournals(): Promise<void> {
   let journalNames: string[];
   try {
@@ -551,6 +586,7 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
   }
   if (journalNames.length === 0) return;
 
+  return withImportedModelRegistryMutation(async () => {
   const records = (await readImportedModelsFrom(importedModelsRegistryPath())) ?? [];
   let registryChanged = false;
   const completed: string[] = [];
@@ -566,11 +602,15 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
     }
 
     const index = records.findIndex((record) => record.id === journal.modelId);
+    let stagedState: "missing" | "matching" | "changed" = "missing";
     let stagedIdentity: ExternalPathIdentity | null = null;
     try {
       const stagedStat = await fs.lstat(journal.stagedPath, { bigint: true });
       if (!externalIdentityMatches(journal.fileIdentity, stagedStat)) {
+        stagedState = "changed";
         stagedIdentity = externalPathIdentity(stagedStat);
+      } else {
+        stagedState = "matching";
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
@@ -588,6 +628,13 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
             ...records[index]!,
             modelPath: restoredPath,
             fileName: path.basename(restoredPath),
+            sizeBytes: Number(stagedIdentity.sizeBytes),
+            fileIdentity: {
+              device: stagedIdentity.device,
+              inode: stagedIdentity.inode,
+              sizeBytes: stagedIdentity.sizeBytes,
+              modifiedAtNs: stagedIdentity.modifiedAtNs,
+            },
           };
           registryChanged = true;
         }
@@ -652,8 +699,11 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
       continue;
     }
     if (index < 0) {
-      if (await statMatches(journal.stagedPath, journal.fileIdentity)) {
-        await fs.unlink(journal.stagedPath);
+      if (
+        stagedState === "matching"
+        && !(await unlinkExpectedExternalDeleteStage(journal))
+      ) {
+        continue;
       }
       completed.push(journalPath);
       continue;
@@ -662,8 +712,11 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
     let restoredPath: string | null = null;
     if (await statMatches(journal.originalPath, journal.fileIdentity)) {
       restoredPath = journal.originalPath;
-      if (await statMatches(journal.stagedPath, journal.fileIdentity)) {
-        await fs.unlink(journal.stagedPath);
+      if (
+        stagedState === "matching"
+        && !(await unlinkExpectedExternalDeleteStage(journal))
+      ) {
+        continue;
       }
     } else if (await statMatches(journal.stagedPath, journal.fileIdentity)) {
       restoredPath = journal.originalPath;
@@ -694,7 +747,41 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
   }
 
   if (registryChanged) await writeImportedModels(records);
-  await Promise.all(completed.map((journalPath) => fs.unlink(journalPath).catch(() => undefined)));
+  await Promise.all(completed.map((journalPath) => unlinkModelsFile(journalPath).catch(() => undefined)));
+  });
+}
+
+const REGISTRY_LOCK = "__luneryImportedModelRegistryLockV1" as const;
+const registryGlobal = globalThis as typeof globalThis & {
+  [REGISTRY_LOCK]?: Promise<void>;
+};
+
+async function withImportedModelRegistryLock<T>(work: () => Promise<T>): Promise<T> {
+  const previous = registryGlobal[REGISTRY_LOCK] ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  registryGlobal[REGISTRY_LOCK] = previous.then(() => current, () => current);
+  await previous.catch(() => undefined);
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+async function withImportedModelRegistryMutation<T>(work: () => Promise<T>): Promise<T> {
+  return withSharedMutationLease(() => withImportedModelRegistryLock(work));
+}
+
+function importedModelRegistryCorrupt(): ApiError {
+  return new ApiError({
+    status: 500,
+    code: "imported_model_registry_corrupt",
+    message: "The imported model registry is corrupted and cannot be read.",
+    retryable: false,
+  });
 }
 
 export async function readImportedModels(): Promise<ImportedModelRecord[]> {
@@ -706,11 +793,19 @@ export async function readImportedModels(): Promise<ImportedModelRecord[]> {
 async function readImportedModelsFrom(registryPath: string): Promise<ImportedModelRecord[] | null> {
   try {
     const raw = await fs.readFile(registryPath, "utf8");
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? parsed.filter(isImportedModelRecord) : [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      throw importedModelRegistryCorrupt();
+    }
+    if (!Array.isArray(parsed) || !parsed.every(isImportedModelRecord)) {
+      throw importedModelRegistryCorrupt();
+    }
+    return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    return [];
+    throw error;
   }
 }
 
@@ -720,28 +815,202 @@ export async function findImportedModel(id: string): Promise<ImportedModelRecord
 }
 
 export async function upsertImportedModel(record: ImportedModelRecord): Promise<ImportedModelRecord> {
-  const records = await readImportedModels();
-  const next = records.filter((item) => item.id !== record.id);
-  next.push(record);
-  next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  await writeImportedModels(next);
-  return record;
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const next = records.filter((item) => item.id !== record.id);
+    next.push(record);
+    next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(next);
+    return record;
+  });
 }
 
 export async function removeImportedModel(id: string): Promise<ImportedModelRecord | undefined> {
-  const records = await readImportedModels();
-  const removed = records.find((record) => record.id === id);
-  if (!removed) return undefined;
-  await writeImportedModels(records.filter((record) => record.id !== id));
-  return removed;
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const removed = records.find((record) => record.id === id);
+    if (!removed) return undefined;
+    await writeImportedModels(records.filter((record) => record.id !== id));
+    return removed;
+  });
 }
 
+export async function removeImportedModelIfUnchanged(
+  expected: ImportedModelRecord,
+): Promise<ImportedModelRecord> {
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const current = records.find((record) => record.id === expected.id);
+    if (!sameImportedModelRecord(current, expected)) {
+      throw new ApiError({
+        status: 409,
+        code: "model_import_in_progress",
+        message: "This model changed while deletion was being prepared. Try again.",
+        retryable: true,
+      });
+    }
+    await writeImportedModels(records.filter((record) => record.id !== expected.id));
+    return expected;
+  });
+}
+
+export interface QueuedImportedModelMutation {
+  record: ImportedModelRecord;
+  previous?: ImportedModelRecord;
+}
+
+/**
+ * Bridge start may have been accepted even though its HTTP response was lost.
+ * This marker tells the registry reservation to retain queued ownership; only
+ * a definitive rejection is safe to compensate.
+ */
+export class QueuedImportedModelStartUncertainError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "QueuedImportedModelStartUncertainError";
+  }
+}
+
+function sameImportedModelRecord(
+  left: ImportedModelRecord | undefined,
+  right: ImportedModelRecord | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/**
+ * Keep the registry mutex and workspace shared lease from the queued write
+ * through bridge start acknowledgement. This prevents same-id imports or
+ * deletes from creating an unowned native download between those phases.
+ */
+export async function withQueuedImportedModelReservation<T>({
+  record,
+  expectedPrevious,
+  start,
+}: {
+  record: ImportedModelRecord;
+  expectedPrevious?: ImportedModelRecord;
+  start: () => Promise<T>;
+}): Promise<{ record: ImportedModelRecord; result: T }> {
+  if (record.source !== "huggingface-url" || record.status !== "queued" || !record.jobId) {
+    throw new Error("Only a queued Hugging Face import can reserve bridge start.");
+  }
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const current = records.find((item) => item.id === record.id);
+    if (!sameImportedModelRecord(current, expectedPrevious)) {
+      throw new ApiError({
+        status: 409,
+        code: "model_import_in_progress",
+        message: "This model import changed while another download was starting. Try again.",
+        retryable: true,
+      });
+    }
+
+    const queuedRecords = records.filter((item) => item.id !== record.id);
+    queuedRecords.push(record);
+    queuedRecords.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(queuedRecords);
+
+    try {
+      return { record, result: await start() };
+    } catch (startError) {
+      if (startError instanceof QueuedImportedModelStartUncertainError) {
+        throw startError;
+      }
+      const restored = records.filter((item) => item.id !== record.id);
+      if (expectedPrevious) restored.push(expectedPrevious);
+      restored.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      try {
+        await writeImportedModels(restored);
+      } catch (compensationError) {
+        console.error("[model-import] queued registry compensation failed", {
+          compensationError,
+          jobId: record.jobId,
+          modelId: record.id,
+          startError,
+        });
+        throw new ApiError({
+          status: 500,
+          code: "imported_model_registry_compensation_failed",
+          message: "Bridge start failed and the queued model registry state could not be rolled back.",
+          retryable: false,
+        });
+      }
+      throw startError;
+    }
+  });
+}
+
+export async function queueImportedModel(
+  record: ImportedModelRecord,
+): Promise<QueuedImportedModelMutation> {
+  if (record.source !== "huggingface-url" || record.status !== "queued" || !record.jobId) {
+    throw new Error("Only a queued Hugging Face import can be registered before bridge start.");
+  }
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const previous = records.find((item) => item.id === record.id);
+    const next = records.filter((item) => item.id !== record.id);
+    next.push(record);
+    next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(next);
+    return { record, ...(previous ? { previous } : {}) };
+  });
+}
+
+/**
+ * Compensate a bridge launch failure without deleting a prior import or a
+ * newer concurrent queue. Returns false when this failed job no longer owns
+ * the registry slot, in which case the newer state is intentionally kept.
+ */
+export async function restoreImportedModelAfterFailedQueue(
+  mutation: QueuedImportedModelMutation,
+): Promise<boolean> {
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const current = records.find((item) => item.id === mutation.record.id);
+    if (current?.jobId !== mutation.record.jobId || current?.status !== "queued") {
+      return false;
+    }
+    const next = records.filter((item) => item.id !== mutation.record.id);
+    if (mutation.previous) next.push(mutation.previous);
+    next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(next);
+    return true;
+  });
+}
+
+/** Test-only hook to inject write failures after the lock is held. */
+export const __importedModelRegistryTestHooks = {
+  beforeWrite: null as null | (() => Promise<void> | void),
+  beforeExternalFinalize: null as null | ((stage: StagedExternalModelFile) => Promise<void> | void),
+  beforeExternalReconcileDelete: null as null | ((stagedPath: string) => Promise<void> | void),
+};
+
 async function writeImportedModels(records: ImportedModelRecord[]): Promise<void> {
+  if (__importedModelRegistryTestHooks.beforeWrite) {
+    await __importedModelRegistryTestHooks.beforeWrite();
+  }
   const registryPath = importedModelsRegistryPath();
-  await fs.mkdir(path.dirname(registryPath), { recursive: true });
   const tmpPath = `${registryPath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(tmpPath, JSON.stringify(records, null, 2), "utf8");
-  await fs.rename(tmpPath, registryPath);
+  try {
+    await nativeProfileWrite(
+      "models",
+      modelsRelative(tmpPath),
+      Buffer.from(JSON.stringify(records, null, 2), "utf8"),
+      { replace: false },
+    );
+    await nativeProfileRename(
+      "models",
+      modelsRelative(tmpPath),
+      modelsRelative(registryPath),
+      { replace: true },
+    );
+  } finally {
+    await unlinkModelsFile(tmpPath).catch(() => undefined);
+  }
 }
 
 export async function resolveLocalModelPath(input: string): Promise<{
@@ -781,7 +1050,7 @@ export async function resolveLocalModelPath(input: string): Promise<{
   }
 }
 
-function isImportedModelRecord(value: unknown): value is ImportedModelRecord {
+export function isImportedModelRecord(value: unknown): value is ImportedModelRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<ImportedModelRecord>;
   return (

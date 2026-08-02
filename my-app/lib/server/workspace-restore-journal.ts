@@ -4,6 +4,18 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { prisma } from "@/lib/server/prisma";
 import { luneryConfigDir, luneryDataDir, luneryMediaDir } from "@/lib/server/lunery-profile";
+import {
+  nativeCleanupWorkspaceRestore,
+  nativeRefreshWorkspaceRestoreRoots,
+  nativeRollbackWorkspaceRestoreRoots,
+  type NativeWorkspaceRestoreOriginalIdentities,
+  type NativeWorkspaceRestoreStagedIdentities,
+} from "@/lib/server/native-profile-fs";
+import {
+  getWorkspaceExclusiveCapability,
+  hasWorkspaceMutationAuthority,
+  withWorkspaceExclusive,
+} from "@/lib/server/workspace-operation-gate";
 
 export const RESTORE_JOURNAL_FORMAT = "lunery-workspace-restore-journal";
 export const RESTORE_JOURNAL_VERSION = 1;
@@ -17,6 +29,10 @@ export interface RestoreJournalSwap {
   staged: string;
   previous: string;
   previousExisted: boolean;
+  originalDevice: string;
+  originalInode: string;
+  stagedDevice: string | null;
+  stagedInode: string | null;
 }
 
 export interface RestoreJournal {
@@ -123,7 +139,12 @@ function siblingRestorePath(root: string, kind: "stage" | "previous", token: str
  * Canonical media+config swap descriptors for the current resolved profile roots
  * and a restore token. Callers fill `previousExisted` after probing the roots.
  */
-export function buildExpectedRestoreSwaps(token: string): Omit<RestoreJournalSwap, "previousExisted">[] {
+export function buildExpectedRestoreSwaps(
+  token: string,
+): Omit<
+  RestoreJournalSwap,
+  "previousExisted" | "originalDevice" | "originalInode" | "stagedDevice" | "stagedInode"
+>[] {
   assertRestoreToken(token);
   const mediaRoot = path.resolve(luneryMediaDir());
   const configRoot = path.resolve(luneryConfigDir());
@@ -175,6 +196,19 @@ export function validateRestoreJournal(journal: RestoreJournal): RestoreJournal 
       typeof actual.staged !== "string" ||
       typeof actual.previous !== "string" ||
       typeof actual.previousExisted !== "boolean" ||
+      typeof actual.originalDevice !== "string" ||
+      typeof actual.originalInode !== "string" ||
+      !/^\d+$/.test(actual.originalDevice) ||
+      !/^\d+$/.test(actual.originalInode) ||
+      !(
+        (actual.stagedDevice === null && actual.stagedInode === null)
+        || (
+          typeof actual.stagedDevice === "string"
+          && typeof actual.stagedInode === "string"
+          && /^\d+$/.test(actual.stagedDevice)
+          && /^\d+$/.test(actual.stagedInode)
+        )
+      ) ||
       !samePath(actual.root, want.root) ||
       !samePath(actual.staged, want.staged) ||
       !samePath(actual.previous, want.previous)
@@ -186,13 +220,42 @@ export function validateRestoreJournal(journal: RestoreJournal): RestoreJournal 
       staged: want.staged,
       previous: want.previous,
       previousExisted: actual.previousExisted,
+      originalDevice: actual.originalDevice,
+      originalInode: actual.originalInode,
+      stagedDevice: actual.stagedDevice,
+      stagedInode: actual.stagedInode,
     });
+  }
+  const stagedIdentityCount = swaps.filter((swap) => swap.stagedDevice !== null).length;
+  if (stagedIdentityCount !== 0 && stagedIdentityCount !== swaps.length) {
+    throw new Error("Corrupt workspace restore staged identities.");
   }
   return {
     format: RESTORE_JOURNAL_FORMAT,
     version: RESTORE_JOURNAL_VERSION,
     token,
     swaps,
+  };
+}
+
+function journalStagedIdentities(journal: RestoreJournal): NativeWorkspaceRestoreStagedIdentities {
+  const media = journal.swaps[0]!;
+  const config = journal.swaps[1]!;
+  if (media.stagedDevice === null || config.stagedDevice === null) return null;
+  return {
+    media: { device: media.stagedDevice, inode: media.stagedInode! },
+    config: { device: config.stagedDevice, inode: config.stagedInode! },
+  };
+}
+
+function journalOriginalIdentities(
+  journal: RestoreJournal,
+): NativeWorkspaceRestoreOriginalIdentities {
+  const media = journal.swaps[0]!;
+  const config = journal.swaps[1]!;
+  return {
+    media: { device: media.originalDevice, inode: media.originalInode },
+    config: { device: config.originalDevice, inode: config.originalInode },
   };
 }
 
@@ -299,97 +362,6 @@ export async function clearRestoreCommitMarker(): Promise<void> {
   });
 }
 
-type SwapPhase =
-  | "not_started"
-  | "root_moved"
-  | "promoted"
-  | "promoted_empty_baseline"
-  | "clean";
-
-/**
- * Infer restore phase from durable root/staged/previous presence. Never trust
- * previousExisted alone to delete an untouched root (media promoted / config
- * still original is the critical case).
- */
-async function inferSwapPhase(swap: RestoreJournalSwap): Promise<SwapPhase> {
-  const rootExists = await pathExists(swap.root);
-  const stagedExists = await pathExists(swap.staged);
-  const previousExists = await pathExists(swap.previous);
-
-  if (previousExists) {
-    return rootExists ? "promoted" : "root_moved";
-  }
-  if (stagedExists) {
-    // Promotion never began for this swap — root still holds the original tree
-    // (or remains absent when previousExisted was false).
-    return "not_started";
-  }
-  if (rootExists && !swap.previousExisted) {
-    // Empty baseline was replaced by staged→root; roll back by removing root.
-    return "promoted_empty_baseline";
-  }
-  if (rootExists && swap.previousExisted) {
-    // previousExisted claimed an old root, but previous is absent and staged is
-    // gone — treat as not started / already rolled back; never delete root.
-    return "not_started";
-  }
-  return "clean";
-}
-
-async function removePathIfPresent(target: string): Promise<void> {
-  if (await pathExists(target)) {
-    await fs.rm(target, { recursive: true, force: true });
-  }
-}
-
-async function rollbackSwap(swap: RestoreJournalSwap): Promise<void> {
-  const phase = await inferSwapPhase(swap);
-  switch (phase) {
-    case "promoted": {
-      await removePathIfPresent(swap.root);
-      await fs.rename(swap.previous, swap.root);
-      await removePathIfPresent(swap.staged);
-      break;
-    }
-    case "root_moved": {
-      await fs.rename(swap.previous, swap.root);
-      await removePathIfPresent(swap.staged);
-      break;
-    }
-    case "promoted_empty_baseline": {
-      await removePathIfPresent(swap.root);
-      await removePathIfPresent(swap.staged);
-      break;
-    }
-    case "not_started": {
-      // Keep untouched root (old config after media-only promotion).
-      await removePathIfPresent(swap.staged);
-      await removePathIfPresent(swap.previous);
-      break;
-    }
-    case "clean": {
-      await removePathIfPresent(swap.staged);
-      await removePathIfPresent(swap.previous);
-      break;
-    }
-    default: {
-      const _exhaustive: never = phase;
-      throw new Error(`Unknown restore swap phase: ${_exhaustive}`);
-    }
-  }
-}
-
-async function finishCommittedSwap(swap: RestoreJournalSwap): Promise<void> {
-  if (!(await pathExists(swap.root))) {
-    // The DB commit proves the new workspace is authoritative. Never discard
-    // the previous tree when the promoted root is missing; preserve the
-    // journal and recovery material for fail-closed diagnosis/retry.
-    throw new Error(`Committed workspace restore root is missing: ${path.basename(swap.root)}`);
-  }
-  await removePathIfPresent(swap.staged);
-  await removePathIfPresent(swap.previous);
-}
-
 /**
  * Reconcile a crash mid-restore into a deterministic old+old or new+new state.
  * Journal absent → no-op (clear orphan marker). Marker absent → phase-correct
@@ -398,7 +370,7 @@ async function finishCommittedSwap(swap: RestoreJournalSwap): Promise<void> {
  * work completes, and before the DB marker, so a crash cannot leave an
  * ambiguous "marker without journal" gap.
  */
-export async function reconcileWorkspaceRestoreState(): Promise<void> {
+async function reconcileWorkspaceRestoreStateWithAuthority(): Promise<void> {
   let journal: RestoreJournal | null;
   try {
     journal = await readRestoreJournal();
@@ -423,25 +395,60 @@ export async function reconcileWorkspaceRestoreState(): Promise<void> {
         );
       }
     }
-    for (const swap of journal.swaps) {
-      await finishCommittedSwap(swap);
-    }
+    // Startup may have freshly pinned these roots; an in-process recovery may
+    // still hold the pre-swap identities. The native boundary validates the
+    // live roots before publishing both identities together.
+    const stagedIdentities = journalStagedIdentities(journal);
+    await nativeRefreshWorkspaceRestoreRoots(journal.token, stagedIdentities);
+    await nativeCleanupWorkspaceRestore(
+      journal.token,
+      journalOriginalIdentities(journal),
+      stagedIdentities,
+    );
   } else {
-    for (const swap of [...journal.swaps].reverse()) {
-      await rollbackSwap(swap);
-    }
+    await nativeRollbackWorkspaceRestoreRoots(
+      journal.token,
+      journalOriginalIdentities(journal),
+      journalStagedIdentities(journal),
+    );
   }
 
   await removeRestoreJournal();
   await clearRestoreCommitMarker();
 }
 
+export async function reconcileWorkspaceRestoreState(): Promise<void> {
+  if (getWorkspaceExclusiveCapability()) {
+    return reconcileWorkspaceRestoreStateWithAuthority();
+  }
+  if (hasWorkspaceMutationAuthority()) {
+    throw new Error("Workspace restore reconciliation cannot begin from a shared mutation lease.");
+  }
+  return withWorkspaceExclusive(
+    "destructive-reconcile",
+    reconcileWorkspaceRestoreStateWithAuthority,
+  );
+}
+
 let reconcilePromise: Promise<void> | null = null;
 
-/** Single-flight startup reconciliation before workspace owner/bootstrap work. */
+/**
+ * Single-flight startup reconciliation before workspace APIs read or mutate
+ * profile state. Recovery owns exclusive authority so sync config writers
+ * cannot race a media/config swap. An already-exclusive restore may re-enter;
+ * a shared caller fails closed instead of waiting on its own lease forever.
+ */
 export function ensureWorkspaceRestoreReconciled(): Promise<void> {
   if (!reconcilePromise) {
-    reconcilePromise = reconcileWorkspaceRestoreState().catch((error) => {
+    const exclusive = getWorkspaceExclusiveCapability();
+    const recovery = exclusive
+      ? reconcileWorkspaceRestoreStateWithAuthority()
+      : hasWorkspaceMutationAuthority()
+        ? Promise.reject(
+            new Error("Startup restore reconciliation cannot begin from a shared mutation lease."),
+          )
+        : withWorkspaceExclusive("destructive-reconcile", reconcileWorkspaceRestoreStateWithAuthority);
+    reconcilePromise = recovery.catch((error) => {
       reconcilePromise = null;
       throw error;
     });

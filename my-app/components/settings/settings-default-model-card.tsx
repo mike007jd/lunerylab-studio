@@ -8,6 +8,7 @@ import { SurfaceCard } from "@/components/ui/page-primitives";
 import type { ImageModelEntry } from "@/lib/image-models";
 import { useT } from "@/lib/i18n/useT";
 import { isChineseLocale, type Locale } from "@/lib/i18n/locale";
+import { isPersistedDefaultUnavailable } from "./settings-capability-default-card";
 
 const NO_DEFAULT_MODEL_VALUE = "__lunery_no_default_model__";
 
@@ -17,8 +18,11 @@ export function SettingsDefaultModelCard({
   feedback,
   locale,
   models,
+  loading,
+  catalogError,
   onModelChange,
   onSave,
+  onClear,
   saving,
 }: {
   defaultModel: string;
@@ -26,8 +30,11 @@ export function SettingsDefaultModelCard({
   feedback: { tone: "success" | "error"; text: string } | null;
   locale: Locale;
   models: ImageModelEntry[];
+  loading: boolean;
+  catalogError: boolean;
   onModelChange: (model: string) => void;
   onSave: () => void;
+  onClear: () => void;
   saving: boolean;
 }) {
   const t = useT();
@@ -35,25 +42,62 @@ export function SettingsDefaultModelCard({
   const pathname = usePathname();
   const isZh = isChineseLocale(locale);
   const hasModels = models.length > 0;
+  const unavailable = isPersistedDefaultUnavailable(defaultModel, models, loading, catalogError);
+  const configured = Boolean(defaultModel) && !unavailable;
 
   return (
-    <SurfaceCard className="space-y-5">
+    <SurfaceCard className="space-y-5" aria-busy={loading}>
       <div className="flex items-center justify-between gap-3">
         <h2 className="text-base font-semibold tracking-[-0.01em] text-(--text-primary)">
           {t("settings.defaultModel")}
         </h2>
         <p className="rounded-full border border-(--border-subtle) bg-(--bg-glass) px-2 py-1 text-[0.7rem] font-medium text-(--text-muted)">
           {t("settings.realGenerationStatus", {
-            status: defaultModel
-              ? t("settings.realGenerationEnabled")
-              : t("settings.notConfigured"),
+            status: loading
+              ? t("common.loading")
+              : catalogError
+                ? t("settings.modelCatalogUnavailable")
+              : unavailable
+              ? t("settings.defaultModelUnavailable")
+              : configured
+                ? t("settings.realGenerationEnabled")
+                : t("settings.notConfigured"),
           })}
         </p>
       </div>
 
-      {/* No model exists yet → dead-end Select + disabled Save is replaced by a
-          real next step. Keeps the no-default rule (we never preselect a model). */}
-      {!hasModels ? (
+      {loading ? (
+        <p className="rounded-xl border border-dashed border-(--border-subtle) bg-(--bg-glass) p-4 text-xs leading-5 text-(--text-secondary)">
+          {t("common.loading")}
+        </p>
+      ) : catalogError ? (
+        <p role="alert" className="rounded-xl border border-dashed border-(--border-subtle) bg-(--bg-glass) p-4 text-xs leading-5 text-(--text-secondary)">
+          {t("settings.modelCatalogUnavailableHint")}
+        </p>
+      ) : unavailable ? (
+        <div className="space-y-3 rounded-xl border border-dashed border-(--border-subtle) bg-(--bg-glass) p-4">
+          <p className="text-xs leading-5 text-(--text-secondary)">
+            {t("settings.defaultModelUnavailableHint")}
+          </p>
+          <Button
+            type="button"
+            variant="secondary"
+            loading={saving}
+            onClick={onClear}
+          >
+            {t("settings.clearDefaultModel")}
+          </Button>
+          {feedback ? (
+            <p
+              role="status"
+              aria-live="polite"
+              className={feedback.tone === "success" ? "text-sm text-(--success)" : "text-sm text-destructive"}
+            >
+              {feedback.text}
+            </p>
+          ) : null}
+        </div>
+      ) : !hasModels ? (
         <div className="space-y-3 rounded-xl border border-dashed border-(--border-subtle) bg-(--bg-glass) p-4">
           <div className="space-y-1">
             <p className="text-sm font-medium text-(--text-primary)">

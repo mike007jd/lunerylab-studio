@@ -2,12 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import {
   bridgeErrorText,
-  getBridgeDownloadStatus,
+  probeBridgeDownloadJob,
   requireDesktopBridge,
   startBridgeDownloadJob,
 } from "@/lib/server/desktop-bridge";
 import { parseJsonBody } from "@/lib/server/http-validation";
-import { jsonError } from "@/lib/server/errors";
+import { ApiError, jsonError } from "@/lib/server/errors";
 import { resolveHuggingFaceModelFileUrl } from "@/lib/server/hf-import-url";
 import {
   findImportedModel,
@@ -15,8 +15,10 @@ import {
   importedModelId,
   normalizeImportableRuntimeTarget,
   resolveLocalModelPath,
+  QueuedImportedModelStartUncertainError,
   upsertImportedModel,
   validateImportedRuntimeFormat,
+  withQueuedImportedModelReservation,
 } from "@/lib/server/imported-model-registry";
 
 export const dynamic = "force-dynamic";
@@ -30,6 +32,22 @@ const importModelBodySchema = z.object({
 });
 
 const ACTIVE_IMPORT_STATUSES = new Set(["queued", "downloading"]);
+
+function queuedImportResponse(record: NonNullable<Awaited<ReturnType<typeof findImportedModel>>>, extra: {
+  recovered?: boolean;
+} = {}) {
+  return NextResponse.json({
+    imported: true,
+    queued: true,
+    reused: true,
+    ...extra,
+    jobId: record.jobId,
+    fileName: record.fileName,
+    runtimeTarget: record.runtimeTarget,
+    dest: record.modelPath,
+    model: record,
+  });
+}
 
 // Required SHA-256 preflight for integrity verification. Hugging Face returns
 // the SHA-256 of an LFS/Xet artifact in `x-linked-etag` on the /resolve HEAD
@@ -56,6 +74,15 @@ async function fetchHuggingFaceSha256(url: string): Promise<string | { error: st
     return { error: "Could not verify the Hugging Face model artifact checksum." };
   } catch {
     return { error: "Could not verify the Hugging Face model artifact." };
+  }
+}
+
+class BridgeStartError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
   }
 }
 
@@ -128,18 +155,85 @@ export async function POST(request: NextRequest) {
   const dest = importedModelDownloadDest(runtimeTarget, modelId, resolved.fileName);
   const existing = await findImportedModel(modelId);
   if (existing?.jobId) {
-    const existingStatus = await getBridgeDownloadStatus(bridge, existing.jobId);
-    if (typeof existingStatus?.status === "string" && ACTIVE_IMPORT_STATUSES.has(existingStatus.status)) {
-      return NextResponse.json({
-        imported: true,
-        queued: true,
-        reused: true,
-        jobId: existing.jobId,
-        fileName: existing.fileName,
-        runtimeTarget: existing.runtimeTarget,
-        dest: existing.modelPath,
-        model: existing,
-      });
+    const existingProbe = await probeBridgeDownloadJob(bridge, existing.jobId);
+    if (existingProbe.outcome === "observed" && ACTIVE_IMPORT_STATUSES.has(existingProbe.status)) {
+      return queuedImportResponse(existing);
+    }
+    if (existingProbe.outcome === "ambiguous") {
+      return NextResponse.json(
+        {
+          error: "Existing model import status is unknown; queued ownership was retained.",
+          code: existingProbe.code,
+          partialState: true,
+          queued: true,
+          retryable: true,
+          jobId: existing.jobId,
+        },
+        { status: existingProbe.code === "bridge_timeout" ? 504 : 503 },
+      );
+    }
+    if (existingProbe.outcome === "not_found") {
+      // An earlier start may have been accepted even though both its response
+      // and the immediate status probe were lost. Re-submit the exact durable
+      // request identity under the original jobId. Native start is idempotent
+      // for same-ID/same-payload and adopts the existing reservation instead
+      // of creating a second job.
+      if (
+        existing.source !== "huggingface-url"
+        || !existing.url
+        || !existing.sha256
+        || existing.modelPath !== dest
+      ) {
+        return NextResponse.json(
+          {
+            error: "Existing model import ownership is incomplete and cannot be retried safely.",
+            code: "bridge_start_unknown",
+            partialState: true,
+            queued: true,
+            retryable: false,
+            jobId: existing.jobId,
+          },
+          { status: 409 },
+        );
+      }
+      try {
+        const retry = await startBridgeDownloadJob(bridge, {
+          url: existing.url,
+          dest: existing.modelPath,
+          sha256: existing.sha256,
+          jobId: existing.jobId,
+        });
+        if (!retry.ok) {
+          const message = await bridgeErrorText(retry).catch(() => `HTTP ${retry.status}`);
+          return NextResponse.json(
+            {
+              error: `Bridge start failed: ${message}`,
+              code: "bridge_start_rejected",
+              queued: true,
+              retryable: false,
+              jobId: existing.jobId,
+            },
+            { status: retry.status },
+          );
+        }
+        return queuedImportResponse(existing, { recovered: true });
+      } catch {
+        const observed = await probeBridgeDownloadJob(bridge, existing.jobId);
+        if (observed.outcome === "observed") {
+          return queuedImportResponse(existing, { recovered: true });
+        }
+        return NextResponse.json(
+          {
+            error: "Existing model import status is unknown; queued ownership was retained.",
+            code: "bridge_start_unknown",
+            partialState: true,
+            queued: true,
+            retryable: true,
+            jobId: existing.jobId,
+          },
+          { status: 503 },
+        );
+      }
     }
   }
 
@@ -148,24 +242,14 @@ export async function POST(request: NextRequest) {
   if (typeof sha256 !== "string") {
     return NextResponse.json({ error: sha256.error }, { status: 400 });
   }
-  const bridgeRes = await startBridgeDownloadJob(bridge, {
-    url: resolved.url,
-    dest,
-    sha256,
-    jobId,
-  });
 
-  if (!bridgeRes.ok) {
-    return NextResponse.json(
-      { error: `Bridge start failed: ${await bridgeErrorText(bridgeRes)}` },
-      { status: bridgeRes.status },
-    );
-  }
-
-  const record = await upsertImportedModel({
+  // Persist queued ownership before invoking the desktop bridge so a crash or
+  // launch failure cannot leave an untracked download. Compensate on start
+  // failure so no false importing/queued record remains.
+  const queuedRecord = {
     id: modelId,
     label: body.label?.trim() || resolved.fileName,
-    source: "huggingface-url",
+    source: "huggingface-url" as const,
     runtimeTarget,
     capability: runnable.capability,
     format: runnable.format,
@@ -173,11 +257,86 @@ export async function POST(request: NextRequest) {
     modelPath: dest,
     sizeBytes: 0,
     sha256,
-    status: "queued",
+    status: "queued" as const,
     createdAt: new Date().toISOString(),
     url: resolved.url,
     jobId,
-  });
+  };
+
+  let record;
+  try {
+    const reservation = await withQueuedImportedModelReservation({
+      record: queuedRecord,
+      expectedPrevious: existing,
+      start: async () => {
+        let bridgeRes: Response;
+        try {
+          bridgeRes = await startBridgeDownloadJob(bridge, {
+            url: resolved.url,
+            dest,
+            sha256,
+            jobId,
+          });
+        } catch (error) {
+          // The local bridge can accept/start the job and then lose the HTTP
+          // response. Probe by jobId before deciding whether queued ownership
+          // is safe to remove.
+          const observed = await probeBridgeDownloadJob(bridge, jobId);
+          if (observed.outcome === "observed") {
+            return new Response(null, { status: 202 });
+          }
+          // A single immediate "unknown" does not prove rejection: the native
+          // worker can reserve/spawn after the status probe. Any transport-loss
+          // outcome therefore retains queued ownership. Only an explicit HTTP
+          // rejection from the start request is safe to compensate.
+          throw new QueuedImportedModelStartUncertainError(
+            "Desktop bridge start outcome is unknown; queued ownership was retained.",
+            { cause: error },
+          );
+        }
+        if (!bridgeRes.ok) {
+          const message = await bridgeErrorText(bridgeRes).catch(
+            () => `HTTP ${bridgeRes.status}`,
+          );
+          throw new BridgeStartError(message, bridgeRes.status);
+        }
+        return bridgeRes;
+      },
+    });
+    record = reservation.record;
+  } catch (error) {
+    if (error instanceof BridgeStartError) {
+      return NextResponse.json(
+        { error: `Bridge start failed: ${error.message}` },
+        { status: error.status },
+      );
+    }
+    if (error instanceof ApiError && error.code === "imported_model_registry_compensation_failed") {
+      return NextResponse.json(
+        {
+          error: error.message,
+          code: error.code,
+          partialState: true,
+          jobId,
+        },
+        { status: error.status },
+      );
+    }
+    if (error instanceof QueuedImportedModelStartUncertainError) {
+      return NextResponse.json(
+        {
+          error: error.message,
+          code: "bridge_start_unknown",
+          partialState: true,
+          queued: true,
+          retryable: true,
+          jobId,
+        },
+        { status: 503 },
+      );
+    }
+    return jsonError(error);
+  }
 
   return NextResponse.json({
     imported: true,

@@ -6,6 +6,7 @@ import { parseJsonBody } from "@/lib/server/http-validation";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 import { fetchProjectActivity } from "@/lib/server/queries";
 import { PROJECT_NAME_MAX_LENGTH } from "@/lib/project-name";
+import { withSharedWorkspaceRead } from "@/lib/server/workspace-operation-gate";
 
 const updateProjectSchema = z.object({
   name: z.string().trim().min(1).max(PROJECT_NAME_MAX_LENGTH),
@@ -18,6 +19,7 @@ interface Params {
 export async function GET(request: NextRequest, { params }: Params) {
   try {
     const user = await requireLocalWorkspaceOwner();
+    return await withSharedWorkspaceRead(async () => {
     const { id } = await params;
     const url = new URL(request.url);
     const sectionParam = url.searchParams.get("section");
@@ -40,7 +42,8 @@ export async function GET(request: NextRequest, { params }: Params) {
       });
     }
 
-    return NextResponse.json(activity);
+      return NextResponse.json(activity);
+    });
   } catch (error) {
     return jsonError(error);
   }

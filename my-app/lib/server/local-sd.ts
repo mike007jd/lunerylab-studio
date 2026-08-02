@@ -222,7 +222,11 @@ export async function generateImagesLocalSd(
     }
   }
 
-  const tmpBase = path.join(os.tmpdir(), `lunery-sd-${randomUUID()}`);
+  // Keep native output names inside an unpredictable, owner-only directory.
+  // The Rust bridge pins each final entry with no-follow semantics immediately
+  // before spawn; callers never control or learn this directory name.
+  const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "lunery-sd-"));
+  await fs.chmod(outputDir, 0o700);
   const outPaths: string[] = [];
   const runs: string[][] = [];
   const runParameters: Array<{ seed: number; steps: number; cfg: number; negativePrompt: string }> = [];
@@ -230,7 +234,7 @@ export async function generateImagesLocalSd(
   const defaultSteps = modelId === "flux1-schnell-q4" ? 4 : modelId === "flux2-dev-q4" ? 28 : modelId === "sdxl-base-1.0" ? 30 : 20;
   const defaultCfg = modelId.startsWith("flux") ? 1 : 7;
   for (let i = 0; i < input.count; i += 1) {
-    const outPath = `${tmpBase}-${i}.png`;
+    const outPath = path.join(outputDir, `image-${i}.png`);
     const resolved = {
       seed: requestedParameters.seed ?? randomGenerationSeed(),
       steps: requestedParameters.steps ?? defaultSteps,
@@ -348,7 +352,7 @@ export async function generateImagesLocalSd(
   } finally {
     abortSignal?.removeEventListener("abort", onAbort);
     await waitForCancellation().catch(() => undefined);
-    await Promise.all(outPaths.map((outPath) => fs.unlink(outPath).catch(() => undefined)));
+    await fs.rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   if (images.length === 0) {

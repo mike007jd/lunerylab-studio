@@ -16,7 +16,15 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model-delete";
 
+vi.mock("server-only", () => ({}));
+
 const mocks = vi.hoisted(() => ({
+  BridgeDownloadJobsError: class BridgeDownloadJobsError extends Error {
+    readonly retryable = true;
+    constructor(readonly code: string, message: string) {
+      super(message);
+    }
+  },
   isDesktopRuntime: vi.fn(),
   findHfModelEntry: vi.fn(),
   bridgeFetch: vi.fn(),
@@ -31,7 +39,11 @@ const mocks = vi.hoisted(() => ({
   finishImportedExternalModelRollback: vi.fn(),
   commitImportedExternalModelFile: vi.fn(),
   catalogModelFiles: vi.fn(),
-  removeManagedModelFiles: vi.fn(),
+  stageManagedModelFiles: vi.fn(),
+  attachManagedModelDeletionRecovery: vi.fn(),
+  finalizeManagedModelFiles: vi.fn(),
+  markManagedModelFilesCommitted: vi.fn(),
+  rollbackManagedModelFiles: vi.fn(),
   invalidateLocalModelInstallStatusCache: vi.fn(),
   requireLocalWorkspaceOwner: vi.fn(),
   getLocalWorkspacePreferences: vi.fn(),
@@ -47,6 +59,7 @@ vi.mock("@/lib/hf-model-catalog", () => ({
 }));
 
 vi.mock("@/lib/server/desktop-bridge", () => ({
+  BridgeDownloadJobsError: mocks.BridgeDownloadJobsError,
   bridgeFetch: mocks.bridgeFetch,
   getBridgeDownloadJobs: mocks.getBridgeDownloadJobs,
   requireDesktopBridge: mocks.requireDesktopBridge,
@@ -55,7 +68,7 @@ vi.mock("@/lib/server/desktop-bridge", () => ({
 vi.mock("@/lib/server/imported-model-registry", () => ({
   findImportedModel: mocks.findImportedModel,
   modelCachePath: mocks.modelCachePath,
-  removeImportedModel: mocks.removeImportedModel,
+  removeImportedModelIfUnchanged: mocks.removeImportedModel,
   upsertImportedModel: mocks.upsertImportedModel,
   stageImportedExternalModelFile: mocks.stageImportedExternalModelFile,
   rollbackImportedExternalModelFile: mocks.rollbackImportedExternalModelFile,
@@ -64,8 +77,15 @@ vi.mock("@/lib/server/imported-model-registry", () => ({
 }));
 
 vi.mock("@/lib/server/local-model-files", () => ({
+  ManagedModelCleanupPendingError: class ManagedModelCleanupPendingError extends Error {
+    removedFiles = 0;
+  },
   catalogModelFiles: mocks.catalogModelFiles,
-  removeManagedModelFiles: mocks.removeManagedModelFiles,
+  stageManagedModelFiles: mocks.stageManagedModelFiles,
+  attachManagedModelDeletionRecovery: mocks.attachManagedModelDeletionRecovery,
+  finalizeManagedModelFiles: mocks.finalizeManagedModelFiles,
+  markManagedModelFilesCommitted: mocks.markManagedModelFilesCommitted,
+  rollbackManagedModelFiles: mocks.rollbackManagedModelFiles,
 }));
 
 vi.mock("@/lib/server/local-model-inventory", () => ({
@@ -88,6 +108,7 @@ const bridge = { url: "http://127.0.0.1:49152", token: "bridge-token" };
 let tempRoot: string | null = null;
 
 afterEach(() => {
+  vi.useRealTimers();
   if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
   tempRoot = null;
 });
@@ -128,7 +149,13 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     mocks.removeImportedModel.mockResolvedValue(undefined);
     mocks.upsertImportedModel.mockResolvedValue(undefined);
     mocks.catalogModelFiles.mockReturnValue([]);
-    mocks.removeManagedModelFiles.mockResolvedValue(0);
+    mocks.stageManagedModelFiles.mockImplementation(async (paths: string[]) =>
+      paths.map((originalPath) => ({ originalPath, stagedPath: `${originalPath}.stage` })),
+    );
+    mocks.finalizeManagedModelFiles.mockResolvedValue(0);
+    mocks.attachManagedModelDeletionRecovery.mockResolvedValue(undefined);
+    mocks.markManagedModelFilesCommitted.mockResolvedValue(undefined);
+    mocks.rollbackManagedModelFiles.mockResolvedValue(undefined);
     mocks.getBridgeDownloadJobs.mockResolvedValue([]);
     mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
       if (endpoint === "/llama-status" || endpoint === "/sd-status") {
@@ -182,7 +209,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
 
     expect(response.status).toBe(404);
     expect(mocks.requireLocalWorkspaceOwner).not.toHaveBeenCalled();
-    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
   });
 
   it("removes catalog files and clears a matching image default", async () => {
@@ -200,7 +227,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       defaultTextModel: "",
       defaultImageModel: "sdxl-base-1.0",
     });
-    mocks.removeManagedModelFiles.mockResolvedValue(4);
+    mocks.finalizeManagedModelFiles.mockResolvedValue(4);
 
     const response = await request("sdxl-base-1.0");
     expect(response.status).toBe(200);
@@ -210,7 +237,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       removedFiles: 4,
       clearedDefaults: ["image"],
     });
-    expect(mocks.removeManagedModelFiles).toHaveBeenCalledWith([
+    expect(mocks.stageManagedModelFiles).toHaveBeenCalledWith([
       "/profile/models/sd-cpp/sd_xl_base_1.0.safetensors",
       "/profile/models/sd-cpp/sd_xl_base_1.0.safetensors.part",
       "/profile/models/sd-cpp/vae.safetensors",
@@ -223,7 +250,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     expect(mocks.invalidateLocalModelInstallStatusCache).toHaveBeenCalledOnce();
   });
 
-  it("does not turn a missing bridge probe into permission to block SD deletion", async () => {
+  it("fails closed before SD deletion when the native bridge is unavailable", async () => {
     mocks.findHfModelEntry.mockReturnValue({
       id: "sdxl-base-1.0",
       runtimeTarget: "sd-cpp",
@@ -232,16 +259,15 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     mocks.catalogModelFiles.mockReturnValue([{ fileName: "sd_xl_base_1.0.safetensors" }]);
     mocks.modelCachePath.mockReturnValue("/profile/models/sd-cpp/sd_xl_base_1.0.safetensors");
     mocks.requireDesktopBridge.mockReturnValue(new NextResponse(null, { status: 503 }));
-    mocks.removeManagedModelFiles.mockResolvedValue(1);
-
     const response = await request("sdxl-base-1.0");
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
-      deleted: true,
-      removedFiles: 1,
-      warnings: ["download_not_stopped", "runtime_not_stopped"],
+      code: "bridge_unreachable",
+      retryable: true,
     });
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
+    expect(mocks.userSettingsUpdate).not.toHaveBeenCalled();
   });
 
   it("unregisters a local-path import without deleting the user's original file", async () => {
@@ -265,8 +291,10 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       preservedExternalFile: true,
       removedFiles: 0,
     });
-    expect(mocks.removeManagedModelFiles).toHaveBeenCalledWith([]);
-    expect(mocks.removeImportedModel).toHaveBeenCalledWith("imported-sd-cpp-original-12345678");
+    expect(mocks.stageManagedModelFiles).toHaveBeenCalledWith([]);
+    expect(mocks.removeImportedModel).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "imported-sd-cpp-original-12345678" }),
+    );
   });
 
   it("deletes an imported external file after explicit confirmation", async () => {
@@ -376,7 +404,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     expect(() => accessSync(modelPath, constants.F_OK)).not.toThrow();
   });
 
-  it("continues deletion when the native bridge is unavailable and reports residual risk", async () => {
+  it("fails closed when the native bridge is unavailable", async () => {
     mocks.findHfModelEntry.mockReturnValue({
       id: "llama-model",
       runtimeTarget: "llama-cpp",
@@ -387,20 +415,18 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     mocks.requireDesktopBridge.mockReturnValue(
       NextResponse.json({ error: "bridge unavailable" }, { status: 503 }),
     );
-    mocks.removeManagedModelFiles.mockResolvedValue(2);
-
     const response = await request("llama-model");
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
-      deleted: true,
-      removedFiles: 2,
-      warnings: ["download_not_stopped", "runtime_not_stopped"],
+      code: "bridge_unreachable",
+      retryable: true,
     });
     expect(mocks.bridgeFetch).not.toHaveBeenCalled();
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
   });
 
-  it("continues deletion when runtime status probing fails and reports the residual risk", async () => {
+  it("fails closed when runtime status probing fails", async () => {
     mocks.findHfModelEntry.mockReturnValue({
       id: "llama-model",
       runtimeTarget: "llama-cpp",
@@ -409,16 +435,14 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     mocks.catalogModelFiles.mockReturnValue([{ fileName: "model.gguf" }]);
     mocks.modelCachePath.mockImplementation((_runtime: string, fileName: string) => `/profile/models/llama-cpp/${fileName}`);
     mocks.bridgeFetch.mockRejectedValue(new Error("bridge down"));
-    mocks.removeManagedModelFiles.mockResolvedValue(2);
-
     const response = await request("llama-model");
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
-      deleted: true,
-      removedFiles: 2,
-      warnings: ["runtime_delete_lease_unavailable", "runtime_not_stopped"],
+      code: "bridge_unreachable",
+      retryable: true,
     });
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
   });
 
   it("stops an active imported llama model before removing its cache", async () => {
@@ -431,8 +455,14 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       jobId: "job-1",
       status: "ready",
     });
+    let statusCalls = 0;
     mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
-      if (endpoint === "/llama-status") return Response.json({ running: true, modelId });
+      if (endpoint === "/llama-status") {
+        statusCalls += 1;
+        return Response.json(statusCalls === 1
+          ? { running: true, modelId }
+          : { running: false, modelId: null });
+      }
       return Response.json({ ok: true, acquired: true, released: true });
     });
 
@@ -446,6 +476,9 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
         body: expect.stringContaining("/profile/models/llama-cpp/imported/demo.gguf"),
       }),
     );
+    expect(
+      mocks.bridgeFetch.mock.calls.filter(([, endpoint]) => endpoint === "/llama-delete-lease-acquire"),
+    ).toHaveLength(2);
     expect(mocks.bridgeFetch).toHaveBeenCalledWith(
       bridge,
       "/llama-status",
@@ -456,7 +489,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       "/llama-stop",
       expect.objectContaining({ method: "POST" }),
     );
-    expect(mocks.removeManagedModelFiles).toHaveBeenCalledWith([
+    expect(mocks.stageManagedModelFiles).toHaveBeenCalledWith([
       "/profile/models/llama-cpp/imported/demo.gguf",
       "/profile/models/llama-cpp/imported/demo.gguf.part",
     ]);
@@ -502,7 +535,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       }),
     );
     expect(mocks.getBridgeDownloadJobs).toHaveBeenCalledTimes(2);
-    expect(mocks.removeManagedModelFiles).toHaveBeenCalledOnce();
+    expect(mocks.stageManagedModelFiles).toHaveBeenCalledOnce();
   });
 
   it.runIf(process.platform !== "win32")("matches active downloads through a symlinked model root", async () => {
@@ -583,7 +616,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       "/hf-download-delete-lease-release",
       expect.objectContaining({ method: "POST" }),
     );
-    expect(mocks.removeManagedModelFiles).toHaveBeenCalledOnce();
+    expect(mocks.stageManagedModelFiles).toHaveBeenCalledOnce();
   });
 
   it("refuses deletion when an active Hugging Face import does not settle", async () => {
@@ -610,8 +643,32 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       code: "download_cancel_timeout",
       retryable: true,
     });
-    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
   }, 10_000);
+
+  it("fails closed when listing active downloads reaches its hard deadline", async () => {
+    const modelId = "imported-llama-cpp-list-timeout-12345678";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath: "/profile/models/llama-cpp/imported/download.gguf",
+      jobId: "job-unknown",
+      status: "downloading",
+    });
+    mocks.getBridgeDownloadJobs.mockRejectedValue(
+      new mocks.BridgeDownloadJobsError("bridge_timeout", "listing timed out"),
+    );
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(504);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "bridge_timeout",
+      retryable: true,
+    });
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
+  });
 
   it("stops an active SD model before removing its cache", async () => {
     const modelId = "imported-sd-cpp-demo-12345678";
@@ -652,7 +709,7 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
         body: JSON.stringify({ modelPath }),
       }),
     );
-    expect(mocks.removeManagedModelFiles).toHaveBeenCalledWith([
+    expect(mocks.stageManagedModelFiles).toHaveBeenCalledWith([
       modelPath,
       `${modelPath}.part`,
     ]);
@@ -686,7 +743,248 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       code: "runtime_stop_failed",
       retryable: true,
     });
-    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a lease cannot be renewed after runtime settlement", async () => {
+    const modelId = "imported-llama-cpp-renew-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/renew.gguf";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    let acquireCalls = 0;
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint === "/llama-delete-lease-acquire") {
+        acquireCalls += 1;
+        return acquireCalls === 1
+          ? Response.json({ ok: true, acquired: true })
+          : Response.json({ ok: false }, { status: 409 });
+      }
+      if (endpoint === "/llama-status") return Response.json({ running: false });
+      return Response.json({ ok: true, released: true });
+    });
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "model_delete_lease_expired",
+      retryable: true,
+    });
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
+    expect(mocks.removeImportedModel).not.toHaveBeenCalled();
+  });
+
+  it("renews download and runtime leases concurrently within one heartbeat deadline", async () => {
+    const modelId = "imported-llama-cpp-concurrent-renew-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/concurrent.gguf";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    const renewalResolvers = new Map<string, (response: Response) => void>();
+    const acquireCounts = new Map<string, number>();
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint.endsWith("delete-lease-acquire")) {
+        const count = (acquireCounts.get(endpoint) ?? 0) + 1;
+        acquireCounts.set(endpoint, count);
+        if (count === 2) {
+          return new Promise<Response>((resolve) => {
+            renewalResolvers.set(endpoint, resolve);
+          });
+        }
+        return Response.json({ acquired: true });
+      }
+      if (endpoint === "/llama-status") return Response.json({ running: false });
+      return Response.json({ ok: true, released: true });
+    });
+
+    const deletion = request(modelId);
+    await vi.waitFor(() => {
+      expect(renewalResolvers.has("/hf-download-delete-lease-acquire")).toBe(true);
+      expect(renewalResolvers.has("/llama-delete-lease-acquire")).toBe(true);
+    });
+    for (const resolve of renewalResolvers.values()) {
+      resolve(Response.json({ acquired: true }));
+    }
+
+    await expect(deletion).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("fails closed when native renewal reports lost download ownership", async () => {
+    const modelId = "imported-llama-cpp-lease-stolen-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/stolen.gguf";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    let hfAcquireCalls = 0;
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint === "/hf-download-delete-lease-acquire") {
+        hfAcquireCalls += 1;
+        return hfAcquireCalls === 1
+          ? Response.json({ acquired: true })
+          : Response.json({ error: "ownership lost" }, { status: 409 });
+      }
+      if (endpoint === "/llama-status") return Response.json({ running: false });
+      return Response.json({ ok: true, acquired: true, released: true });
+    });
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "model_delete_lease_expired",
+      retryable: true,
+    });
+    expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
+  });
+
+  it("heartbeats every delete lease across a stalled stage beyond the native TTL", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-03T00:00:00.000Z"));
+    const modelId = "imported-llama-cpp-heartbeat-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/heartbeat.gguf";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    let leaseExpiresAt = 0;
+    mocks.bridgeFetch.mockImplementation(async (_bridge, endpoint: string) => {
+      if (endpoint.endsWith("delete-lease-acquire")) {
+        leaseExpiresAt = Date.now() + 60_000;
+        return Response.json({ ok: true, acquired: true });
+      }
+      if (endpoint === "/hf-download-start" || endpoint === "/llama-start") {
+        return Date.now() < leaseExpiresAt
+          ? Response.json({ error: "model delete in progress" }, { status: 409 })
+          : Response.json({ ok: true });
+      }
+      if (endpoint === "/llama-status") return Response.json({ running: false });
+      return Response.json({ ok: true, released: true });
+    });
+    let finishStage!: (value: Array<{ originalPath: string; stagedPath: string }>) => void;
+    mocks.stageManagedModelFiles.mockImplementation(() => new Promise((resolve) => {
+      finishStage = resolve;
+    }));
+
+    const deletion = request(modelId);
+    await vi.waitFor(() => expect(mocks.stageManagedModelFiles).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(75_000);
+
+    const [downloadStart, runtimeStart] = await Promise.all([
+      mocks.bridgeFetch(bridge, "/hf-download-start"),
+      mocks.bridgeFetch(bridge, "/llama-start"),
+    ]);
+    expect(downloadStart.status).toBe(409);
+    expect(runtimeStart.status).toBe(409);
+    finishStage([{ originalPath: modelPath, stagedPath: `${modelPath}.stage` }]);
+    await expect(deletion).resolves.toMatchObject({ status: 200 });
+    expect(mocks.bridgeFetch.mock.calls.filter(([, endpoint]) =>
+      String(endpoint).endsWith("delete-lease-acquire")).length).toBeGreaterThanOrEqual(7);
+  });
+
+  it("rolls managed files and defaults back when registry metadata removal fails", async () => {
+    const modelId = "imported-llama-cpp-metadata-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/metadata.gguf";
+    const staged = [
+      { originalPath: modelPath, stagedPath: `${modelPath}.stage` },
+      { originalPath: `${modelPath}.part`, stagedPath: `${modelPath}.part.stage` },
+    ];
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    mocks.getLocalWorkspacePreferences.mockResolvedValue({
+      defaultTextModel: modelId,
+      defaultImageModel: "",
+    });
+    mocks.stageManagedModelFiles.mockResolvedValue(staged);
+    mocks.removeImportedModel.mockRejectedValueOnce(new Error("registry unavailable"));
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(500);
+    expect(mocks.rollbackManagedModelFiles).toHaveBeenCalledWith(staged);
+    expect(mocks.finalizeManagedModelFiles).not.toHaveBeenCalled();
+    expect(mocks.userSettingsUpdate).toHaveBeenNthCalledWith(1, {
+      where: { userId: "owner-1" },
+      data: { defaultTextModel: "" },
+    });
+    expect(mocks.userSettingsUpdate).toHaveBeenNthCalledWith(2, {
+      where: { userId: "owner-1" },
+      data: { defaultTextModel: modelId },
+    });
+  });
+
+  it("rolls metadata and staged bytes back when committed-marker publication fails", async () => {
+    const modelId = "imported-llama-cpp-marker-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/marker.gguf";
+    const staged = [{ originalPath: modelPath, stagedPath: `${modelPath}.stage` }];
+    const imported = {
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    };
+    mocks.findImportedModel.mockResolvedValue(imported);
+    mocks.getLocalWorkspacePreferences.mockResolvedValue({
+      defaultTextModel: modelId,
+      defaultImageModel: "",
+    });
+    mocks.stageManagedModelFiles.mockResolvedValue(staged);
+    mocks.markManagedModelFilesCommitted.mockRejectedValueOnce(new Error("marker publish failed"));
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(500);
+    expect(mocks.rollbackManagedModelFiles).toHaveBeenCalledWith(staged);
+    expect(mocks.upsertImportedModel).toHaveBeenCalledWith(imported);
+    expect(mocks.userSettingsUpdate).toHaveBeenLastCalledWith({
+      where: { userId: "owner-1" },
+      data: { defaultTextModel: modelId },
+    });
+    expect(mocks.finalizeManagedModelFiles).not.toHaveBeenCalled();
+  });
+
+  it("reports logical success with retryable staged cleanup after metadata commits", async () => {
+    const modelId = "imported-llama-cpp-cleanup-12345678";
+    const modelPath = "/profile/models/llama-cpp/imported/cleanup.gguf";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath,
+      status: "ready",
+    });
+    mocks.finalizeManagedModelFiles.mockRejectedValueOnce(new Error("unlink failed"));
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deleted: true,
+      cleanupPending: true,
+      warnings: ["managed_file_cleanup_pending"],
+    });
+    expect(mocks.removeImportedModel).toHaveBeenCalledOnce();
   });
 
   it("rejects malformed ids before looking up a model", async () => {

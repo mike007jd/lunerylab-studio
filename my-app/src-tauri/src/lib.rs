@@ -11,6 +11,7 @@ mod llama_resident;
 mod mlx_resident;
 mod model_residency;
 mod profile;
+mod profile_fs;
 mod sd_cpp_resident;
 mod secrets;
 mod security;
@@ -23,7 +24,13 @@ use crate::engine_sd::{bridge_stop_sd, sd_binary_path};
 use crate::external_apps::{is_lmstudio_installed, is_ollama_installed};
 use crate::hardware::{cached_accel, detect_hardware, probe_local_runtime, AccelInfo};
 use crate::http_bridge::{start_desktop_bridge, DesktopBridgeServer, WorkspaceResetHandler};
-use crate::profile::{ensure_profile_dirs, profile_dirs, ProfileDirs, ProfileStorageDirs};
+use crate::profile::{
+    acquire_profile_advisory_lock, ensure_profile_dirs, profile_dirs, ProfileAdvisoryLock,
+    ProfileDirs, ProfileStorageDirs,
+};
+#[cfg(not(debug_assertions))]
+use crate::profile_fs::refresh_profile_fs_roots;
+use crate::profile_fs::{clear_stale_workspace_initialization_lock, initialize_profile_fs_roots};
 use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
 use crate::security::bridge_token;
@@ -43,9 +50,9 @@ use std::path::{Path, PathBuf};
 #[cfg(not(debug_assertions))]
 use std::process::Stdio;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
 #[cfg(not(debug_assertions))]
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
@@ -59,19 +66,26 @@ use tauri::{AppHandle, Emitter, Manager, State};
 // ---------------------------------------------------------------------------
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-fn get_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    // Fast path: already initialized.
-    if let Some(c) = HTTP_CLIENT.get() {
-        return Ok(c.clone());
+pub(crate) fn get_http_client_with_connect_timeout(
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    // Shared client uses the production connect bound. Tests that inject a
+    // shorter connect timeout build an ephemeral client instead.
+    if connect_timeout == Duration::from_secs(30) {
+        if let Some(c) = HTTP_CLIENT.get() {
+            return Ok(c.clone());
+        }
+        let candidate = reqwest::Client::builder()
+            .user_agent("Lunery Lab Desktop/1.0")
+            .connect_timeout(connect_timeout)
+            .build()?;
+        let _ = HTTP_CLIENT.set(candidate);
+        return Ok(HTTP_CLIENT.get().expect("OnceLock set above").clone());
     }
-    // Build a candidate (only happens once; concurrent first-downloads race here).
-    let candidate = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent("Lunery Lab Desktop/1.0")
-        .build()?;
-    // set() returns Err(candidate) if another thread already set it — discard ours.
-    let _ = HTTP_CLIENT.set(candidate);
-    // Either we just set it or another thread did; either way it's initialized now.
-    Ok(HTTP_CLIENT.get().expect("OnceLock set above").clone())
+        .connect_timeout(connect_timeout)
+        .build()
 }
 
 // ---------------------------------------------------------------------------
@@ -88,21 +102,114 @@ struct DesktopServerState {
     pid_lockfile: Mutex<Option<PathBuf>>,
     dev_bridge_file: Mutex<Option<PathBuf>>,
     dev_bridge_server: Mutex<Option<DesktopBridgeServer>>,
+    /// OS advisory lock for the resolved profile. Held for the app lifetime;
+    /// the lock file itself is persistent and must not be unlinked on unlock.
+    profile_lock: Mutex<Option<ProfileAdvisoryLock>>,
     runtime_operation: AtomicU8,
-    /// Flipped by `shutdown` so the local-runtime watcher thread exits cleanly
-    /// on app shutdown instead of being a daemon leak. The watcher reads this
-    /// every 2s tick.
-    watcher_cancel: Arc<AtomicBool>,
+    /// Serialises lifecycle revocation against the final child/bridge/PID/URL
+    /// commit. Shutdown can therefore never lose a race to a late boot commit.
+    lifecycle_commit: Mutex<()>,
+    lifecycle_epoch: AtomicU64,
+    lifecycle_cancelled: AtomicBool,
+    lifecycle_wake: Condvar,
+    lifecycle_wait: Mutex<()>,
+    lifecycle_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl DesktopServerState {
-    fn stop_runtime(&self) {
-        // Prefer stopping embedded engines before joining the bridge listener so
-        // in-flight generate workers cannot keep teardown waiting.
-        bridge_stop_llama();
-        bridge_stop_mlx();
-        bridge_stop_sd();
+    fn begin_lifecycle_epoch(&self) -> Result<u64, String> {
+        let _commit = self
+            .lifecycle_commit
+            .lock()
+            .map_err(|_| "Desktop lifecycle lock is poisoned".to_string())?;
+        if self.lifecycle_cancelled.load(Ordering::Acquire) {
+            return Err("Desktop runtime is shutting down".to_string());
+        }
+        Ok(self.lifecycle_epoch.fetch_add(1, Ordering::AcqRel) + 1)
+    }
 
+    fn lifecycle_is_current(&self, epoch: u64) -> bool {
+        !self.lifecycle_cancelled.load(Ordering::Acquire)
+            && self.lifecycle_epoch.load(Ordering::Acquire) == epoch
+    }
+
+    fn lifecycle_is_cancelled(&self) -> bool {
+        self.lifecycle_cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns true when cancellation was observed, including a poisoned wait
+    /// lock (fail closed during teardown).
+    fn wait_for_lifecycle_cancel(&self, duration: Duration) -> bool {
+        if self.lifecycle_is_cancelled() {
+            return true;
+        }
+        let guard = match self.lifecycle_wait.lock() {
+            Ok(guard) => guard,
+            Err(_) => return true,
+        };
+        let _ = self
+            .lifecycle_wake
+            .wait_timeout_while(guard, duration, |_| !self.lifecycle_is_cancelled());
+        self.lifecycle_is_cancelled()
+    }
+
+    fn spawn_lifecycle_task(
+        &self,
+        name: &str,
+        work: impl FnOnce() + Send + 'static,
+    ) -> Result<(), String> {
+        let mut tasks = self
+            .lifecycle_tasks
+            .lock()
+            .map_err(|_| "Desktop lifecycle task registry is poisoned".to_string())?;
+        if self.lifecycle_is_cancelled() {
+            return Err("Desktop runtime is shutting down".to_string());
+        }
+        let mut active = Vec::with_capacity(tasks.len() + 1);
+        for task in tasks.drain(..) {
+            if task.is_finished() {
+                let _ = task.join();
+            } else {
+                active.push(task);
+            }
+        }
+        let task = thread::Builder::new()
+            .name(name.to_string())
+            .spawn(work)
+            .map_err(|error| format!("Could not start {name}: {error}"))?;
+        active.push(task);
+        *tasks = active;
+        Ok(())
+    }
+
+    fn revoke_lifecycle(&self) {
+        let _commit = self
+            .lifecycle_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.lifecycle_cancelled.store(true, Ordering::Release);
+        self.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+        self.lifecycle_wake.notify_all();
+    }
+
+    fn join_lifecycle_tasks(&self) {
+        let tasks = {
+            let mut tasks = self
+                .lifecycle_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            let _ = task.join();
+        }
+    }
+
+    fn stop_runtime(&self) {
+        // Bridge shutdown revokes admission first, then interrupts long work /
+        // advances the SD epoch, then drains accepted workers. Stop the other
+        // embedded engines around the same boundary so queued work cannot spawn
+        // after teardown.
         let bridge_server = self
             .bridge_server
             .lock()
@@ -111,6 +218,9 @@ impl DesktopServerState {
         if let Some(bridge_server) = bridge_server {
             bridge_server.shutdown();
         }
+        bridge_stop_llama();
+        bridge_stop_mlx();
+        bridge_stop_sd();
 
         let mut child_guard = self
             .child
@@ -155,7 +265,11 @@ impl DesktopServerState {
     }
 
     fn shutdown(&self) {
-        self.watcher_cancel.store(true, Ordering::Relaxed);
+        let had_started = self.lifecycle_epoch.load(Ordering::Acquire) > 0;
+        self.revoke_lifecycle();
+        if had_started {
+            crate::secrets::shutdown_secret_runtime();
+        }
         self.stop_runtime();
 
         let mut dev_bridge_guard = self
@@ -175,7 +289,21 @@ impl DesktopServerState {
         if let Some(dev_bridge_server) = dev_bridge_server {
             dev_bridge_server.shutdown();
         }
+        self.join_lifecycle_tasks();
     }
+}
+
+fn acquire_profile_lock_for_startup(
+    state: &DesktopServerState,
+    profile: &ProfileDirs,
+) -> Result<(), String> {
+    let profile_lock = acquire_profile_advisory_lock(profile)?;
+    let mut guard = state
+        .profile_lock
+        .lock()
+        .map_err(|_| "Desktop profile lock holder is poisoned".to_string())?;
+    *guard = Some(profile_lock);
+    Ok(())
 }
 
 fn terminate_desktop_process(child: &mut Child, process_group: Option<u32>) {
@@ -300,21 +428,148 @@ const RUNTIME_OPERATION_BOOT: u8 = 1;
 #[cfg(not(debug_assertions))]
 const RUNTIME_OPERATION_RESET: u8 = 2;
 
-#[cfg(any(test, not(debug_assertions)))]
-fn remove_profile_owned_path(path: &Path) -> Result<(), String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(format!("Could not inspect {}: {err}", path.display())),
-    };
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn profile_directory_identity(file: &std::fs::File) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Could not inspect pinned profile directory: {error}"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
 
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        std::fs::remove_file(path)
-            .map_err(|err| format!("Could not remove {}: {err}", path.display()))
-    } else {
-        std::fs::remove_dir_all(path)
-            .map_err(|err| format!("Could not remove {}: {err}", path.display()))
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn verify_profile_root_identity(root_path: &Path, expected: (u64, u64)) -> Result<(), String> {
+    use rustix::fs::{open, Mode, OFlags};
+    let current = std::fs::File::from(
+        open(
+            root_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("Profile root changed during reset: {error}"))?,
+    );
+    if profile_directory_identity(&current)? != expected {
+        return Err("Profile root changed during reset".to_string());
     }
+    Ok(())
+}
+
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn remove_directory_contents_at(directory: &std::fs::File) -> Result<(), String> {
+    use rustix::fs::{openat, unlinkat, AtFlags, Mode, OFlags};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    #[cfg(target_vendor = "apple")]
+    use std::os::unix::ffi::OsStrExt;
+
+    #[cfg(target_os = "linux")]
+    let directory_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    #[cfg(target_vendor = "apple")]
+    let directory_path = PathBuf::from(std::ffi::OsStr::from_bytes(
+        rustix::fs::getpath(directory)
+            .map_err(|error| format!("Could not resolve pinned profile data: {error}"))?
+            .to_bytes(),
+    ));
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    let directory_path: PathBuf =
+        return Err("Workspace reset is unavailable on this Unix platform".to_string());
+    let names = std::fs::read_dir(&directory_path)
+        .map_err(|error| format!("Could not enumerate profile data: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| format!("Could not enumerate profile data: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for name in names {
+        match openat(
+            directory,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(child) => {
+                let child = std::fs::File::from(child);
+                remove_directory_contents_at(&child)?;
+                unlinkat(directory, &name, AtFlags::REMOVEDIR).map_err(|error| {
+                    format!("Could not remove profile directory entry: {error}")
+                })?;
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+                unlinkat(directory, &name, AtFlags::empty())
+                    .map_err(|error| format!("Could not remove profile file entry: {error}"))?;
+            }
+            Err(error) => {
+                return Err(format!("Could not inspect profile data entry: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn reset_workspace_data_unix<F>(dirs: &ProfileDirs, after_pin: F) -> Result<(), String>
+where
+    F: FnOnce(),
+{
+    use rustix::fs::{mkdirat, open, openat, unlinkat, AtFlags, Mode, OFlags};
+
+    let canonical_root = dirs.root.canonicalize().map_err(|error| {
+        format!(
+            "Could not verify profile root {}: {error}",
+            dirs.root.display()
+        )
+    })?;
+    let root = std::fs::File::from(
+        open(
+            &canonical_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("Could not pin profile root: {error}"))?,
+    );
+    let root_identity = profile_directory_identity(&root)?;
+    after_pin();
+    verify_profile_root_identity(&dirs.root, root_identity)?;
+
+    match openat(
+        &root,
+        "data",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(data) => {
+            let data = std::fs::File::from(data);
+            remove_directory_contents_at(&data)?;
+            unlinkat(&root, "data", AtFlags::REMOVEDIR)
+                .map_err(|error| format!("Could not remove profile data directory: {error}"))?;
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+            unlinkat(&root, "data", AtFlags::empty())
+                .map_err(|error| format!("Could not remove profile data entry: {error}"))?;
+        }
+        Err(error) => return Err(format!("Could not inspect profile data directory: {error}")),
+    }
+    verify_profile_root_identity(&dirs.root, root_identity)?;
+    mkdirat(&root, "data", Mode::from_raw_mode(0o700))
+        .map_err(|error| format!("Could not recreate profile data directory: {error}"))?;
+    let data = std::fs::File::from(
+        openat(
+            &root,
+            "data",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("Could not pin recreated profile data: {error}"))?,
+    );
+    for child in ["pglite", "media"] {
+        mkdirat(&data, child, Mode::from_raw_mode(0o700))
+            .map_err(|error| format!("Could not recreate profile {child} directory: {error}"))?;
+    }
+    verify_profile_root_identity(&dirs.root, root_identity)
 }
 
 #[cfg(any(test, not(debug_assertions)))]
@@ -366,34 +621,17 @@ fn reset_workspace_data(dirs: &ProfileDirs) -> Result<(), String> {
         }
     }
 
-    let canonical_root = dirs.root.canonicalize().map_err(|err| {
-        format!(
-            "Could not verify profile root {}: {err}",
-            dirs.root.display()
+    #[cfg(unix)]
+    {
+        reset_workspace_data_unix(dirs, || {})
+    }
+    #[cfg(not(unix))]
+    {
+        Err(
+            "Workspace reset is unavailable until reparse-safe directory operations are enabled"
+                .to_string(),
         )
-    })?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&dirs.data) {
-        if !metadata.file_type().is_symlink() {
-            let canonical_data = dirs.data.canonicalize().map_err(|err| {
-                format!(
-                    "Could not verify profile data directory {}: {err}",
-                    dirs.data.display()
-                )
-            })?;
-            if canonical_data.parent() != Some(canonical_root.as_path()) {
-                return Err(
-                    "Profile data directory escapes the resolved Lunery profile".to_string()
-                );
-            }
-        }
     }
-
-    remove_profile_owned_path(&dirs.data)?;
-    for dir in [&dirs.data, &dirs.pglite, &dirs.media] {
-        std::fs::create_dir_all(dir)
-            .map_err(|err| format!("Could not recreate {}: {err}", dir.display()))?;
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -473,13 +711,19 @@ fn wait_for_port_or_child_exit(
     child: &mut Child,
     log_path: &Path,
     expected_session_hash: &str,
+    state: &DesktopServerState,
+    epoch: u64,
 ) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(200);
     let mut last_health_error = "Studio health check has not responded".to_string();
     while Instant::now() < deadline {
+        if !state.lifecycle_is_current(epoch) {
+            return Err("Desktop runtime start was superseded".to_string());
+        }
         match probe_desktop_health(port, expected_session_hash) {
-            Ok(()) => return Ok(()),
+            Ok(()) if state.lifecycle_is_current(epoch) => return Ok(()),
+            Ok(()) => return Err("Desktop runtime start was superseded".to_string()),
             Err(err) => last_health_error = err,
         }
         match child.try_wait() {
@@ -499,7 +743,16 @@ fn wait_for_port_or_child_exit(
                 ));
             }
         }
-        thread::sleep(backoff);
+        let sleep_deadline = Instant::now() + backoff;
+        while Instant::now() < sleep_deadline {
+            if !state.lifecycle_is_current(epoch) {
+                return Err("Desktop runtime start was superseded".to_string());
+            }
+            thread::sleep(
+                Duration::from_millis(50)
+                    .min(sleep_deadline.saturating_duration_since(Instant::now())),
+            );
+        }
         backoff = (backoff * 2).min(Duration::from_secs(4));
     }
     Err(format!(
@@ -560,15 +813,31 @@ fn probe_desktop_health(port: u16, expected_session_hash: &str) -> Result<(), St
     Ok(())
 }
 
-fn wait_for_port(port: u16) -> Result<(), String> {
+fn wait_for_port_while(port: u16, mut is_current: impl FnMut() -> bool) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(200);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return Ok(());
+        if !is_current() {
+            return Err("Desktop runtime start was superseded".to_string());
         }
-        thread::sleep(backoff);
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return if is_current() {
+                Ok(())
+            } else {
+                Err("Desktop runtime start was superseded".to_string())
+            };
+        }
+        let sleep_deadline = Instant::now() + backoff;
+        while Instant::now() < sleep_deadline {
+            if !is_current() {
+                return Err("Desktop runtime start was superseded".to_string());
+            }
+            thread::sleep(
+                Duration::from_millis(50)
+                    .min(sleep_deadline.saturating_duration_since(Instant::now())),
+            );
+        }
         backoff = (backoff * 2).min(Duration::from_secs(4));
     }
     Err(format!(
@@ -1132,7 +1401,11 @@ fn start_desktop_server(
     app: &AppHandle,
     state: &DesktopServerState,
     download_state: &Arc<DownloadState>,
+    epoch: u64,
 ) -> Result<DesktopServerStatus, String> {
+    if !state.lifecycle_is_current(epoch) {
+        return Err("Desktop runtime start was superseded".to_string());
+    }
     {
         let mut child_guard = state
             .child
@@ -1151,14 +1424,25 @@ fn start_desktop_server(
                     .next()
                     .and_then(|value| value.parse::<u16>().ok())
                     .ok_or_else(|| "Desktop server port is invalid".to_string())?;
-                return Ok(DesktopServerStatus { url, port });
+                return if state.lifecycle_is_current(epoch) {
+                    Ok(DesktopServerStatus { url, port })
+                } else {
+                    Err("Desktop runtime start was superseded".to_string())
+                };
             }
             *child_guard = None;
         }
     }
 
+    if !state.lifecycle_is_current(epoch) {
+        return Err("Desktop runtime start was superseded".to_string());
+    }
     let profile = profile_dirs()?;
     ensure_profile_dirs(&profile)?;
+    // A backend crash can leave the cross-bundle first-boot lock behind while
+    // the Tauri shell remains alive. We only reach this point after proving
+    // there is no live desktop child, so its lock cannot have a current owner.
+    clear_stale_workspace_initialization_lock()?;
 
     let root = desktop_server_root(app)?;
     let app_dir = root.join("app");
@@ -1198,15 +1482,25 @@ fn start_desktop_server(
         // about to spawn AND (b) the OS confirms that PID is currently
         // executing that same abspath. Either disagreement → leave the
         // process alone, just clean up the file.
+        if !state.lifecycle_is_current(epoch) {
+            return Err("Desktop runtime start was superseded".to_string());
+        }
         kill_stale_pid_if_matches(lockfile, &node_bin_abspath);
     }
 
     let port = reserve_local_port()?;
     let url = format!("http://127.0.0.1:{port}");
+    if !state.lifecycle_is_current(epoch) {
+        return Err("Desktop runtime start was superseded".to_string());
+    }
     let bridge_server = start_desktop_bridge(
         Arc::clone(download_state),
         workspace_reset_handler(app.clone(), Arc::clone(download_state)),
     )?;
+    if !state.lifecycle_is_current(epoch) {
+        bridge_server.shutdown();
+        return Err("Desktop runtime start was superseded".to_string());
+    }
     let bridge_port = bridge_server.bridge.port;
     let bridge_auth_token = bridge_server.bridge.token.clone();
     let media_dir = desktop_media_dir(&profile)?;
@@ -1263,11 +1557,17 @@ fn start_desktop_server(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    if !state.lifecycle_is_current(epoch) {
+        bridge_server.shutdown();
+        return Err("Desktop runtime start was superseded".to_string());
+    }
     let mut child = command
         .spawn()
         .map_err(|err| format!("Could not start desktop Studio server: {err}"))?;
 
-    if let Err(err) = wait_for_port_or_child_exit(port, &mut child, &log_path, &session_hash) {
+    if let Err(err) =
+        wait_for_port_or_child_exit(port, &mut child, &log_path, &session_hash, state, epoch)
+    {
         let child_id = child.id();
         terminate_desktop_process(&mut child, Some(child_id));
         if let Some(ref lockfile) = pid_lockfile {
@@ -1277,10 +1577,23 @@ fn start_desktop_server(
     }
 
     {
+        let _commit = state
+            .lifecycle_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.lifecycle_is_current(epoch) {
+            let child_id = child.id();
+            terminate_desktop_process(&mut child, Some(child_id));
+            if let Some(ref lockfile) = pid_lockfile {
+                let _ = std::fs::remove_file(lockfile);
+            }
+            bridge_server.shutdown();
+            return Err("Desktop runtime start was superseded".to_string());
+        }
         let mut child_guard = state
             .child
             .lock()
-            .map_err(|_| "Desktop server lock is poisoned".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Commit server state only after the port is reachable; otherwise a
         // failed first launch can make the next invocation return a stale URL.
         // New 2-line format ({pid}\n{abspath}\n) lets the next launch validate
@@ -1290,7 +1603,7 @@ fn start_desktop_server(
             let mut lockfile_guard = state
                 .pid_lockfile
                 .lock()
-                .map_err(|_| "Desktop server pid-lockfile lock is poisoned".to_string())?;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *lockfile_guard = Some(lockfile.clone());
         }
         #[cfg(unix)]
@@ -1298,19 +1611,19 @@ fn start_desktop_server(
             let mut group_guard = state
                 .process_group
                 .lock()
-                .map_err(|_| "Desktop server process-group lock is poisoned".to_string())?;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *group_guard = Some(child.id());
         }
         *child_guard = Some(child);
         let mut bridge_guard = state
             .bridge_server
             .lock()
-            .map_err(|_| "Desktop bridge server lock is poisoned".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *bridge_guard = Some(bridge_server);
         let mut url_guard = state
             .url
             .lock()
-            .map_err(|_| "Desktop server URL lock is poisoned".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *url_guard = Some(url.clone());
     }
 
@@ -1336,36 +1649,54 @@ fn show_startup_error(app: &AppHandle) {
     }
 }
 
-fn boot_desktop_runtime_inner(app: &AppHandle, download_state: &Arc<DownloadState>) {
-    #[cfg(not(debug_assertions))]
+fn boot_desktop_runtime_inner(app: &AppHandle, download_state: &Arc<DownloadState>, epoch: u64) {
     let state = app.state::<DesktopServerState>();
+    if !state.lifecycle_is_current(epoch) {
+        return;
+    }
 
     #[cfg(debug_assertions)]
     let result = {
         let _ = &download_state;
-        wait_for_port(3000).map(|_| DesktopServerStatus {
-            url: "http://127.0.0.1:3000".to_string(),
-            port: 3000,
+        wait_for_port_while(3000, || state.lifecycle_is_current(epoch)).map(|_| {
+            DesktopServerStatus {
+                url: "http://127.0.0.1:3000".to_string(),
+                port: 3000,
+            }
         })
     };
     #[cfg(not(debug_assertions))]
-    let result = start_desktop_server(app, state.inner(), download_state);
+    let result = start_desktop_server(app, state.inner(), download_state, epoch);
+
+    if !state.lifecycle_is_current(epoch) {
+        return;
+    }
 
     match result {
         Ok(runtime) => {
+            if !state.lifecycle_is_current(epoch) {
+                return;
+            }
             if let Err(err) = navigate_and_show(app, &format!("{}/studio", runtime.url)) {
                 eprintln!("Desktop Studio navigation failed: {err}");
-                show_startup_error(app);
+                if state.lifecycle_is_current(epoch) {
+                    show_startup_error(app);
+                }
             }
         }
         Err(err) => {
             eprintln!("Desktop Studio startup failed: {err}");
-            show_startup_error(app);
+            if state.lifecycle_is_current(epoch) {
+                show_startup_error(app);
+            }
         }
     }
 }
 
-fn boot_desktop_runtime(app: AppHandle, download_state: Arc<DownloadState>) {
+fn schedule_desktop_runtime_boot(
+    app: AppHandle,
+    download_state: Arc<DownloadState>,
+) -> Result<(), String> {
     let state = app.state::<DesktopServerState>();
     if state
         .runtime_operation
@@ -1377,13 +1708,33 @@ fn boot_desktop_runtime(app: AppHandle, download_state: Arc<DownloadState>) {
         )
         .is_err()
     {
-        return;
+        return Ok(());
     }
-
-    boot_desktop_runtime_inner(&app, &download_state);
-    state
-        .runtime_operation
-        .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+    let epoch = match state.begin_lifecycle_epoch() {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            state
+                .runtime_operation
+                .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    let task_app = app.clone();
+    let result = state.spawn_lifecycle_task("lunery-desktop-boot", move || {
+        boot_desktop_runtime_inner(&task_app, &download_state, epoch);
+        let state = task_app.state::<DesktopServerState>();
+        if state.lifecycle_is_current(epoch) {
+            state
+                .runtime_operation
+                .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+        }
+    });
+    if result.is_err() {
+        state
+            .runtime_operation
+            .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+    }
+    result
 }
 
 fn workspace_reset_handler(
@@ -1411,10 +1762,10 @@ fn request_desktop_workspace_reset(
     #[cfg(debug_assertions)]
     {
         let _ = (app, download_state);
-        return Err(
+        Err(
             "Workspace reset is available in packaged Studio builds; development runtime data must be reset by its owner"
                 .to_string(),
-        );
+        )
     }
 
     #[cfg(not(debug_assertions))]
@@ -1433,30 +1784,68 @@ fn request_desktop_workspace_reset(
             return Err("Studio is already starting or resetting".to_string());
         }
 
-        thread::spawn(move || {
+        let epoch = match state.begin_lifecycle_epoch() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                state
+                    .runtime_operation
+                    .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let task_app = app.clone();
+        if let Err(error) = state.spawn_lifecycle_task("lunery-desktop-reset", move || {
             // Let the invoking page receive its acknowledgement before the
             // owned Next/PGlite process is stopped.
-            thread::sleep(Duration::from_millis(250));
+            let state = task_app.state::<DesktopServerState>();
+            if state.wait_for_lifecycle_cancel(Duration::from_millis(250))
+                || !state.lifecycle_is_current(epoch)
+            {
+                return;
+            }
             let result = (|| -> Result<(), String> {
-                if let Err(err) = navigate_and_show(&app, "tauri://localhost/index.html") {
+                if !state.lifecycle_is_current(epoch) {
+                    return Err("Desktop workspace reset was superseded".to_string());
+                }
+                if let Err(err) = navigate_and_show(&task_app, "tauri://localhost/index.html") {
                     eprintln!("Could not show workspace reset progress: {err}");
                 }
-                app.state::<DesktopServerState>().stop_runtime();
-                reset_workspace_data(&profile_dirs()?)?;
+                if !state.lifecycle_is_current(epoch) {
+                    return Err("Desktop workspace reset was superseded".to_string());
+                }
+                state.stop_runtime();
+                if !state.lifecycle_is_current(epoch) {
+                    return Err("Desktop workspace reset was superseded".to_string());
+                }
+                let reset_profile = profile_dirs()?;
+                reset_workspace_data(&reset_profile)?;
+                refresh_profile_fs_roots(&reset_profile)?;
+                if !state.lifecycle_is_current(epoch) {
+                    return Err("Desktop workspace reset was superseded".to_string());
+                }
                 Ok(())
             })();
 
             match result {
-                Ok(()) => boot_desktop_runtime_inner(&app, &download_state),
+                Ok(()) => boot_desktop_runtime_inner(&task_app, &download_state, epoch),
                 Err(err) => {
                     eprintln!("Desktop workspace reset failed: {err}");
-                    show_startup_error(&app);
+                    if state.lifecycle_is_current(epoch) {
+                        show_startup_error(&task_app);
+                    }
                 }
             }
-            app.state::<DesktopServerState>()
+            if state.lifecycle_is_current(epoch) {
+                state
+                    .runtime_operation
+                    .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
+            }
+        }) {
+            state
                 .runtime_operation
                 .store(RUNTIME_OPERATION_IDLE, Ordering::SeqCst);
-        });
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -1473,7 +1862,7 @@ fn reset_desktop_workspace(
 #[tauri::command]
 fn retry_desktop_runtime(app: AppHandle, download_state: State<'_, Arc<DownloadState>>) {
     let download_state = Arc::clone(download_state.inner());
-    thread::spawn(move || boot_desktop_runtime(app, download_state));
+    let _ = schedule_desktop_runtime_boot(app, download_state);
 }
 
 #[cfg(debug_assertions)]
@@ -1515,7 +1904,6 @@ fn write_desktop_dev_bridge_file(
 pub fn run() {
     let download_state = Arc::new(DownloadState::default());
     let desktop_state = DesktopServerState::default();
-    let watcher_cancel = Arc::clone(&desktop_state.watcher_cancel);
     let startup_download_state = Arc::clone(&download_state);
     #[cfg(debug_assertions)]
     let dev_bridge_download_state = Arc::clone(&download_state);
@@ -1529,12 +1917,47 @@ pub fn run() {
     // the same logical manager from the user's perspective.
     let _ = RESIDENCY_GLOBAL.set(Arc::clone(&residency));
     let builder = tauri::Builder::default()
+        // Must be the first registered plugin so a second launch focuses the
+        // existing instance before any other plugin setup runs.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(desktop_state)
         .manage(Arc::clone(&download_state))
         .setup(move |app| {
+            // Acquire the resolved-profile OS advisory lock before dev bridge,
+            // stale PID cleanup, runtime spawn, or PGlite open. A second instance
+            // that races past single-instance must not run backend PID cleanup.
+            let profile = match profile_dirs() {
+                Ok(profile) => profile,
+                Err(err) => {
+                    eprintln!("desktop profile unavailable: {err}");
+                    return Err(Box::<dyn std::error::Error>::from(err));
+                }
+            };
+            if let Err(err) = acquire_profile_lock_for_startup(
+                app.state::<DesktopServerState>().inner(),
+                &profile,
+            ) {
+                eprintln!("desktop profile lock unavailable: {err}");
+                return Err(Box::<dyn std::error::Error>::from(err));
+            }
+            if let Err(err) = initialize_profile_fs_roots(&profile) {
+                eprintln!("desktop safe profile filesystem unavailable: {err}");
+                return Err(Box::<dyn std::error::Error>::from(err));
+            }
+            if let Err(err) = clear_stale_workspace_initialization_lock() {
+                eprintln!("desktop workspace initialization lock cleanup failed: {err}");
+                return Err(Box::<dyn std::error::Error>::from(err));
+            }
+
             #[cfg(debug_assertions)]
             {
-                let dev_bridge_result = profile_dirs().and_then(|profile| {
+                let dev_bridge_result = (|| {
                     let bridge_server = start_desktop_bridge(
                         Arc::clone(&dev_bridge_download_state),
                         workspace_reset_handler(
@@ -1543,8 +1966,8 @@ pub fn run() {
                         ),
                     )?;
                     let path = write_desktop_dev_bridge_file(&profile, &bridge_server.bridge)?;
-                    Ok((path, bridge_server))
-                });
+                    Ok::<_, String>((path, bridge_server))
+                })();
                 match dev_bridge_result {
                     Ok((path, bridge_server)) => {
                         if let Ok(mut guard) =
@@ -1569,56 +1992,61 @@ pub fn run() {
             // 30s schedule. Polling remains in place as a fallback (visibility
             // change + 30s).
             //
-            // Cancellation: DesktopServerState::shutdown flips watcher_cancel;
-            // the loop checks each tick so app shutdown doesn't leak this thread.
+            // Cancellation: the watcher is part of the tracked desktop
+            // lifecycle and waits on its wakeable shutdown token.
             let app_handle = app.handle().clone();
-            let cancel = Arc::clone(&watcher_cancel);
-            thread::spawn(move || {
-                let mut last_llama_running = false;
-                let mut last_mlx_running = false;
-                let mut last_mlx_phase = String::new();
-                loop {
-                    thread::sleep(Duration::from_secs(2));
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let llama_running = llama_engine_slot()
-                        .lock()
-                        .ok()
-                        .map(|g| g.is_some())
-                        .unwrap_or(false);
-                    let mlx_slot = mlx_engine_slot().lock().ok().and_then(|g| g.clone());
-                    let mlx_job = mlx_job_slot().lock().ok().and_then(|g| g.clone());
-                    let mlx_running = mlx_slot.is_some();
-                    let mlx_phase = mlx_job
-                        .as_ref()
-                        .map(|j| j.phase.clone())
-                        .unwrap_or_default();
+            app.state::<DesktopServerState>()
+                .spawn_lifecycle_task("lunery-runtime-watcher", move || {
+                    let mut last_llama_running = false;
+                    let mut last_mlx_running = false;
+                    let mut last_mlx_phase = String::new();
+                    loop {
+                        let state = app_handle.state::<DesktopServerState>();
+                        if state.wait_for_lifecycle_cancel(Duration::from_secs(2)) {
+                            break;
+                        }
+                        let llama_running = llama_engine_slot()
+                            .lock()
+                            .ok()
+                            .map(|g| g.is_some())
+                            .unwrap_or(false);
+                        let mlx_slot = mlx_engine_slot().lock().ok().and_then(|g| g.clone());
+                        let mlx_job = mlx_job_slot().lock().ok().and_then(|g| g.clone());
+                        let mlx_running = mlx_slot.is_some();
+                        let mlx_phase = mlx_job
+                            .as_ref()
+                            .map(|j| j.phase.clone())
+                            .unwrap_or_default();
 
-                    if llama_running != last_llama_running
-                        || mlx_running != last_mlx_running
-                        || mlx_phase != last_mlx_phase
-                    {
-                        last_llama_running = llama_running;
-                        last_mlx_running = mlx_running;
-                        // Clone for the emit JSON; the cached `last_mlx_phase`
-                        // takes ownership of the original so subsequent ticks
-                        // can dedup without re-reading the slot.
-                        last_mlx_phase = mlx_phase.clone();
-                        let _ = app_handle.emit(
-                            "local-runtime-changed",
-                            serde_json::json!({
-                                "llamaRunning": llama_running,
-                                "mlxRunning": mlx_running,
-                                "mlxPhase": mlx_phase,
-                            }),
-                        );
+                        if llama_running != last_llama_running
+                            || mlx_running != last_mlx_running
+                            || mlx_phase != last_mlx_phase
+                        {
+                            last_llama_running = llama_running;
+                            last_mlx_running = mlx_running;
+                            // Clone for the emit JSON; the cached `last_mlx_phase`
+                            // takes ownership of the original so subsequent ticks
+                            // can dedup without re-reading the slot.
+                            last_mlx_phase = mlx_phase.clone();
+                            if state.lifecycle_is_cancelled() {
+                                break;
+                            }
+                            let _ = app_handle.emit(
+                                "local-runtime-changed",
+                                serde_json::json!({
+                                    "llamaRunning": llama_running,
+                                    "mlxRunning": mlx_running,
+                                    "mlxPhase": mlx_phase,
+                                }),
+                            );
+                        }
                     }
-                }
-            });
+                })
+                .map_err(Box::<dyn std::error::Error>::from)?;
             let startup_app = app.handle().clone();
             let startup_download_state = Arc::clone(&startup_download_state);
-            thread::spawn(move || boot_desktop_runtime(startup_app, startup_download_state));
+            schedule_desktop_runtime_boot(startup_app, startup_download_state)
+                .map_err(Box::<dyn std::error::Error>::from)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1650,16 +2078,86 @@ pub fn run() {
     });
 }
 
+/// Returns true only in the hidden, bounded keychain helper subprocess. This
+/// runs before Tauri initialisation so a stuck native keychain call can be
+/// terminated by the owning desktop process without affecting the app.
+pub fn run_keychain_read_helper_if_requested() -> bool {
+    secrets::run_keychain_read_helper_if_requested()
+}
+
 #[cfg(all(test, unix))]
 mod desktop_server_lifecycle_tests {
-    use crate::{pid_matches_expected_binary, DesktopServerState};
+    use crate::{
+        acquire_profile_lock_for_startup, pid_matches_expected_binary, test_global_lock,
+        DesktopServerState, ProfileDirs,
+    };
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_profile(name: &str) -> ProfileDirs {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lunery-startup-{name}-{nanos}"));
+        let data = root.join("data");
+        ProfileDirs {
+            root: root.clone(),
+            config: root.join("config"),
+            data: data.clone(),
+            pglite: data.join("pglite"),
+            media: data.join("media"),
+            models: root.join("models"),
+            logs: root.join("logs"),
+            runtime: root.join("runtime"),
+        }
+    }
+
+    #[test]
+    fn second_profile_holder_fails_before_pid_cleanup_hook() {
+        let profile = unique_profile("second-holder");
+        let first = DesktopServerState::default();
+        acquire_profile_lock_for_startup(&first, &profile).expect("first profile holder");
+
+        let second = DesktopServerState::default();
+        let pid_cleanup_reached = AtomicBool::new(false);
+        let result = (|| -> Result<(), String> {
+            acquire_profile_lock_for_startup(&second, &profile)?;
+            pid_cleanup_reached.store(true, Ordering::SeqCst);
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert!(
+            !pid_cleanup_reached.load(Ordering::SeqCst),
+            "a second profile holder must fail before stale PID cleanup"
+        );
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_dir_all(&profile.root);
+    }
+
+    #[test]
+    fn poisoned_profile_lock_holder_fails_closed() {
+        let profile = unique_profile("poisoned-holder");
+        let state = DesktopServerState::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.profile_lock.lock().expect("profile lock holder");
+            panic!("poison profile lock holder");
+        });
+
+        let result = acquire_profile_lock_for_startup(&state, &profile);
+        assert!(result.is_err(), "poisoned holder must abort startup");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&profile.root);
+    }
 
     #[test]
     fn shutdown_reaps_runtime_child_and_cleans_runtime_files() {
+        let _global = test_global_lock();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1703,7 +2201,7 @@ mod desktop_server_lifecycle_tests {
 
         state.shutdown();
 
-        assert!(state.watcher_cancel.load(Ordering::Relaxed));
+        assert!(state.lifecycle_is_cancelled());
         assert!(state.child.lock().expect("lock child state").is_none());
         assert!(state.url.lock().expect("lock URL state").is_none());
         assert!(!pid_lockfile.exists());
@@ -1718,7 +2216,49 @@ mod desktop_server_lifecycle_tests {
             .success());
 
         state.shutdown();
+        drop(state);
+        crate::secrets::reset_secret_runtime_for_tests();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shutdown_revocation_wins_against_a_precommit_runtime_task() {
+        let _global = test_global_lock();
+        let state = Arc::new(DesktopServerState::default());
+        let epoch = state.begin_lifecycle_epoch().expect("lifecycle epoch");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let effects = Arc::new(AtomicUsize::new(0));
+
+        let task_state = Arc::clone(&state);
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task_effects = Arc::clone(&effects);
+        state
+            .spawn_lifecycle_task("desktop-precommit-latch", move || {
+                task_entered.wait();
+                task_release.wait();
+                let _commit = task_state
+                    .lifecycle_commit
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if task_state.lifecycle_is_current(epoch) {
+                    // Models the externally visible child, bridge/PID and event
+                    // commits, all protected by the same epoch+commit lock.
+                    task_effects.fetch_add(4, Ordering::SeqCst);
+                }
+            })
+            .expect("spawn precommit task");
+        entered.wait();
+
+        state.revoke_lifecycle();
+        release.wait();
+        state.join_lifecycle_tasks();
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(state.lifecycle_is_cancelled());
+        assert!(state.lifecycle_tasks.lock().unwrap().is_empty());
+        drop(state);
+        crate::secrets::reset_secret_runtime_for_tests();
     }
 }
 
@@ -1726,6 +2266,8 @@ mod desktop_server_lifecycle_tests {
 mod workspace_reset_tests {
     use crate::profile::ProfileDirs;
     use crate::reset_workspace_data;
+    #[cfg(unix)]
+    use crate::reset_workspace_data_unix;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1832,6 +2374,40 @@ mod workspace_reset_tests {
 
         let _ = std::fs::remove_dir_all(link_parent);
         let _ = std::fs::remove_dir_all(actual_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_rejects_root_swap_after_pin_without_touching_outside_data() {
+        use std::os::unix::fs::symlink;
+
+        let dirs = profile(unique_root("root-swap"));
+        let moved_root = unique_root("root-swap-moved");
+        let outside = unique_root("root-swap-outside");
+        std::fs::create_dir_all(&dirs.data).expect("create profile data");
+        std::fs::write(dirs.data.join("profile.txt"), b"profile").expect("seed profile");
+        std::fs::create_dir_all(outside.join("data")).expect("create outside data");
+        std::fs::write(outside.join("data/sentinel.txt"), b"outside-sentinel")
+            .expect("seed outside sentinel");
+
+        let error = reset_workspace_data_unix(&dirs, || {
+            std::fs::rename(&dirs.root, &moved_root).expect("move pinned profile root");
+            symlink(&outside, &dirs.root).expect("replace profile root with symlink");
+        })
+        .expect_err("root replacement must fail closed");
+
+        assert!(error.contains("Profile root changed"));
+        assert_eq!(
+            std::fs::read(outside.join("data/sentinel.txt")).expect("outside sentinel"),
+            b"outside-sentinel"
+        );
+        assert_eq!(
+            std::fs::read(moved_root.join("data/profile.txt")).expect("profile data preserved"),
+            b"profile"
+        );
+        std::fs::remove_file(&dirs.root).expect("remove root symlink");
+        std::fs::remove_dir_all(moved_root).expect("remove moved profile");
+        std::fs::remove_dir_all(outside).expect("remove outside fixture");
     }
 
     #[test]

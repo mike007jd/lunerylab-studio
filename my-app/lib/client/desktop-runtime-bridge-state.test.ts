@@ -30,7 +30,7 @@ describe("desktop bridge action state", () => {
 
     expect(
       providerSecretSourceLabel(
-        { source: "none", keychain_status: "unavailable" },
+        { source: "none", keychain_status: "unknown" },
         true,
         false,
         labels,
@@ -38,7 +38,7 @@ describe("desktop bridge action state", () => {
     ).toBe(labels.keychainUnavailable);
     expect(
       providerSecretSourceLabel(
-        { source: "none", keychain_status: "missing" },
+        { source: "none", keychain_status: "absent" },
         true,
         false,
         labels,
@@ -46,7 +46,7 @@ describe("desktop bridge action state", () => {
     ).toBe(labels.notConnected);
     expect(
       providerSecretSourceLabel(
-        { source: "environment", keychain_status: "unavailable" },
+        { source: "environment", keychain_status: "unknown" },
         true,
         false,
         labels,

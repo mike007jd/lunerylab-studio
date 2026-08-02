@@ -16,10 +16,24 @@ export async function GET(
 
   const { jobId } = await params;
 
-  return proxyToBridge(
+  const response = await proxyToBridge(
     bridge,
     `/hf-download-status?jobId=${encodeURIComponent(jobId)}`,
   );
+  if (response.ok) {
+    const payload = await response.clone().json().catch(() => null) as { status?: unknown } | null;
+    if (payload?.status === "unknown") {
+      return NextResponse.json(
+        {
+          error: "Download job not found",
+          code: "download_job_not_found",
+          jobId,
+        },
+        { status: 404 },
+      );
+    }
+  }
+  return response;
 }
 
 /**

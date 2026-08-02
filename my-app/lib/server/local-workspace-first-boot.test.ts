@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   assetFindMany: vi.fn(),
   reconcileStagedStoredFileDeletions: vi.fn(),
   reconcileExternalModelDeleteJournals: vi.fn(),
+  reconcileStagedManagedModelFiles: vi.fn(),
 }));
 
 // This dependency is intentionally hostile: if template initialization ever
@@ -61,6 +62,12 @@ vi.mock("@/lib/server/workspace-restore-journal", () => ({
 vi.mock("@/lib/server/imported-model-registry", () => ({
   reconcileExternalModelDeleteJournals: mocks.reconcileExternalModelDeleteJournals,
 }));
+vi.mock("@/lib/server/local-model-files", () => ({
+  reconcileStagedManagedModelFiles: mocks.reconcileStagedManagedModelFiles,
+}));
+vi.mock("@/lib/server/workspace-initialization-lock", () => ({
+  withWorkspaceInitializationLock: (work: () => Promise<unknown>) => work(),
+}));
 
 import { ensureLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 
@@ -78,6 +85,7 @@ describe("local workspace first boot", () => {
     mocks.assetFindMany.mockResolvedValue([]);
     mocks.reconcileStagedStoredFileDeletions.mockResolvedValue(undefined);
     mocks.reconcileExternalModelDeleteJournals.mockResolvedValue(undefined);
+    mocks.reconcileStagedManagedModelFiles.mockResolvedValue(0);
 
     const outcome = await Promise.race([
       ensureLocalWorkspaceOwner().then(() => "completed"),

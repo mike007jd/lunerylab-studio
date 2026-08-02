@@ -6,6 +6,7 @@ vi.mock("server-only", () => ({}));
 const mocks = vi.hoisted(() => ({
   requireLocalWorkspaceOwner: vi.fn(),
   updateMany: vi.fn(),
+  findUnique: vi.fn(),
   purgeAssets: vi.fn(),
 }));
 
@@ -13,7 +14,7 @@ vi.mock("@/lib/server/local-workspace-owner", () => ({
   requireLocalWorkspaceOwner: mocks.requireLocalWorkspaceOwner,
 }));
 vi.mock("@/lib/server/prisma", () => ({
-  prisma: { asset: { updateMany: mocks.updateMany } },
+  prisma: { asset: { updateMany: mocks.updateMany, findUnique: mocks.findUnique } },
 }));
 vi.mock("@/lib/server/storage", () => ({
   getStoredFileMetadata: vi.fn(),
@@ -26,8 +27,9 @@ vi.mock("@/lib/server/asset-purge", () => ({
   purgeAssets: mocks.purgeAssets,
 }));
 
-import { DELETE } from "@/app/api/assets/[id]/route";
+import { DELETE, GET } from "@/app/api/assets/[id]/route";
 import { ApiError } from "@/lib/server/errors";
+import { acquireWorkspaceExclusive, resetWorkspaceOperationGateForTests } from "@/lib/server/workspace-operation-gate";
 
 function deleteRequest(id: string, query = "") {
   return DELETE(new NextRequest(`http://localhost/api/assets/${id}${query}`, { method: "DELETE" }), {
@@ -36,10 +38,27 @@ function deleteRequest(id: string, query = "") {
 }
 
 beforeEach(() => {
+  resetWorkspaceOperationGateForTests();
   vi.clearAllMocks();
   mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
   mocks.updateMany.mockResolvedValue({ count: 1 });
   mocks.purgeAssets.mockResolvedValue({ purgedCount: 1, bytesFreed: 2048, filesDeleted: 1 });
+});
+
+describe("GET /api/assets/[id] restore barrier", () => {
+  it("fails closed before DB/file reads while restore is paused between swaps", async () => {
+    const exclusive = await acquireWorkspaceExclusive("restore");
+    try {
+      const response = await GET(new NextRequest("http://localhost/api/assets/asset-1"), {
+        params: Promise.resolve({ id: "asset-1" }),
+      });
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({ code: "workspace_busy" });
+      expect(mocks.findUnique).not.toHaveBeenCalled();
+    } finally {
+      exclusive.release();
+    }
+  });
 });
 
 describe("DELETE /api/assets/[id] soft delete", () => {

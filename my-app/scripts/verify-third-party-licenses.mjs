@@ -6,6 +6,7 @@ const repoRoot = resolve(appRoot, "..");
 const licenseDir = resolve(appRoot, "engine", "licenses");
 const manifest = JSON.parse(readFileSync(resolve(appRoot, "scripts", "sidecar-manifest.json"), "utf8"));
 const notices = readFileSync(resolve(repoRoot, "THIRD_PARTY_NOTICES.md"), "utf8");
+const cargoToml = readFileSync(resolve(appRoot, "src-tauri", "Cargo.toml"), "utf8");
 
 const licenses = new Map([
   ["ggml-org/llama.cpp", "llama.cpp-LICENSE"],
@@ -43,4 +44,38 @@ if (unexpected.length || missing.length || unlicensed.length) {
   );
 }
 
-console.log(`[verify-third-party-licenses] OK: ${licenses.size} licenses; ${manifestRepos.size} sidecar components`);
+const requiredDesktopDeps = [
+  {
+    cargoKey: "tauri-plugin-single-instance",
+    version: "2.4.3",
+    noticeNeedle: "tauri-plugin-single-instance 2.4.3",
+  },
+  {
+    cargoKey: "fs4",
+    version: "1.1.0",
+    noticeNeedle: "fs4 1.1.0",
+  },
+  {
+    cargoKey: "rustix",
+    version: "1.1.4",
+    noticeNeedle: "rustix 1.1.4",
+  },
+];
+
+for (const dep of requiredDesktopDeps) {
+  const cargoPattern = new RegExp(
+    `${dep.cargoKey}\\s*=\\s*(?:\"=${dep.version}\"|\\{[^}]*version\\s*=\\s*\"=${dep.version}\"[^}]*\\})`,
+  );
+  if (!cargoPattern.test(cargoToml)) {
+    throw new Error(
+      `Missing direct desktop dependency ${dep.cargoKey} = "=${dep.version}" in src-tauri/Cargo.toml`,
+    );
+  }
+  if (!notices.includes(dep.noticeNeedle)) {
+    throw new Error(`THIRD_PARTY_NOTICES.md is missing required notice for ${dep.noticeNeedle}`);
+  }
+}
+
+console.log(
+  `[verify-third-party-licenses] OK: ${licenses.size} licenses; ${manifestRepos.size} sidecar components; ${requiredDesktopDeps.length} desktop deps`,
+);

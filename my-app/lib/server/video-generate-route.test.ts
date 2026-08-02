@@ -152,7 +152,7 @@ describe("POST /api/generate/video", () => {
   });
 
   it("returns stable 409 and creates no job while backup owns exclusivity", async () => {
-    const release = acquireWorkspaceExclusive("backup");
+    const { release } = await acquireWorkspaceExclusive("backup");
     try {
       const response = await POST(
         formRequest({
@@ -186,8 +186,10 @@ describe("POST /api/generate/video", () => {
 
     expect(response.status).toBe(200);
     expect(mocks.runVideoJob).not.toHaveBeenCalled();
-    expect(getWorkspaceOperationGateStateForTests()).toEqual({
+    expect(getWorkspaceOperationGateStateForTests()).toMatchObject({
       exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
       activeVideoCount: 0,
     });
   });

@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,9 +12,147 @@ use crate::download::canonical_models_roots;
 use crate::residency_global;
 use crate::sd_cpp_resident::SdCppResident;
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdOutputIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct PinnedSdOutput {
+    parent: std::fs::File,
+    name: std::ffi::OsString,
+    file: std::fs::File,
+    identity: SdOutputIdentity,
+}
+
+#[cfg(unix)]
+impl PinnedSdOutput {
+    fn pin(argv: &[String]) -> Result<Self, String> {
+        use rustix::fs::{open, openat, Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+
+        let path = sd_output_path_from_argv(argv)?;
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| "SD output must include a parent directory".to_string())?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| "SD output must point to a file".to_string())?
+            .to_os_string();
+        let parent = std::fs::File::from(
+            open(
+                parent_path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| format!("Could not pin SD output directory: {error}"))?,
+        );
+        let metadata = parent
+            .metadata()
+            .map_err(|error| format!("Could not inspect SD output directory: {error}"))?;
+        if metadata.mode() & 0o777 != 0o700 || metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err("SD output directory must be private and owned by this user".to_string());
+        }
+        let file = std::fs::File::from(
+            openat(
+                &parent,
+                &name,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|error| format!("Could not reserve SD output safely: {error}"))?,
+        );
+        let file_metadata = file
+            .metadata()
+            .map_err(|error| format!("Could not inspect SD output file: {error}"))?;
+        if !file_metadata.file_type().is_file() {
+            return Err("SD output is not a regular file".to_string());
+        }
+        let identity = SdOutputIdentity {
+            device: file_metadata.dev(),
+            inode: file_metadata.ino(),
+        };
+        rustix::fs::fchmod(&parent, Mode::from_raw_mode(0o500))
+            .map_err(|error| format!("Could not seal SD output directory: {error}"))?;
+        Ok(Self {
+            parent,
+            name,
+            file,
+            identity,
+        })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        use rustix::fs::{openat, Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+
+        let current = std::fs::File::from(
+            openat(
+                &self.parent,
+                &self.name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| format!("Could not verify SD output file: {error}"))?,
+        );
+        let metadata = current
+            .metadata()
+            .map_err(|error| format!("Could not inspect SD output file: {error}"))?;
+        let current_identity = SdOutputIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        if current_identity != self.identity {
+            return Err("SD output file was replaced during generation".to_string());
+        }
+        self.file
+            .metadata()
+            .map_err(|error| format!("Pinned SD output became unavailable: {error}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PinnedSdOutput {
+    fn drop(&mut self) {
+        let _ = rustix::fs::fchmod(&self.parent, rustix::fs::Mode::from_raw_mode(0o700));
+    }
+}
+
+#[cfg(not(unix))]
+struct PinnedSdOutput;
+
+#[cfg(not(unix))]
+impl PinnedSdOutput {
+    fn pin(_argv: &[String]) -> Result<Self, String> {
+        Err(
+            "Local SD generation is unavailable until reparse-safe output handling is enabled"
+                .to_string(),
+        )
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        Err(
+            "Local SD generation is unavailable until reparse-safe output handling is enabled"
+                .to_string(),
+        )
+    }
+}
+
 static SD_INFLIGHT_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 pub(crate) fn sd_inflight_child() -> &'static Mutex<Option<Child>> {
     SD_INFLIGHT_CHILD.get_or_init(|| Mutex::new(None))
+}
+
+/// Serialize spawn registration with stop/reset/shutdown so there is no
+/// check-to-spawn TOCTOU. Lock order is always gate → child-slot.
+static SD_SPAWN_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+pub(crate) fn sd_spawn_gate() -> &'static Mutex<()> {
+    SD_SPAWN_GATE.get_or_init(|| Mutex::new(()))
 }
 
 static SD_GENERATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -30,6 +168,47 @@ pub(crate) fn sd_generate_lock() -> &'static Mutex<()> {
 static SD_CANCEL: OnceLock<AtomicBool> = OnceLock::new();
 pub(crate) fn sd_cancel_flag() -> &'static AtomicBool {
     SD_CANCEL.get_or_init(|| AtomicBool::new(false))
+}
+
+/// Runtime epoch advanced by stop/reset/shutdown. Every accepted generate
+/// captures the epoch before queueing and rechecks it after the generate mutex
+/// and before every native spawn so stale queued work cannot start a process.
+static SD_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn sd_runtime_epoch() -> u64 {
+    SD_RUNTIME_EPOCH.load(Ordering::SeqCst)
+}
+
+pub(crate) fn advance_sd_runtime_epoch() -> u64 {
+    SD_RUNTIME_EPOCH
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
+/// Pure admission decision used by generate and by deterministic tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SdSpawnDecision {
+    Allow,
+    Revoked,
+    Canceled,
+}
+
+pub(crate) fn sd_spawn_decision(
+    captured_epoch: u64,
+    current_epoch: u64,
+    canceled: bool,
+) -> SdSpawnDecision {
+    if captured_epoch != current_epoch {
+        SdSpawnDecision::Revoked
+    } else if canceled {
+        SdSpawnDecision::Canceled
+    } else {
+        SdSpawnDecision::Allow
+    }
+}
+
+pub(crate) fn sd_may_spawn(captured_epoch: u64, current_epoch: u64, canceled: bool) -> bool {
+    sd_spawn_decision(captured_epoch, current_epoch, canceled) == SdSpawnDecision::Allow
 }
 
 static SD_PROGRESS: OnceLock<Mutex<Option<SdProgress>>> = OnceLock::new();
@@ -49,6 +228,7 @@ struct SdModelState {
 }
 
 static SD_MODEL_STATE: OnceLock<Mutex<SdModelState>> = OnceLock::new();
+const SD_MODEL_DELETE_LEASE_TTL: Duration = Duration::from_secs(60);
 fn sd_model_state() -> &'static Mutex<SdModelState> {
     SD_MODEL_STATE.get_or_init(|| Mutex::new(SdModelState::default()))
 }
@@ -77,11 +257,55 @@ pub(crate) fn acquire_sd_model_delete_lease(
     model_path: &str,
     lease_id: &str,
 ) -> Result<(), String> {
+    acquire_sd_model_delete_lease_at(model_path, lease_id, Instant::now())
+}
+
+pub(crate) fn renew_sd_model_delete_lease(model_path: &str, lease_id: &str) -> Result<(), String> {
+    renew_sd_model_delete_lease_at(model_path, lease_id, Instant::now())
+}
+
+fn renew_sd_model_delete_lease_at(
+    model_path: &str,
+    lease_id: &str,
+    now: Instant,
+) -> Result<(), String> {
     if lease_id.is_empty() || lease_id.len() > 128 {
         return Err("Invalid SD model deletion lease".to_string());
     }
     let model_path = normalize_sd_model_path(model_path);
-    let now = Instant::now();
+    let mut state = sd_model_state()
+        .lock()
+        .map_err(|_| "SD model state lock poisoned".to_string())?;
+    state
+        .delete_leases
+        .retain(|_, lease| lease.expires_at > now);
+    if state
+        .delete_leases
+        .get(&model_path)
+        .map(|lease| lease.lease_id.as_str())
+        != Some(lease_id)
+    {
+        return Err("Image model deletion lease was lost".to_string());
+    }
+    state.delete_leases.insert(
+        model_path,
+        SdModelDeleteLease {
+            lease_id: lease_id.to_string(),
+            expires_at: now + SD_MODEL_DELETE_LEASE_TTL,
+        },
+    );
+    Ok(())
+}
+
+fn acquire_sd_model_delete_lease_at(
+    model_path: &str,
+    lease_id: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if lease_id.is_empty() || lease_id.len() > 128 {
+        return Err("Invalid SD model deletion lease".to_string());
+    }
+    let model_path = normalize_sd_model_path(model_path);
     let mut state = sd_model_state()
         .lock()
         .map_err(|_| "SD model state lock poisoned".to_string())?;
@@ -97,7 +321,7 @@ pub(crate) fn acquire_sd_model_delete_lease(
         model_path,
         SdModelDeleteLease {
             lease_id: lease_id.to_string(),
-            expires_at: now + Duration::from_secs(60),
+            expires_at: now + SD_MODEL_DELETE_LEASE_TTL,
         },
     );
     Ok(())
@@ -123,8 +347,11 @@ struct ActiveSdModelGuard {
 
 impl ActiveSdModelGuard {
     fn set(path: Option<String>) -> Result<Self, String> {
+        Self::set_at(path, Instant::now())
+    }
+
+    fn set_at(path: Option<String>, now: Instant) -> Result<Self, String> {
         let path = path.map(|value| normalize_sd_model_path(&value));
-        let now = Instant::now();
         let mut state = sd_model_state()
             .lock()
             .map_err(|_| "SD model state lock poisoned".to_string())?;
@@ -317,18 +544,28 @@ pub(crate) fn sd_binary_path() -> Option<PathBuf> {
 }
 
 fn stop_sd_child() {
-    if let Ok(mut guard) = sd_inflight_child().lock() {
-        if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
-            // Reap the killed child so it does not linger as a zombie on a
-            // cancel-without-exit path (mirrors the llama Child Drop pattern).
-            let _ = child.wait();
-        }
-        *guard = None;
+    let mut guard = sd_inflight_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = guard.as_mut() {
+        let _ = child.kill();
+        // Reap the killed child so it does not linger as a zombie on a
+        // cancel-without-exit path (mirrors the llama Child Drop pattern).
+        let _ = child.wait();
     }
+    *guard = None;
 }
 
+/// Teardown under the spawn gate: advance epoch, then kill any registered child
+/// before returning. A worker holding the gate finishes register-or-abort first;
+/// a worker that acquires the gate afterwards observes the new epoch and must
+/// not invoke spawn.
 pub(crate) fn bridge_stop_sd() {
+    let _gate = match sd_spawn_gate().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let _ = advance_sd_runtime_epoch();
     sd_cancel_flag().store(true, Ordering::SeqCst);
     if let Ok(slot) = sd_progress_slot().lock() {
         if let Some(progress) = slot.as_ref() {
@@ -338,6 +575,36 @@ pub(crate) fn bridge_stop_sd() {
         }
     }
     stop_sd_child();
+}
+
+/// Testable spawn/register seam held under `sd_spawn_gate`. Returns `Ok(None)`
+/// when the captured epoch is stale or cancel is set — `spawn_fn` is never
+/// called in that case. On success the child is registered in the inflight slot
+/// before the gate is released.
+#[cfg(test)]
+pub(crate) fn sd_spawn_and_register_under_gate<F>(
+    captured_epoch: u64,
+    mut spawn_fn: F,
+) -> Result<Option<()>, String>
+where
+    F: FnMut() -> Result<Child, String>,
+{
+    let _gate = sd_spawn_gate()
+        .lock()
+        .map_err(|_| "sd spawn gate poisoned".to_string())?;
+    if !sd_may_spawn(
+        captured_epoch,
+        sd_runtime_epoch(),
+        sd_cancel_flag().load(Ordering::SeqCst),
+    ) {
+        return Ok(None);
+    }
+    let child = spawn_fn()?;
+    let mut slot = sd_inflight_child()
+        .lock()
+        .map_err(|_| "sd in-flight lock poisoned".to_string())?;
+    *slot = Some(child);
+    Ok(Some(()))
 }
 
 pub(crate) fn bridge_stop_sd_if_model_path(expected_model_path: &str) -> bool {
@@ -365,11 +632,23 @@ pub(crate) fn bridge_stop_sd_if_model_path(expected_model_path: &str) -> bool {
 /// Cancel only the matching run. Unknown run ids are queued briefly because
 /// the cancel request can beat the generate request to the bridge lock.
 pub(crate) fn bridge_cancel_sd(run_id: &str) -> bool {
+    // This is the same gate used by begin and native spawn. Reading progress,
+    // consuming/publishing pending cancel state, and canceling an active run
+    // therefore form one admission critical section.
+    let _gate = match sd_spawn_gate().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    bridge_cancel_sd_under_gate(run_id)
+}
+
+fn bridge_cancel_sd_under_gate(run_id: &str) -> bool {
     let matching_progress = sd_progress_for_run(run_id);
     match matching_progress {
         Some(progress) if progress.phase == SdProgressPhase::Canceled => true,
         Some(progress) if progress.phase.is_terminal() => false,
         Some(_) => {
+            let _ = advance_sd_runtime_epoch();
             sd_cancel_flag().store(true, Ordering::SeqCst);
             set_sd_phase(run_id, SdProgressPhase::Canceled);
             stop_sd_child();
@@ -557,12 +836,31 @@ fn canceled_run_results(total_images: usize) -> Vec<SdRunResult> {
         .collect()
 }
 
-fn begin_sd_run(run_id: &str, total_images: usize) -> bool {
-    sd_cancel_flag().store(false, Ordering::SeqCst);
+fn begin_sd_run(captured_epoch: u64, run_id: &str, total_images: usize) -> bool {
+    // Stop/reset/cancel and native spawn use this same gate. Revalidate the
+    // captured epoch before clearing a stale cancel bit so a concurrent
+    // teardown can never be erased by a fresh-run reset.
+    let _gate = match sd_spawn_gate().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    begin_sd_run_under_gate(captured_epoch, run_id, total_images)
+}
+
+fn begin_sd_run_under_gate(captured_epoch: u64, run_id: &str, total_images: usize) -> bool {
+    if captured_epoch != sd_runtime_epoch() {
+        return false;
+    }
+    let canceled = take_pending_cancel(run_id);
+    sd_cancel_flag().store(canceled, Ordering::SeqCst);
     let started_at_ms = epoch_ms();
     set_sd_progress(SdProgress {
         run_id: run_id.to_string(),
-        phase: SdProgressPhase::Preparing,
+        phase: if canceled {
+            SdProgressPhase::Canceled
+        } else {
+            SdProgressPhase::Preparing
+        },
         current_image: usize::from(total_images > 0),
         total_images,
         step: None,
@@ -571,12 +869,7 @@ fn begin_sd_run(run_id: &str, total_images: usize) -> bool {
         started_at_ms,
         updated_at_ms: started_at_ms,
     });
-    if !take_pending_cancel(run_id) {
-        return true;
-    }
-    sd_cancel_flag().store(true, Ordering::SeqCst);
-    set_sd_phase(run_id, SdProgressPhase::Canceled);
-    false
+    !canceled
 }
 
 pub(crate) fn valid_sd_run_id(run_id: &str) -> bool {
@@ -612,6 +905,10 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
         validate_sd_run_argv(argv, &output_root, &models_roots)?;
     }
 
+    // Capture before waiting so stop/reset/shutdown during the queue wait
+    // revokes this request without a native spawn.
+    let captured_epoch = sd_runtime_epoch();
+
     let _generate_guard = sd_generate_lock()
         .lock()
         .map_err(|_| "sd generation lock poisoned".to_string())?;
@@ -626,7 +923,11 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
     // batch (not just each image) so a multi-image request can't outrun the
     // caller's overall deadline. The batch cap is the per-image timeout times
     // the image count, hard-capped at 1 h.
-    if !begin_sd_run(&run_id, total_images) {
+    if !begin_sd_run(captured_epoch, &run_id, total_images) {
+        return Ok(canceled_run_results(total_images));
+    }
+    if !sd_may_spawn(captured_epoch, sd_runtime_epoch(), false) {
+        set_sd_phase(&run_id, SdProgressPhase::Canceled);
         return Ok(canceled_run_results(total_images));
     }
     let batch_deadline = Instant::now()
@@ -662,9 +963,16 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
     let mut canceled = false;
     let mut any_success = false;
     for (index, args) in body.runs.into_iter().enumerate() {
-        if sd_cancel_flag().load(Ordering::SeqCst) {
-            canceled = true;
-            break;
+        match sd_spawn_decision(
+            captured_epoch,
+            sd_runtime_epoch(),
+            sd_cancel_flag().load(Ordering::SeqCst),
+        ) {
+            SdSpawnDecision::Allow => {}
+            SdSpawnDecision::Revoked | SdSpawnDecision::Canceled => {
+                canceled = true;
+                break;
+            }
         }
         let current_image = index + 1;
         set_sd_image_phase(
@@ -673,6 +981,16 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
             total_images,
             SdProgressPhase::Preparing,
         );
+        let pinned_output = match PinnedSdOutput::pin(&args) {
+            Ok(output) => output,
+            Err(error) => {
+                results.push(SdRunResult {
+                    ok: false,
+                    error: Some(error),
+                });
+                continue;
+            }
+        };
         let mut cmd = Command::new(&bin);
         cmd.args(&args)
             .stdin(Stdio::null())
@@ -688,35 +1006,82 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
             cmd.env("PATH", format!("{};{}", lib_dir.display(), prev));
         }
 
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(err) => {
+        // Hold the spawn gate across epoch recheck → spawn → register so stop
+        // cannot return while an old-epoch spawn is still runnable, and a
+        // teardown that wins the gate makes spawn_fn unreachable.
+        enum GatedSpawn {
+            Revoked,
+            SpawnFailed(String),
+            Started {
+                stdout_reader: Option<thread::JoinHandle<()>>,
+                stderr_reader: Option<thread::JoinHandle<()>>,
+                stderr_tail: Arc<Mutex<VecDeque<u8>>>,
+            },
+        }
+        let gated = {
+            let _gate = sd_spawn_gate()
+                .lock()
+                .map_err(|_| "sd spawn gate poisoned".to_string())?;
+            if !sd_may_spawn(
+                captured_epoch,
+                sd_runtime_epoch(),
+                sd_cancel_flag().load(Ordering::SeqCst),
+            ) {
+                GatedSpawn::Revoked
+            } else {
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+                        let stdout_reader = child.stdout.take().map(|stdout| {
+                            spawn_sd_output_reader(
+                                stdout,
+                                run_id.clone(),
+                                current_image,
+                                total_images,
+                                None,
+                            )
+                        });
+                        let stderr_reader = child.stderr.take().map(|stderr| {
+                            spawn_sd_output_reader(
+                                stderr,
+                                run_id.clone(),
+                                current_image,
+                                total_images,
+                                Some(Arc::clone(&stderr_tail)),
+                            )
+                        });
+                        let mut slot = sd_inflight_child()
+                            .lock()
+                            .map_err(|_| "sd in-flight lock poisoned".to_string())?;
+                        *slot = Some(child);
+                        GatedSpawn::Started {
+                            stdout_reader,
+                            stderr_reader,
+                            stderr_tail,
+                        }
+                    }
+                    Err(err) => GatedSpawn::SpawnFailed(format!("spawn failed: {err}")),
+                }
+            }
+        };
+        let (stdout_reader, stderr_reader, stderr_tail) = match gated {
+            GatedSpawn::Revoked => {
+                canceled = true;
+                break;
+            }
+            GatedSpawn::SpawnFailed(err) => {
                 results.push(SdRunResult {
                     ok: false,
-                    error: Some(format!("spawn failed: {err}")),
+                    error: Some(err),
                 });
                 continue;
             }
+            GatedSpawn::Started {
+                stdout_reader,
+                stderr_reader,
+                stderr_tail,
+            } => (stdout_reader, stderr_reader, stderr_tail),
         };
-        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-        let stdout_reader = child.stdout.take().map(|stdout| {
-            spawn_sd_output_reader(stdout, run_id.clone(), current_image, total_images, None)
-        });
-        let stderr_reader = child.stderr.take().map(|stderr| {
-            spawn_sd_output_reader(
-                stderr,
-                run_id.clone(),
-                current_image,
-                total_images,
-                Some(Arc::clone(&stderr_tail)),
-            )
-        });
-        {
-            let mut slot = sd_inflight_child()
-                .lock()
-                .map_err(|_| "sd in-flight lock poisoned".to_string())?;
-            *slot = Some(child);
-        }
 
         // Poll for completion with a wall-clock deadline; kill on timeout. The
         // effective deadline is the sooner of this image's own timeout and the
@@ -772,19 +1137,25 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
         canceled |= sd_cancel_flag().load(Ordering::SeqCst);
 
         match outcome {
-            Ok(status) if status.success() => {
-                any_success = true;
-                set_sd_image_phase(
-                    &run_id,
-                    current_image,
-                    total_images,
-                    SdProgressPhase::Finalizing,
-                );
-                results.push(SdRunResult {
-                    ok: true,
-                    error: None,
-                });
-            }
+            Ok(status) if status.success() => match pinned_output.verify() {
+                Ok(()) => {
+                    any_success = true;
+                    set_sd_image_phase(
+                        &run_id,
+                        current_image,
+                        total_images,
+                        SdProgressPhase::Finalizing,
+                    );
+                    results.push(SdRunResult {
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(error) => results.push(SdRunResult {
+                    ok: false,
+                    error: Some(error),
+                }),
+            },
             Ok(status) => {
                 let tail = stderr_tail
                     .lock()
@@ -847,6 +1218,19 @@ fn canonical_sd_output_root() -> Result<PathBuf, String> {
         .map_err(|err| format!("Could not verify temp output root: {err}"))
 }
 
+fn sd_output_path_from_argv(argv: &[String]) -> Result<PathBuf, String> {
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-o" || arg == "--output" {
+            return iter
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "Missing value after output flag".to_string());
+        }
+    }
+    Err("Missing SD output path".to_string())
+}
+
 /// Confirm that `value` (an argv path that follows `-o`/`--output`) resolves
 /// under `root`. The file itself need not exist yet, so we canonicalize its
 /// PARENT and join the file name — same approach as `hf_download_start_inner`'s
@@ -866,7 +1250,30 @@ fn sd_output_path_allowed(value: &str, root: &Path) -> bool {
     let Ok(parent_canon) = parent.canonicalize() else {
         return false;
     };
-    parent_canon.starts_with(root) && parent_canon.join(file_name).starts_with(root)
+    if parent_canon.parent() != Some(root)
+        || !parent_canon
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("lunery-sd-"))
+        || path.extension().and_then(|extension| extension.to_str()) != Some("png")
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::metadata(&parent_canon) else {
+            return false;
+        };
+        metadata.file_type().is_dir()
+            && metadata.mode() & 0o777 == 0o700
+            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && parent_canon.join(file_name).starts_with(root)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Confirm that `value` (an argv path that follows `-m`/`--model`/
@@ -978,15 +1385,18 @@ fn sd_model_path_from_argv(argv: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_sd_model_delete_lease, begin_sd_run, bridge_cancel_sd, bridge_stop_sd,
-        bridge_stop_sd_if_model_path, queue_pending_cancel, release_sd_model_delete_lease,
-        sd_active_model_path, sd_cancel_flag, sd_inflight_child, sd_model_id_from_argv,
-        sd_progress_for_run, set_sd_image_phase, set_sd_progress, validate_sd_run_argv,
-        ActiveSdModelGuard, SdProgress, SdProgressParser, SdProgressPhase,
+        acquire_sd_model_delete_lease, acquire_sd_model_delete_lease_at, advance_sd_runtime_epoch,
+        begin_sd_run, bridge_cancel_sd, bridge_stop_sd, bridge_stop_sd_if_model_path,
+        queue_pending_cancel, release_sd_model_delete_lease, renew_sd_model_delete_lease_at,
+        sd_active_model_path, sd_cancel_flag, sd_inflight_child, sd_may_spawn,
+        sd_model_id_from_argv, sd_progress_for_run, sd_runtime_epoch, sd_spawn_decision,
+        sd_spawn_gate, set_sd_image_phase, set_sd_progress, validate_sd_run_argv,
+        ActiveSdModelGuard, PinnedSdOutput, SdProgress, SdProgressParser, SdProgressPhase,
+        SdSpawnDecision,
     };
     use crate::test_global_lock;
     use std::sync::atomic::Ordering;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     // bridge_stop_sd must kill + reap the in-flight child and clear the slot.
     #[cfg(unix)]
@@ -1066,6 +1476,42 @@ mod tests {
     }
 
     #[test]
+    fn same_id_renewal_blocks_sd_start_past_original_expiry() {
+        let _g = test_global_lock();
+        let model_path = "/models/renewed-delete.safetensors";
+        let t0 = Instant::now();
+        acquire_sd_model_delete_lease_at(model_path, "renew", t0).expect("initial lease");
+        renew_sd_model_delete_lease_at(model_path, "renew", t0 + Duration::from_secs(59))
+            .expect("same-id renewal");
+
+        assert!(ActiveSdModelGuard::set_at(
+            Some(model_path.to_string()),
+            t0 + Duration::from_secs(61),
+        )
+        .is_err());
+        assert!(acquire_sd_model_delete_lease_at(
+            model_path,
+            "different-owner",
+            t0 + Duration::from_secs(61),
+        )
+        .is_err());
+        release_sd_model_delete_lease(model_path, "renew");
+    }
+
+    #[test]
+    fn expired_sd_delete_lease_cannot_be_reacquired_as_a_renewal() {
+        let _g = test_global_lock();
+        let model_path = "/tmp/lunery-expired-sd-delete-lease.safetensors";
+        let t0 = Instant::now();
+        acquire_sd_model_delete_lease_at(model_path, "renew", t0).expect("initial lease");
+        assert!(
+            renew_sd_model_delete_lease_at(model_path, "renew", t0 + Duration::from_secs(61),)
+                .expect_err("expired lease must fail closed")
+                .contains("was lost")
+        );
+    }
+
+    #[test]
     fn parses_chunked_carriage_return_progress_and_both_speed_units() {
         let mut parser = SdProgressParser::default();
 
@@ -1121,16 +1567,20 @@ mod tests {
     #[test]
     fn canceled_batch_cannot_start_and_retry_gets_fresh_state() {
         let _g = test_global_lock();
-        queue_pending_cancel("run-canceled");
+        let captured_epoch = sd_runtime_epoch();
+        {
+            let _gate = sd_spawn_gate().lock().expect("spawn gate");
+            queue_pending_cancel("run-canceled");
+        }
 
-        assert!(!begin_sd_run("run-canceled", 2));
+        assert!(!begin_sd_run(captured_epoch, "run-canceled", 2));
         assert!(sd_cancel_flag().load(Ordering::SeqCst));
         assert_eq!(
             sd_progress_for_run("run-canceled").map(|progress| progress.phase),
             Some(SdProgressPhase::Canceled)
         );
 
-        assert!(begin_sd_run("run-retry", 2));
+        assert!(begin_sd_run(captured_epoch, "run-retry", 2));
         assert!(!sd_cancel_flag().load(Ordering::SeqCst));
         assert!(sd_progress_for_run("run-canceled").is_none());
         assert_eq!(
@@ -1139,12 +1589,372 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fresh_generation_clears_prior_stop_cancel_without_weakening_epoch() {
+        let _g = test_global_lock();
+        *super::sd_progress_slot().lock().unwrap() = None;
+        super::sd_pending_cancels().lock().unwrap().clear();
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+
+        bridge_stop_sd();
+        let fresh_epoch = sd_runtime_epoch();
+        assert!(sd_cancel_flag().load(Ordering::SeqCst));
+        assert!(begin_sd_run(fresh_epoch, "run-after-stop", 1));
+        assert!(!sd_cancel_flag().load(Ordering::SeqCst));
+        assert_eq!(
+            sd_progress_for_run("run-after-stop").map(|progress| progress.phase),
+            Some(SdProgressPhase::Preparing)
+        );
+
+        // A stop after capture still wins. The stale request may not clear the
+        // new cancel bit or replace the stopped run's terminal progress.
+        bridge_stop_sd();
+        assert!(!begin_sd_run(fresh_epoch, "run-stale-epoch", 1));
+        assert!(sd_cancel_flag().load(Ordering::SeqCst));
+        assert!(sd_progress_for_run("run-stale-epoch").is_none());
+
+        *super::sd_progress_slot().lock().unwrap() = None;
+        super::sd_pending_cancels().lock().unwrap().clear();
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn pending_cancel_handshake_is_atomic_for_both_gate_orderings() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Barrier};
+
+        fn reset_run_control() {
+            let _gate = sd_spawn_gate().lock().expect("spawn gate");
+            *super::sd_progress_slot().lock().unwrap() = None;
+            super::sd_pending_cancels().lock().unwrap().clear();
+            sd_cancel_flag().store(false, Ordering::SeqCst);
+        }
+
+        let _g = test_global_lock();
+        reset_run_control();
+
+        // Ordering A: cancel owns the gate while progress is absent. Begin is
+        // already attempting admission, but cannot publish until cancel queues
+        // the run id; it must then consume that cancel and refuse the run.
+        {
+            let captured_epoch = sd_runtime_epoch();
+            let cancel_has_gate = Arc::new(Barrier::new(2));
+            let release_cancel = Arc::new(Barrier::new(2));
+            let cancel_has_gate_w = Arc::clone(&cancel_has_gate);
+            let release_cancel_w = Arc::clone(&release_cancel);
+            let cancel = std::thread::spawn(move || {
+                let _gate = sd_spawn_gate().lock().expect("cancel gate");
+                cancel_has_gate_w.wait();
+                release_cancel_w.wait();
+                super::bridge_cancel_sd_under_gate("race-cancel-first")
+            });
+            cancel_has_gate.wait();
+
+            let (attempting_tx, attempting_rx) = mpsc::channel();
+            let begin = std::thread::spawn(move || {
+                attempting_tx.send(()).expect("begin attempt signal");
+                begin_sd_run(captured_epoch, "race-cancel-first", 1)
+            });
+            attempting_rx.recv().expect("begin is attempting admission");
+            release_cancel.wait();
+
+            assert!(cancel.join().expect("cancel thread"));
+            assert!(!begin.join().expect("begin thread"));
+            assert!(sd_cancel_flag().load(Ordering::SeqCst));
+            assert_eq!(
+                sd_progress_for_run("race-cancel-first").map(|progress| progress.phase),
+                Some(SdProgressPhase::Canceled)
+            );
+            assert!(super::sd_pending_cancels().lock().unwrap().is_empty());
+        }
+
+        reset_run_control();
+
+        // Ordering B: begin owns the gate and publishes Preparing before
+        // cancel can inspect state. Cancel must then observe the active run,
+        // revoke its epoch, and commit Canceled instead of enqueueing late.
+        {
+            let captured_epoch = sd_runtime_epoch();
+            let begin_has_gate = Arc::new(Barrier::new(2));
+            let release_begin = Arc::new(Barrier::new(2));
+            let begin_has_gate_w = Arc::clone(&begin_has_gate);
+            let release_begin_w = Arc::clone(&release_begin);
+            let begin = std::thread::spawn(move || {
+                let _gate = sd_spawn_gate().lock().expect("begin gate");
+                begin_has_gate_w.wait();
+                release_begin_w.wait();
+                super::begin_sd_run_under_gate(captured_epoch, "race-begin-first", 1)
+            });
+            begin_has_gate.wait();
+
+            let (attempting_tx, attempting_rx) = mpsc::channel();
+            let cancel = std::thread::spawn(move || {
+                attempting_tx.send(()).expect("cancel attempt signal");
+                bridge_cancel_sd("race-begin-first")
+            });
+            attempting_rx
+                .recv()
+                .expect("cancel is attempting admission");
+            release_begin.wait();
+
+            assert!(begin.join().expect("begin thread"));
+            assert!(cancel.join().expect("cancel thread"));
+            assert!(sd_cancel_flag().load(Ordering::SeqCst));
+            assert_ne!(captured_epoch, sd_runtime_epoch());
+            assert_eq!(
+                sd_progress_for_run("race-begin-first").map(|progress| progress.phase),
+                Some(SdProgressPhase::Canceled)
+            );
+            assert!(super::sd_pending_cancels().lock().unwrap().is_empty());
+        }
+
+        reset_run_control();
+    }
+
+    #[test]
+    fn epoch_mismatch_or_cancel_blocks_spawn_after_reset() {
+        let _g = test_global_lock();
+        let captured = sd_runtime_epoch();
+        assert_eq!(
+            sd_spawn_decision(captured, captured, false),
+            SdSpawnDecision::Allow
+        );
+        assert!(sd_may_spawn(captured, captured, false));
+
+        let advanced = advance_sd_runtime_epoch();
+        assert_ne!(captured, advanced);
+        assert_eq!(
+            sd_spawn_decision(captured, sd_runtime_epoch(), false),
+            SdSpawnDecision::Revoked
+        );
+        assert!(!sd_may_spawn(captured, sd_runtime_epoch(), false));
+        assert_eq!(
+            sd_spawn_decision(advanced, advanced, true),
+            SdSpawnDecision::Canceled
+        );
+    }
+
+    #[test]
+    fn stop_advances_epoch_so_queued_work_cannot_spawn() {
+        let _g = test_global_lock();
+        let before = sd_runtime_epoch();
+        bridge_stop_sd();
+        let after = sd_runtime_epoch();
+        assert_ne!(before, after);
+        assert!(!sd_may_spawn(before, after, false));
+    }
+
+    /// Deterministic barrier covering both gate orderings. Pure
+    /// `sd_spawn_decision` checks are not sufficient: this exercises the real
+    /// spawn-gate + register seam and proves no old-epoch spawn closure runs
+    /// after teardown has returned.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_gate_blocks_stale_epoch_spawn_for_both_orderings() {
+        use super::sd_spawn_and_register_under_gate;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Barrier};
+
+        fn spawn_sleep_child() -> Result<std::process::Child, String> {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| e.to_string())
+        }
+
+        let _g = test_global_lock();
+
+        // Ordering A: teardown wins the gate first. Worker must observe the new
+        // epoch and never invoke spawn_fn after teardown returns.
+        {
+            sd_cancel_flag().store(false, Ordering::SeqCst);
+            *sd_inflight_child().lock().unwrap() = None;
+            let captured = sd_runtime_epoch();
+            let spawned = Arc::new(AtomicBool::new(false));
+            let spawned_flag = Arc::clone(&spawned);
+            bridge_stop_sd();
+            let result = sd_spawn_and_register_under_gate(captured, || {
+                spawned_flag.store(true, Ordering::SeqCst);
+                spawn_sleep_child()
+            })
+            .expect("gate lock");
+            assert_eq!(result, None);
+            assert!(
+                !spawned.load(Ordering::SeqCst),
+                "stale-epoch worker must not call spawn after teardown returned"
+            );
+            assert!(sd_inflight_child().lock().unwrap().is_none());
+        }
+
+        // Ordering B: worker holds the gate across epoch capture → spawn →
+        // register so a concurrent process-global stop cannot revoke the epoch
+        // in the check-to-spawn window. Main calls teardown immediately; it
+        // blocks on the gate, then kills the registered child before returning.
+        {
+            sd_cancel_flag().store(false, Ordering::SeqCst);
+            *sd_inflight_child().lock().unwrap() = None;
+
+            let entered_gate = Arc::new(Barrier::new(2));
+            let entered_gate_w = Arc::clone(&entered_gate);
+            let release_spawn = Arc::new(std::sync::Mutex::new(false));
+            let release_spawn_w = Arc::clone(&release_spawn);
+            let release_cv = Arc::new(std::sync::Condvar::new());
+            let release_cv_w = Arc::clone(&release_cv);
+            let captured_slot = Arc::new(std::sync::Mutex::new(0_u64));
+            let captured_slot_w = Arc::clone(&captured_slot);
+            let spawned = Arc::new(AtomicBool::new(false));
+            let spawned_w = Arc::clone(&spawned);
+
+            let worker = std::thread::spawn(move || {
+                let _gate = sd_spawn_gate().lock().expect("spawn gate");
+                // Capture under the gate and clear cancel so external stops that
+                // already advanced the epoch cannot create a TOCTOU gap before
+                // spawn — they must wait for this gate first.
+                let captured = sd_runtime_epoch();
+                *captured_slot_w.lock().unwrap() = captured;
+                sd_cancel_flag().store(false, Ordering::SeqCst);
+                entered_gate_w.wait();
+                let guard = release_spawn_w.lock().unwrap();
+                let _ = release_cv_w
+                    .wait_timeout_while(guard, std::time::Duration::from_secs(2), |ready| !*ready)
+                    .unwrap();
+                if !sd_may_spawn(
+                    captured,
+                    sd_runtime_epoch(),
+                    sd_cancel_flag().load(Ordering::SeqCst),
+                ) {
+                    return Err("epoch revoked while holding spawn gate".to_string());
+                }
+                spawned_w.store(true, Ordering::SeqCst);
+                let child = spawn_sleep_child()?;
+                *sd_inflight_child()
+                    .lock()
+                    .map_err(|_| "child lock".to_string())? = Some(child);
+                Ok(())
+            });
+
+            entered_gate.wait();
+            {
+                let mut ready = release_spawn.lock().unwrap();
+                *ready = true;
+                release_cv.notify_all();
+            }
+            // Teardown waits for the in-gate worker, then kills before return.
+            bridge_stop_sd();
+            assert!(
+                sd_inflight_child().lock().unwrap().is_none(),
+                "teardown must reap registered child before returning"
+            );
+            worker.join().expect("worker").expect("worker registered");
+            assert!(
+                spawned.load(Ordering::SeqCst),
+                "worker-first ordering must invoke spawn under the gate"
+            );
+
+            let captured = *captured_slot.lock().unwrap();
+            let post_teardown_spawned = Arc::new(AtomicBool::new(false));
+            let spawned = Arc::clone(&post_teardown_spawned);
+            let again = sd_spawn_and_register_under_gate(captured, || {
+                spawned.store(true, Ordering::SeqCst);
+                Err("must-not-spawn".to_string())
+            })
+            .expect("gate");
+            assert_eq!(again, None);
+            assert!(
+                !post_teardown_spawned.load(Ordering::SeqCst),
+                "no old-epoch spawn closure may run after teardown returned"
+            );
+        }
+
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+        *sd_inflight_child().lock().unwrap() = None;
+    }
+
+    /// Worker holds the gate across a slow spawn; teardown blocks until the
+    /// worker registers, then kills before returning — proving teardown waits
+    /// rather than racing past an in-flight spawn closure.
+    #[cfg(unix)]
+    #[test]
+    fn teardown_waits_for_in_gate_worker_then_kills_registered_child() {
+        use super::sd_spawn_and_register_under_gate;
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let _g = test_global_lock();
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+        *sd_inflight_child().lock().unwrap() = None;
+        let captured = sd_runtime_epoch();
+
+        let entered_spawn = Arc::new(Barrier::new(2));
+        let entered_spawn_w = Arc::clone(&entered_spawn);
+        let release_spawn = Arc::new(Mutex::new(false));
+        let release_spawn_w = Arc::clone(&release_spawn);
+        let release_cv = Arc::new(std::sync::Condvar::new());
+        let release_cv_w = Arc::clone(&release_cv);
+
+        let worker = std::thread::spawn(move || {
+            sd_spawn_and_register_under_gate(captured, move || {
+                entered_spawn_w.wait();
+                let guard = release_spawn_w.lock().unwrap();
+                let _ = release_cv_w
+                    .wait_timeout_while(guard, std::time::Duration::from_secs(2), |ready| !*ready)
+                    .unwrap();
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map_err(|e| e.to_string())
+            })
+        });
+
+        entered_spawn.wait();
+        let stopper = std::thread::spawn(|| {
+            bridge_stop_sd();
+        });
+
+        // Give teardown time to block on the gate held by the worker.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !stopper.is_finished(),
+            "teardown must wait while worker holds the spawn gate"
+        );
+
+        {
+            let mut ready = release_spawn.lock().unwrap();
+            *ready = true;
+            release_cv.notify_all();
+        }
+
+        let registered = worker.join().expect("worker").expect("gate");
+        assert_eq!(registered, Some(()));
+        stopper.join().expect("teardown");
+        assert!(
+            sd_inflight_child().lock().unwrap().is_none(),
+            "teardown returns only after killing the registered child"
+        );
+        // Old epoch must remain unspawnable.
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawned_f = Arc::clone(&spawned);
+        let again = sd_spawn_and_register_under_gate(captured, move || {
+            spawned_f.store(true, Ordering::SeqCst);
+            Err("no".into())
+        })
+        .unwrap();
+        assert_eq!(again, None);
+        assert!(!spawned.load(Ordering::SeqCst));
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+    }
+
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be available")
             .as_nanos();
-        std::env::temp_dir().join(format!("lunerylab-sd-{name}-{nonce}"))
+        std::env::temp_dir().join(format!("lunery-sd-{name}-{nonce}"))
     }
 
     #[test]
@@ -1168,6 +1978,12 @@ mod tests {
         let out_root = unique_test_dir("out");
         std::fs::create_dir_all(root.join("sd-cpp")).expect("create model dir");
         std::fs::create_dir_all(&out_root).expect("create out dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out_root, std::fs::Permissions::from_mode(0o700))
+                .expect("secure output dir");
+        }
         let model = root.join("sd-cpp").join("flux2-dev-Q4_K_M.gguf");
         let vae = root
             .join("sd-cpp")
@@ -1191,7 +2007,9 @@ mod tests {
             output.to_string_lossy().to_string(),
         ];
 
-        let out_root_canon = out_root.canonicalize().expect("canonical out root");
+        let out_root_canon = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
         let root_canon = root.canonicalize().expect("canonical model root");
 
         assert!(validate_sd_run_argv(&argv, &out_root_canon, &[root_canon]).is_ok());
@@ -1206,6 +2024,12 @@ mod tests {
         let outside = unique_test_dir("outside");
         std::fs::create_dir_all(root.join("sd-cpp")).expect("create model dir");
         std::fs::create_dir_all(&out_root).expect("create out dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out_root, std::fs::Permissions::from_mode(0o700))
+                .expect("secure output dir");
+        }
         std::fs::create_dir_all(&outside).expect("create outside dir");
         let model = root.join("sd-cpp").join("flux2-dev-Q4_K_M.gguf");
         let vae = outside.join("full_encoder_small_decoder.safetensors");
@@ -1222,12 +2046,43 @@ mod tests {
             output.to_string_lossy().to_string(),
         ];
 
-        let out_root_canon = out_root.canonicalize().expect("canonical out root");
+        let out_root_canon = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
         let root_canon = root.canonicalize().expect("canonical model root");
 
         assert!(validate_sd_run_argv(&argv, &out_root_canon, &[root_canon]).is_err());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(out_root);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sd_output_pin_rejects_before_spawn_symlink_and_preserves_outside_sentinel() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let output_dir = unique_test_dir("symlink-output");
+        let outside = unique_test_dir("outside-sentinel");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+        std::fs::set_permissions(&output_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure output dir");
+        std::fs::write(&outside, b"outside-sentinel").expect("write sentinel");
+        let output = output_dir.join("image-0.png");
+        symlink(&outside, &output).expect("plant output symlink");
+        let argv = vec!["-o".to_string(), output.to_string_lossy().to_string()];
+
+        let error = PinnedSdOutput::pin(&argv).expect_err("symlink must fail closed");
+        assert!(error.contains("reserve SD output safely"));
+        assert_eq!(
+            std::fs::read(&outside).expect("outside sentinel"),
+            b"outside-sentinel"
+        );
+        assert!(std::fs::symlink_metadata(&output)
+            .expect("output symlink remains")
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(&output_dir).expect("remove output fixture");
+        std::fs::remove_file(&outside).expect("remove sentinel");
     }
 }

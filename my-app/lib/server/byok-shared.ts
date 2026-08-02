@@ -221,7 +221,7 @@ export async function readByokKey(providerId: string): Promise<string> {
 // it through the cross-bundle profile revision marker.
 // ---------------------------------------------------------------------------
 
-export type KeychainSecretStatus = "present" | "missing" | "unavailable";
+export type KeychainSecretStatus = "present" | "absent" | "unknown";
 
 export interface DesktopStatusSnapshot {
   providers: Array<{
@@ -306,7 +306,11 @@ export async function fetchConfiguredProviderIds(): Promise<Set<string>> {
         .filter((provider) => provider.configured)
         .map((provider) => provider.id),
     );
+    const hasUnknownPresence = snapshot.providers.some(
+      (provider) => !provider.configured && provider.keychain_status === "unknown",
+    );
     if (
+      !hasUnknownPresence &&
       requestEpoch === configuredProviderIdsEpoch &&
       configuredProviderIdsRevision !== null
     ) {

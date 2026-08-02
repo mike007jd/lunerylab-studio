@@ -32,8 +32,10 @@ vi.mock("@/lib/server/storage", () => ({
 }));
 
 import { POST } from "@/app/api/assets/upload/route";
+import { acquireWorkspaceExclusive, resetWorkspaceOperationGateForTests } from "@/lib/server/workspace-operation-gate";
 
 beforeEach(() => {
+  resetWorkspaceOperationGateForTests();
   vi.clearAllMocks();
   mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
   mocks.resolveOwnedProjectId.mockResolvedValue("project-1");
@@ -82,6 +84,24 @@ beforeEach(() => {
 });
 
 describe("asset upload dimensions", () => {
+  it("returns retryable workspace_busy while restore owns exclusivity", async () => {
+    const exclusive = await acquireWorkspaceExclusive("restore");
+    try {
+      const response = await POST(new NextRequest("http://localhost/api/assets/upload", {
+        method: "POST",
+        body: new FormData(),
+      }));
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "workspace_busy",
+        retryable: true,
+      });
+      expect(mocks.prepareImageFiles).not.toHaveBeenCalled();
+    } finally {
+      exclusive.release();
+    }
+  });
+
   it("persists and returns the decoded 16:9 dimensions", async () => {
     const form = new FormData();
     form.set("projectId", "project-1");

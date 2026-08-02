@@ -32,7 +32,7 @@ export function providerSecretSourceLabel(
   },
 ): string {
   if (runtime?.source === "environment") return copy.env;
-  if (runtime?.keychain_status === "unavailable") return copy.keychainUnavailable;
+  if (runtime?.keychain_status === "unknown") return copy.keychainUnavailable;
   if (runtime?.source === "system-keychain") return copy.keychain;
   if (!statusAvailable && savedSecret) return copy.saved;
   return copy.notConnected;

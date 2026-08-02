@@ -30,6 +30,7 @@ import {
 } from "@/lib/server/reference-assets";
 import {
   beginDetachedVideoWork,
+  runWithDetachedVideoAdmission,
   type DetachedVideoAdmission,
 } from "@/lib/server/workspace-operation-gate";
 
@@ -65,6 +66,7 @@ export async function POST(request: NextRequest) {
   // Admission is acquired only once a new detached job is about to be created.
   // Cached / rejected paths must not leave a lease behind.
   let videoAdmission: DetachedVideoAdmission | null = null;
+  let appStateEnsured = false;
 
   try {
     const user = await requireLocalWorkspaceOwner();
@@ -138,26 +140,31 @@ export async function POST(request: NextRequest) {
 
     // Reject before any job mutation when backup/restore owns exclusivity.
     videoAdmission = beginDetachedVideoWork();
+    const submissionAdmission = videoAdmission;
 
-    const created = await createOrReplayGenerationJob({
-      input: {
+    const created = await runWithDetachedVideoAdmission(submissionAdmission, () =>
+      createOrReplayGenerationJob({
+        input: {
+          userId: user.id,
+          projectId: resolvedProjectId,
+          source: "STUDIO",
+          prompt,
+          referenceCount: referenceImage || refBuffer ? 1 : 0,
+          requestedCount: 1,
+          provider: videoTarget.backend,
+          model: runtimeModelId,
+          type: "video",
+          videoDuration: duration,
+          idempotencyKey,
+          requestFingerprint,
+        },
         userId: user.id,
-        projectId: resolvedProjectId,
-        source: "STUDIO",
-        prompt,
-        referenceCount: referenceImage || refBuffer ? 1 : 0,
-        requestedCount: 1,
-        provider: videoTarget.backend,
-        model: runtimeModelId,
-        type: "video",
-        videoDuration: duration,
-        idempotencyKey,
         requestFingerprint,
-      },
-      userId: user.id,
-      requestFingerprint,
-    });
+      }),
+    );
     if (created.kind === "cached") {
+      await runWithDetachedVideoAdmission(submissionAdmission, ensureAppState);
+      appStateEnsured = true;
       videoAdmission.release();
       videoAdmission = null;
       const cachedJob = created.job;
@@ -175,12 +182,14 @@ export async function POST(request: NextRequest) {
 
     if (referenceImage) {
       refBuffer = (
-        await persistUploadedImageReferenceFiles({
-          projectId: resolvedProjectId,
-          jobId: job.id,
-          files: [referenceImage],
-          userId: user.id,
-        })
+        await runWithDetachedVideoAdmission(submissionAdmission, () =>
+          persistUploadedImageReferenceFiles({
+            projectId: resolvedProjectId,
+            jobId: job.id,
+            files: [referenceImage],
+            userId: user.id,
+          }),
+        )
       )[0]?.bytes;
     }
 
@@ -192,6 +201,9 @@ export async function POST(request: NextRequest) {
         retryable: false,
       });
     }
+
+    await runWithDetachedVideoAdmission(submissionAdmission, ensureAppState);
+    appStateEnsured = true;
 
     const admission = videoAdmission;
     videoAdmission = null;
@@ -231,15 +243,28 @@ export async function POST(request: NextRequest) {
     telemetry.done(response.status);
     return response;
   } catch (error) {
-    videoAdmission?.release();
-    videoAdmission = null;
     if (jobId) {
-      await failRunningGenerationJob({ jobId, error, fallbackCode: "video_generation_failed" });
+      const fail = () =>
+        failRunningGenerationJob({ jobId: jobId!, error, fallbackCode: "video_generation_failed" });
+      if (videoAdmission) {
+        await runWithDetachedVideoAdmission(videoAdmission, fail);
+      } else {
+        await fail();
+      }
     }
 
     telemetry.failed(error);
     return jsonError(error);
   } finally {
-    await ensureAppState();
+    try {
+      if (!appStateEnsured) {
+        if (videoAdmission) {
+          await runWithDetachedVideoAdmission(videoAdmission, ensureAppState);
+        }
+      }
+    } finally {
+      videoAdmission?.release();
+      videoAdmission = null;
+    }
   }
 }

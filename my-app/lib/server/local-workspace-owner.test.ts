@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   ensureWorkspaceRestoreReconciled: vi.fn(),
   reconcileStagedStoredFileDeletions: vi.fn(),
   reconcileExternalModelDeleteJournals: vi.fn(),
+  reconcileStagedManagedModelFiles: vi.fn(),
   assetFindMany: vi.fn(),
   isDesktopRuntime: vi.fn(),
 }));
@@ -39,8 +40,14 @@ vi.mock("@/lib/server/storage", () => ({
 vi.mock("@/lib/server/imported-model-registry", () => ({
   reconcileExternalModelDeleteJournals: mocks.reconcileExternalModelDeleteJournals,
 }));
+vi.mock("@/lib/server/local-model-files", () => ({
+  reconcileStagedManagedModelFiles: mocks.reconcileStagedManagedModelFiles,
+}));
+vi.mock("@/lib/server/workspace-initialization-lock", () => ({
+  withWorkspaceInitializationLock: (work: () => Promise<unknown>) => work(),
+}));
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
   mocks.isDesktopRuntime.mockReturnValue(true);
@@ -48,8 +55,13 @@ beforeEach(() => {
   mocks.ensureWorkspaceRestoreReconciled.mockResolvedValue(undefined);
   mocks.reconcileStagedStoredFileDeletions.mockResolvedValue(undefined);
   mocks.reconcileExternalModelDeleteJournals.mockResolvedValue(undefined);
+  mocks.reconcileStagedManagedModelFiles.mockResolvedValue(0);
   mocks.assetFindMany.mockResolvedValue([]);
   mocks.userCreate.mockResolvedValue({ id: "owner" });
+  const { resetLocalWorkspaceOwnerForTests } = await import(
+    "@/lib/server/local-workspace-owner"
+  );
+  resetLocalWorkspaceOwnerForTests();
 });
 
 afterEach(() => {
@@ -67,6 +79,7 @@ describe("local workspace owner initialization", () => {
 
     expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
     expect(mocks.reconcileExternalModelDeleteJournals).toHaveBeenCalledTimes(1);
+    expect(mocks.reconcileStagedManagedModelFiles).toHaveBeenCalledTimes(1);
     expect(mocks.userCreate).toHaveBeenCalledTimes(1);
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledWith(LOCAL_WORKSPACE_OWNER.id);
   });
@@ -99,10 +112,42 @@ describe("local workspace owner initialization", () => {
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledTimes(1);
   });
 
-  it("reconciles restore state before any owner bootstrap query", async () => {
+  it("shares the first-boot single-flight across module instances in one isolate", async () => {
+    const reconciliation = { release: null as (() => void) | null };
+    mocks.ensureWorkspaceRestoreReconciled.mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        reconciliation.release = resolve;
+      }),
+    );
+    mocks.userFindUnique.mockResolvedValue({ id: "owner" });
+    const firstModule = await import("@/lib/server/local-workspace-owner");
+
+    const firstInitialization = firstModule.ensureLocalWorkspaceOwner();
+    await vi.waitFor(() => {
+      expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
+    });
+    vi.resetModules();
+    const secondModule = await import("@/lib/server/local-workspace-owner");
+    const secondInitialization = secondModule.ensureLocalWorkspaceOwner();
+
+    expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
+    reconciliation.release?.();
+    await Promise.all([firstInitialization, secondInitialization]);
+    expect(mocks.userFindUnique).toHaveBeenCalledTimes(1);
+    expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles restore and managed deletes before external deletes and owner queries", async () => {
     const order: string[] = [];
     mocks.ensureWorkspaceRestoreReconciled.mockImplementation(async () => {
-      order.push("reconcile");
+      order.push("restore");
+    });
+    mocks.reconcileStagedManagedModelFiles.mockImplementation(async () => {
+      order.push("managed-delete");
+      return 0;
+    });
+    mocks.reconcileExternalModelDeleteJournals.mockImplementation(async () => {
+      order.push("external-delete");
     });
     mocks.userFindUnique.mockImplementation(async () => {
       order.push("owner-query");
@@ -112,7 +157,7 @@ describe("local workspace owner initialization", () => {
 
     await ensureLocalWorkspaceOwner();
 
-    expect(order).toEqual(["reconcile", "owner-query"]);
+    expect(order).toEqual(["restore", "managed-delete", "external-delete", "owner-query"]);
   });
 
   it("reconciles staged file deletions against current asset references", async () => {

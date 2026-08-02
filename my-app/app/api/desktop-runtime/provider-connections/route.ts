@@ -10,7 +10,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { requireDesktopBridge } from "@/lib/server/desktop-bridge";
 import { parseJsonBody } from "@/lib/server/http-validation";
-import { jsonError } from "@/lib/server/errors";
+import { ApiError, jsonError } from "@/lib/server/errors";
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import {
   byokModelInputRoles,
@@ -25,6 +25,16 @@ import {
   listByokConnectionMeta,
   setByokConnectionMeta,
 } from "@/lib/server/byok-connection-store";
+import {
+  clearDefaultsOwnedByProvider,
+  restoreClearedProviderDefaults,
+} from "@/lib/server/clear-provider-defaults";
+import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
+import {
+  withSharedWorkspaceRead,
+  withWorkspaceExclusive,
+} from "@/lib/server/workspace-operation-gate";
+import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
 
 export const dynamic = "force-dynamic";
 
@@ -43,15 +53,23 @@ const providerConnectionDeleteSchema = z.object({
 }).strict();
 
 export async function GET() {
-  const bridge = requireDesktopBridge();
-  if (bridge instanceof NextResponse) return bridge;
-  return NextResponse.json({ connections: listByokConnectionMeta() });
+  try {
+    const bridge = requireDesktopBridge();
+    if (bridge instanceof NextResponse) return bridge;
+    await ensureWorkspaceRestoreReconciled();
+    return await withSharedWorkspaceRead(async () =>
+      NextResponse.json({ connections: listByokConnectionMeta() }),
+    );
+  } catch (error) {
+    return jsonError(error);
+  }
 }
 
 export async function POST(request: NextRequest) {
   try {
     const bridge = requireDesktopBridge();
     if (bridge instanceof NextResponse) return bridge;
+    await ensureWorkspaceRestoreReconciled();
 
     const body = await parseJsonBody(request, providerConnectionPostSchema);
 
@@ -93,7 +111,7 @@ export async function POST(request: NextRequest) {
     }
 
     try {
-      setByokConnectionMeta(providerId, {
+      await setByokConnectionMeta(providerId, {
         endpoint: endpointCheck.url,
         ...(hasModel ? { models } : {}),
         updatedAt: new Date().toISOString(),
@@ -125,9 +143,32 @@ export async function DELETE(request: NextRequest) {
         { status: 404 },
       );
     }
+    await ensureWorkspaceRestoreReconciled();
     const { providerId } = await parseJsonBody(request, providerConnectionDeleteSchema);
-    deleteByokConnectionMeta(providerId);
-    return NextResponse.json({ ok: true });
+    const user = await requireLocalWorkspaceOwner();
+    // Provider unlink is rare and must drain every in-flight settings/config
+    // writer. Exclusive ownership prevents a validated settings PATCH from
+    // reviving this provider's default after the unlink returns.
+    const clearedDefaults = await withWorkspaceExclusive("provider-unlink", async () => {
+      const cleared = await clearDefaultsOwnedByProvider(user.id, providerId);
+      try {
+        await deleteByokConnectionMeta(providerId);
+      } catch (error) {
+        try {
+          await restoreClearedProviderDefaults(user.id, cleared);
+        } catch {
+          throw new ApiError({
+            status: 500,
+            code: "provider_unlink_rollback_failed",
+            message: "Provider unlink failed and its defaults could not be restored.",
+            retryable: false,
+          });
+        }
+        throw error;
+      }
+      return cleared;
+    });
+    return NextResponse.json({ ok: true, clearedDefaults: clearedDefaults.cleared });
   } catch (error) {
     return jsonError(error);
   }

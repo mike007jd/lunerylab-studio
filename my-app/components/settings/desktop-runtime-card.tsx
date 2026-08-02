@@ -215,7 +215,7 @@ function DesktopRuntimeCardContent({
             ...provider,
             configured,
             source: nextSource,
-            keychain_status: configured ? "present" : "missing",
+            keychain_status: configured ? "present" : "absent",
           };
         }),
       };

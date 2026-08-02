@@ -54,10 +54,12 @@ without passing its key through a platform gateway.
 
 **[Get the latest desktop release](https://github.com/mike007jd/lunerylab-studio/releases/latest)**
 
-Public builds are available for Apple Silicon macOS and x64 Windows:
+Public builds are currently available for Apple Silicon macOS:
 
 - macOS — `Lunery-Lab-Studio-macOS-arm64.dmg`, signed and notarized
-- Windows — `Lunery-Lab-Studio-Windows-x64.exe`, CPU inference
+
+Windows distribution is paused until its profile filesystem and local-engine
+paths have reparse-point-safe implementations and dedicated acceptance coverage.
 
 Every release includes `SHA256SUMS.txt` so the installer can be verified before
 opening it. Studio stores its workspace at `~/.lunerylab/studio`; local models

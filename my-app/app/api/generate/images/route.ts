@@ -43,6 +43,7 @@ import {
 import { finishSdProgress, resolveSdRunId } from "@/lib/server/sd-progress";
 import { generationAssetProvenance } from "@/lib/generation-parameters";
 import { resolveImageAdvancedParameters } from "@/lib/image-models";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 function toJobPayload(job: {
   id: string;
@@ -110,6 +111,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const user = await requireLocalWorkspaceOwner();
+    return await withSharedMutationLease(async () => {
 
     assertRequestContentLength(request.headers, getMaxUploadBytesPerFile() * 4 + 128 * 1024);
     const formData = await parseFormData(request);
@@ -272,62 +274,66 @@ export async function POST(request: NextRequest) {
     });
     assertGenerationRequestActive(request);
 
-    // Write images to storage first (I/O), then batch-create DB records. The
-    // batch is all-or-nothing for cleanup: a partial write failure deletes the
-    // images that already landed instead of orphaning them.
-    const storedImages = await writeFilesOrCleanup(
-      generation.images.map(
-        (image) => () =>
-          writeGeneratedImage({ bytes: image.bytes, projectId: projectId || undefined }),
-      ),
-    );
-    if (request.signal.aborted) {
-      await deleteStoredFiles(storedImages.map((stored) => stored.storagePath));
-      assertGenerationRequestActive(request);
-    }
-
-    // Asset creation AND the job's terminal state commit in the same
-    // transaction, so we can never end up with successful assets attached to a
-    // FAILED job (or a SUCCEEDED job with no assets). Files are deleted if the
-    // transaction rolls back.
-    const { createdAssets, updatedJob } = await withAssetWriteTransaction(async (tx) => {
-      assertGenerationRequestActive(request);
-      const assets = await Promise.all(
-        storedImages.map((stored, index) =>
-          tx.asset.create({
-            data: {
-              userId: user.id,
-              projectId: projectId || undefined,
-              jobId: job.id,
-              kind: "GENERATED",
-              storagePath: stored.storagePath,
-              mimeType: stored.mimeType,
-              byteSize: stored.byteSize,
-              width: stored.width,
-              height: stored.height,
-              ...generationAssetProvenance(
-                generation.images[index]?.generationParameters,
-                generation.model,
-              ),
-            },
-          }),
+    // One shared lease covers file writes + Asset/job commit so destructive
+    // reconcile/restore cannot delete in-flight generation outputs.
+    const { createdAssets, updatedJob } = await withSharedMutationLease(async () => {
+      // Write images to storage first (I/O), then batch-create DB records. The
+      // batch is all-or-nothing for cleanup: a partial write failure deletes the
+      // images that already landed instead of orphaning them.
+      const storedImages = await writeFilesOrCleanup(
+        generation.images.map(
+          (image) => () =>
+            writeGeneratedImage({ bytes: image.bytes, projectId: projectId || undefined }),
         ),
       );
-      assertGenerationRequestActive(request);
-      const completed = await completeGenerationJob({
-        jobId: job.id,
-        model: generation.model,
-        provider: generation.provider,
-        endpoint: generation.endpoint,
-        successCount: assets.length,
-        requestedCount: count,
-        emptyResultMessage: `${generation.provider} returned no generated images.`,
-        client: tx,
+      if (request.signal.aborted) {
+        await deleteStoredFiles(storedImages.map((stored) => stored.storagePath));
+        assertGenerationRequestActive(request);
+      }
+
+      // Asset creation AND the job's terminal state commit in the same
+      // transaction, so we can never end up with successful assets attached to a
+      // FAILED job (or a SUCCEEDED job with no assets). Files are deleted if the
+      // transaction rolls back.
+      return withAssetWriteTransaction(async (tx) => {
+        assertGenerationRequestActive(request);
+        const assets = await Promise.all(
+          storedImages.map((stored, index) =>
+            tx.asset.create({
+              data: {
+                userId: user.id,
+                projectId: projectId || undefined,
+                jobId: job.id,
+                kind: "GENERATED",
+                storagePath: stored.storagePath,
+                mimeType: stored.mimeType,
+                byteSize: stored.byteSize,
+                width: stored.width,
+                height: stored.height,
+                ...generationAssetProvenance(
+                  generation.images[index]?.generationParameters,
+                  generation.model,
+                ),
+              },
+            }),
+          ),
+        );
+        assertGenerationRequestActive(request);
+        const completed = await completeGenerationJob({
+          jobId: job.id,
+          model: generation.model,
+          provider: generation.provider,
+          endpoint: generation.endpoint,
+          successCount: assets.length,
+          requestedCount: count,
+          emptyResultMessage: `${generation.provider} returned no generated images.`,
+          client: tx,
+        });
+        return { createdAssets: assets, updatedJob: completed };
+      }).catch(async (error) => {
+        await deleteStoredFiles(storedImages.map((stored) => stored.storagePath));
+        throw error;
       });
-      return { createdAssets: assets, updatedJob: completed };
-    }).catch(async (error) => {
-      await deleteStoredFiles(storedImages.map((stored) => stored.storagePath));
-      throw error;
     });
 
     const response = generationResponse({
@@ -337,7 +343,8 @@ export async function POST(request: NextRequest) {
     });
     await finishSdProgress(runId, "completed");
     telemetry.done(response.status);
-    return response;
+      return response;
+    });
   } catch (error) {
     if (runId) {
       const canceled =
@@ -351,6 +358,8 @@ export async function POST(request: NextRequest) {
     telemetry.failed(error);
     return jsonError(error);
   } finally {
-    await ensureAppState();
+    // No job exists when shared admission was rejected (restore/exclusive
+    // pending). Do not run a warmup write outside the lease in that path.
+    if (jobId) await ensureAppState();
   }
 }

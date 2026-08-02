@@ -66,15 +66,21 @@ import {
   beginDetachedVideoWork,
   getWorkspaceOperationGateStateForTests,
   resetWorkspaceOperationGateForTests,
+  withSharedMutationLeaseSync,
 } from "@/lib/server/workspace-operation-gate";
 import {
   buildExpectedRestoreSwaps,
+  ensureWorkspaceRestoreReconciled,
   reconcileWorkspaceRestoreState,
   resetWorkspaceRestoreReconcileForTests,
   restoreJournalPath,
   writeRestoreJournal,
 } from "@/lib/server/workspace-restore-journal";
 import { createHash } from "node:crypto";
+import {
+  nativePrepareWorkspaceRestore,
+  resetNativeProfileFsRestoreForTests,
+} from "@/lib/server/native-profile-fs";
 
 let testRoot = "";
 
@@ -83,6 +89,7 @@ beforeEach(async () => {
   for (const key of Object.keys(mocks.models)) delete mocks.models[key];
   resetWorkspaceOperationGateForTests();
   resetWorkspaceRestoreReconcileForTests();
+  resetNativeProfileFsRestoreForTests();
   mocks.getStoredFileMetadata.mockResolvedValue({
     byteSize: 0,
     mimeType: "application/octet-stream",
@@ -91,6 +98,8 @@ beforeEach(async () => {
   vi.stubEnv("LUNERY_CONFIG_DIR", path.join(testRoot, "config"));
   vi.stubEnv("LUNERY_MEDIA_DIR", path.join(testRoot, "media"));
   vi.stubEnv("LUNERY_DATA_DIR", path.join(testRoot, "data"));
+  await fs.mkdir(path.join(testRoot, "config"));
+  await fs.mkdir(path.join(testRoot, "media"));
   // $transaction passes a tx that proxies to the same per-model mocks.
   mocks.transaction.mockImplementation(async (fn: (tx: unknown) => unknown) => {
     const txHandler = {
@@ -106,6 +115,7 @@ beforeEach(async () => {
 afterEach(async () => {
   resetWorkspaceOperationGateForTests();
   resetWorkspaceRestoreReconcileForTests();
+  resetNativeProfileFsRestoreForTests();
   vi.unstubAllEnvs();
   await fs.rm(testRoot, { recursive: true, force: true });
 });
@@ -436,33 +446,45 @@ describe("restoreWorkspaceBackup", () => {
 });
 
 describe("workspace operation gate", () => {
-  it("rejects backup while a detached video job holds admission", async () => {
+  it("drains detached video admission before backup starts", async () => {
     const admission = beginDetachedVideoWork();
-    await expect(exportWorkspaceBackup("2026-07-15T00:00:00.000Z")).rejects.toMatchObject({
-      status: 409,
-      code: "workspace_busy",
+    let backupStarted = false;
+    const backupPromise = exportWorkspaceBackup("2026-07-15T00:00:00.000Z").then((result) => {
+      backupStarted = true;
+      return result;
     });
+    await Promise.resolve();
+    expect(backupStarted).toBe(false);
     expect(mocks.transaction).not.toHaveBeenCalled();
     admission.release();
+    await expect(backupPromise).resolves.toBeTruthy();
+    expect(mocks.transaction).toHaveBeenCalled();
   });
 
-  it("rejects restore while a detached video job holds admission", async () => {
+  it("drains detached video admission before restore starts", async () => {
     const admission = beginDetachedVideoWork();
-    await expect(restoreWorkspaceBackup(goodBackup(), { confirm: true })).rejects.toMatchObject({
-      status: 409,
-      code: "workspace_busy",
+    let restoreStarted = false;
+    const restorePromise = restoreWorkspaceBackup(goodBackup(), { confirm: true }).then((result) => {
+      restoreStarted = true;
+      return result;
     });
+    await Promise.resolve();
+    expect(restoreStarted).toBe(false);
     expect(mocks.transaction).not.toHaveBeenCalled();
     admission.release();
+    await expect(restorePromise).resolves.toBeTruthy();
+    expect(mocks.transaction).toHaveBeenCalled();
   });
 
   it("rejects new video admission while backup owns exclusivity", async () => {
-    const release = acquireWorkspaceExclusive("backup");
+    const { release } = await acquireWorkspaceExclusive("backup");
     expect(() => beginDetachedVideoWork()).toThrow(
       expect.objectContaining({ status: 409, code: "workspace_busy" }),
     );
     expect(getWorkspaceOperationGateStateForTests()).toEqual({
       exclusive: "backup",
+      exclusivePending: true,
+      sharedCount: 0,
       activeVideoCount: 0,
     });
     release();
@@ -473,6 +495,8 @@ describe("workspace operation gate", () => {
     await expect(exportWorkspaceBackup("2026-07-15T00:00:00.000Z")).rejects.toThrow("export failed");
     expect(getWorkspaceOperationGateStateForTests()).toEqual({
       exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
       activeVideoCount: 0,
     });
     await expect(exportWorkspaceBackup("2026-07-15T00:00:00.000Z")).resolves.toBeTruthy();
@@ -480,6 +504,21 @@ describe("workspace operation gate", () => {
 });
 
 describe("restore crash reconciliation", () => {
+  async function replaceDirectoryWithFixture(
+    target: string,
+    relativeFile: string,
+    contents: string,
+  ): Promise<void> {
+    const replacement = `${target}.test-replacement`;
+    await fs.rm(replacement, { recursive: true, force: true });
+    await fs.mkdir(path.dirname(path.join(replacement, relativeFile)), { recursive: true });
+    await fs.writeFile(path.join(replacement, relativeFile), contents);
+    // Allocate the replacement before removing the target so its inode cannot
+    // be recycled from the directory whose durable identity is under test.
+    await fs.rm(target, { recursive: true, force: true });
+    await fs.rename(replacement, target);
+  }
+
   async function seedPromotedTrees(token: string) {
     const expected = buildExpectedRestoreSwaps(token);
     const media = expected[0]!;
@@ -492,10 +531,30 @@ describe("restore crash reconciliation", () => {
     await fs.writeFile(path.join(config.root, "new.json"), "new-config");
     await fs.writeFile(path.join(media.previous, "generated/old.png"), "old-media");
     await fs.writeFile(path.join(config.previous, "old.json"), "old-config");
+    const [mediaOriginal, configOriginal, mediaStaged, configStaged] = await Promise.all([
+      fs.lstat(media.previous, { bigint: true }),
+      fs.lstat(config.previous, { bigint: true }),
+      fs.lstat(media.root, { bigint: true }),
+      fs.lstat(config.root, { bigint: true }),
+    ]);
     return {
       swaps: [
-        { ...media, previousExisted: true },
-        { ...config, previousExisted: true },
+        {
+          ...media,
+          previousExisted: true,
+          originalDevice: mediaOriginal.dev.toString(),
+          originalInode: mediaOriginal.ino.toString(),
+          stagedDevice: mediaStaged.dev.toString(),
+          stagedInode: mediaStaged.ino.toString(),
+        },
+        {
+          ...config,
+          previousExisted: true,
+          originalDevice: configOriginal.dev.toString(),
+          originalInode: configOriginal.ino.toString(),
+          stagedDevice: configStaged.dev.toString(),
+          stagedInode: configStaged.ino.toString(),
+        },
       ],
     };
   }
@@ -527,6 +586,75 @@ describe("restore crash reconciliation", () => {
     expect(await fs.readFile(path.join(testRoot, "media/generated/old.png"), "utf8")).toBe("old-media");
   });
 
+  it("rejects a replaced durable previous root before mutating either live root", async () => {
+    const token = "crash-previous-replaced";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await replaceDirectoryWithFixture(
+      swaps[0]!.previous,
+      "generated/replacement.png",
+      "replacement",
+    );
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
+
+    await expect(reconcileWorkspaceRestoreState()).rejects.toThrow(
+      "previous root identity changed",
+    );
+
+    expect(await fs.readFile(path.join(testRoot, "config/new.json"), "utf8")).toBe("new-config");
+    expect(await fs.readFile(path.join(swaps[1]!.previous, "old.json"), "utf8")).toBe("old-config");
+    expect(
+      await fs.readFile(path.join(swaps[0]!.previous, "generated/replacement.png"), "utf8"),
+    ).toBe("replacement");
+    await expect(fs.access(restoreJournalPath())).resolves.toBeUndefined();
+  });
+
+  it("holds startup crash reconciliation exclusively before sync config writes", async () => {
+    const token = "startup-crash-barrier";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    mocks.models.workspaceRestoreCommit = makeModel();
+    let releaseCommitProbe!: () => void;
+    const commitProbeMayFinish = new Promise<void>((resolve) => {
+      releaseCommitProbe = resolve;
+    });
+    mocks.models.workspaceRestoreCommit.findUnique.mockImplementation(async () => {
+      await commitProbeMayFinish;
+      return null;
+    });
+
+    const recovery = ensureWorkspaceRestoreReconciled();
+    await vi.waitFor(() => {
+      expect(getWorkspaceOperationGateStateForTests()).toMatchObject({
+        exclusive: "destructive-reconcile",
+        exclusivePending: true,
+      });
+    });
+    expect(() => withSharedMutationLeaseSync(() => undefined)).toThrow(
+      expect.objectContaining({ code: "workspace_busy", retryable: true }),
+    );
+
+    releaseCommitProbe();
+    await recovery;
+    expect(await fs.readFile(path.join(testRoot, "config/old.json"), "utf8")).toBe("old-config");
+    expect(getWorkspaceOperationGateStateForTests()).toMatchObject({
+      exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
+    });
+  });
+
   it("keeps new roots and finishes cleanup when the commit marker matches the journal", async () => {
     const token = "crash-committed";
     const { swaps } = await seedPromotedTrees(token);
@@ -546,6 +674,117 @@ describe("restore crash reconciliation", () => {
     await expect(fs.access(swaps[0]!.previous)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.access(restoreJournalPath())).rejects.toMatchObject({ code: "ENOENT" });
     expect(mocks.models.workspaceRestoreCommit.deleteMany).toHaveBeenCalled();
+  });
+
+  it("preserves a replacement of a committed promoted root across cold reconciliation", async () => {
+    const token = "crash-committed-live-replaced";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await replaceDirectoryWithFixture(
+      swaps[0]!.root,
+      "replacement/keep.txt",
+      "replacement",
+    );
+    resetNativeProfileFsRestoreForTests();
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue({ token });
+
+    await expect(reconcileWorkspaceRestoreState()).rejects.toThrow(
+      "promoted root identity changed",
+    );
+
+    expect(await fs.readFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "utf8"))
+      .toBe("replacement");
+    expect(await fs.readFile(path.join(swaps[1]!.root, "new.json"), "utf8"))
+      .toBe("new-config");
+    await expect(fs.access(swaps[0]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(swaps[1]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(restoreJournalPath())).resolves.toBeUndefined();
+    expect(mocks.models.workspaceRestoreCommit.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("preserves both roots and recovery material on an uncommitted cold live replacement", async () => {
+    const token = "crash-uncommitted-live-replaced";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await replaceDirectoryWithFixture(
+      swaps[0]!.root,
+      "replacement/keep.txt",
+      "replacement",
+    );
+    resetNativeProfileFsRestoreForTests();
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
+
+    await expect(reconcileWorkspaceRestoreState()).rejects.toThrow(
+      "live root identity changed during rollback",
+    );
+
+    expect(await fs.readFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "utf8"))
+      .toBe("replacement");
+    expect(await fs.readFile(path.join(swaps[1]!.root, "new.json"), "utf8"))
+      .toBe("new-config");
+    await expect(fs.access(swaps[0]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(swaps[1]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(restoreJournalPath())).resolves.toBeUndefined();
+  });
+
+  it("cleans only empty unattested stages after a cold prepare-window crash", async () => {
+    const token = "crash-before-stage-attestation";
+    const expected = buildExpectedRestoreSwaps(token);
+    const [mediaOriginal, configOriginal] = await Promise.all([
+      fs.lstat(expected[0]!.root, { bigint: true }),
+      fs.lstat(expected[1]!.root, { bigint: true }),
+    ]);
+    const swaps = [
+      {
+        ...expected[0]!,
+        previousExisted: true,
+        originalDevice: mediaOriginal.dev.toString(),
+        originalInode: mediaOriginal.ino.toString(),
+        stagedDevice: null,
+        stagedInode: null,
+      },
+      {
+        ...expected[1]!,
+        previousExisted: true,
+        originalDevice: configOriginal.dev.toString(),
+        originalInode: configOriginal.ino.toString(),
+        stagedDevice: null,
+        stagedInode: null,
+      },
+    ];
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await nativePrepareWorkspaceRestore(token, {
+      media: { device: swaps[0]!.originalDevice, inode: swaps[0]!.originalInode },
+      config: { device: swaps[1]!.originalDevice, inode: swaps[1]!.originalInode },
+    });
+    resetNativeProfileFsRestoreForTests();
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
+
+    await reconcileWorkspaceRestoreState();
+
+    await expect(fs.access(swaps[0]!.staged)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(swaps[1]!.staged)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(restoreJournalPath())).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(swaps[0]!.root)).resolves.toBeUndefined();
+    await expect(fs.access(swaps[1]!.root)).resolves.toBeUndefined();
   });
 
   it("fails closed and preserves recovery material when a committed root is missing", async () => {
@@ -585,14 +824,34 @@ describe("restore crash reconciliation", () => {
     await fs.writeFile(path.join(media.previous, "generated/old.png"), "old-media");
     await fs.writeFile(path.join(config.root, "old.json"), "old-config");
     await fs.writeFile(path.join(config.staged, "new.json"), "new-config");
+    const [mediaOriginal, configOriginal, mediaStaged, configStaged] = await Promise.all([
+      fs.lstat(media.previous, { bigint: true }),
+      fs.lstat(config.root, { bigint: true }),
+      fs.lstat(media.root, { bigint: true }),
+      fs.lstat(config.staged, { bigint: true }),
+    ]);
 
     await writeRestoreJournal({
       format: "lunery-workspace-restore-journal",
       version: 1,
       token,
       swaps: [
-        { ...media, previousExisted: true },
-        { ...config, previousExisted: true },
+        {
+          ...media,
+          previousExisted: true,
+          originalDevice: mediaOriginal.dev.toString(),
+          originalInode: mediaOriginal.ino.toString(),
+          stagedDevice: mediaStaged.dev.toString(),
+          stagedInode: mediaStaged.ino.toString(),
+        },
+        {
+          ...config,
+          previousExisted: true,
+          originalDevice: configOriginal.dev.toString(),
+          originalInode: configOriginal.ino.toString(),
+          stagedDevice: configStaged.dev.toString(),
+          stagedInode: configStaged.ino.toString(),
+        },
       ],
     });
     mocks.models.workspaceRestoreCommit = makeModel();

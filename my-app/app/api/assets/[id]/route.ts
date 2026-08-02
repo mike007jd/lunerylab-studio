@@ -12,6 +12,7 @@ import { restoreBundledSampleAssetStorage } from "@/lib/server/sample-projects";
 import { purgeAssets } from "@/lib/server/asset-purge";
 import { toAssetDTO } from "@/lib/server/dto";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
+import { withSharedWorkspaceRead } from "@/lib/server/workspace-operation-gate";
 
 interface Params {
   params: Promise<{ id: string }>;
@@ -215,6 +216,7 @@ export async function DELETE(request: NextRequest, { params }: Params) {
 export async function GET(_request: NextRequest, { params }: Params) {
   try {
     const user = await requireLocalWorkspaceOwner();
+    return await withSharedWorkspaceRead(async () => {
     const { id } = await params;
 
     const asset = await prisma.asset.findUnique({
@@ -279,7 +281,8 @@ export async function GET(_request: NextRequest, { params }: Params) {
     }
 
     const { stream } = await streamStoredFile(asset.storagePath);
-    return new NextResponse(stream, { headers });
+      return new NextResponse(stream, { headers });
+    });
   } catch (error) {
     return jsonError(error);
   }

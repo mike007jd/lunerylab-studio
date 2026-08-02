@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
@@ -26,8 +26,14 @@ vi.mock("@/lib/server/storage", () => ({
 }));
 
 import { purgeAssets } from "@/lib/server/asset-purge";
+import {
+  getWorkspaceOperationGateStateForTests,
+  resetWorkspaceOperationGateForTests,
+  withWorkspaceExclusive,
+} from "@/lib/server/workspace-operation-gate";
 
 beforeEach(() => {
+  resetWorkspaceOperationGateForTests();
   vi.clearAllMocks();
   mocks.deleteMany.mockResolvedValue({ count: 0 });
   mocks.stageStoredFileDeletion.mockImplementation(async (storagePath: string) => ({
@@ -37,6 +43,10 @@ beforeEach(() => {
   }));
   mocks.rollbackStoredFileDeletion.mockResolvedValue(undefined);
   mocks.commitStoredFileDeletion.mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  resetWorkspaceOperationGateForTests();
 });
 
 describe("purgeAssets", () => {
@@ -151,5 +161,46 @@ describe("purgeAssets", () => {
     // Reference reconciliation is now handled by the join table's onDelete
     // Cascade FK — purge just removes the asset rows.
     expect(mocks.deleteMany).toHaveBeenCalledWith({ where: { id: { in: ["a1"] }, userId: "user-1" } });
+  });
+
+  it("holds one shared lease from file staging through row deletion and file commit", async () => {
+    mocks.findMany.mockResolvedValueOnce([
+      { id: "a1", storagePath: "generated/a1.png", byteSize: 10 },
+    ]);
+    mocks.findMany.mockResolvedValueOnce([]);
+    let releaseStage!: () => void;
+    let stageStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      stageStarted = resolve;
+    });
+    mocks.stageStoredFileDeletion.mockImplementationOnce(async (storagePath: string) => {
+      stageStarted();
+      await new Promise<void>((resolve) => {
+        releaseStage = resolve;
+      });
+      return {
+        storagePath,
+        stagedStoragePath: `${storagePath}.lunery-purge`,
+        hadFile: true,
+      };
+    });
+
+    const purge = purgeAssets("user-1", ["a1"]);
+    await started;
+    let exclusiveEntered = false;
+    const exclusive = withWorkspaceExclusive("backup", async () => {
+      exclusiveEntered = true;
+    });
+    await vi.waitFor(() => {
+      expect(getWorkspaceOperationGateStateForTests().exclusivePending).toBe(true);
+    });
+    expect(exclusiveEntered).toBe(false);
+
+    releaseStage();
+    await purge;
+    expect(mocks.deleteMany).toHaveBeenCalledOnce();
+    expect(mocks.commitStoredFileDeletion).toHaveBeenCalledOnce();
+    await exclusive;
+    expect(exclusiveEntered).toBe(true);
   });
 });

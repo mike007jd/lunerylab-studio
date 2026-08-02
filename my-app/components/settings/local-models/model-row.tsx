@@ -306,7 +306,12 @@ function ModelRowImpl({
               {copy.stateLabels.downloading}
             </Button>
           ) : effectiveState === "downloading" ? (
-            <Button type="button" size="sm" variant="ghostMuted" onClick={() => void dl.cancel()}>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghostMuted"
+              onClick={() => void dl.cancel().catch(() => {})}
+            >
               <X className="h-3 w-3" />
               {copy.actionCancel}
             </Button>

@@ -25,6 +25,7 @@ import { fetchConfiguredProviderIds } from "@/lib/server/byok-shared";
 import { selectConfiguredModel3dProvider } from "@/lib/server/model3d-provider-selection";
 import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
 import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 async function pickModel3dProvider(): Promise<string | null> {
   const [connections, configuredProviderIds] = await Promise.all([
@@ -54,6 +55,7 @@ export function buildGenerate3dTool(ctx: AgentToolContext): Tool {
         .describe("Override the BYOK provider id."),
     }),
     async execute({ layerId, prompt, format, providerId }) {
+      return withSharedMutationLease(async () => {
       const startedAt = new Date().toISOString();
       const stepId = randomUUID();
       let jobId: string | null = null;
@@ -189,6 +191,7 @@ export function buildGenerate3dTool(ctx: AgentToolContext): Tool {
         });
         return { ok: false, error: message.slice(0, 400) };
       }
+      });
     },
   });
 }

@@ -242,18 +242,45 @@ fn bridge_mlx_engine_root() -> Result<PathBuf, String> {
 /// MLX first start may download a multi-GB model, so the deadline is generous
 /// (the bridge handler runs on a detached per-connection thread; the Next
 /// /api/desktop-runtime/mlx POST is expected to be slow on first activate).
-fn wait_for_port_long(port: u16, max_secs: u64) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadinessOutcome {
+    Ready,
+    TimedOut,
+    Superseded,
+}
+
+fn wait_for_port_long(epoch: u64, port: u16, max_secs: u64) -> ReadinessOutcome {
     let deadline = Instant::now() + Duration::from_secs(max_secs);
     let mut backoff = Duration::from_millis(200);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return true;
+        if MLX_LIFECYCLE.current_epoch() != epoch {
+            return ReadinessOutcome::Superseded;
         }
-        thread::sleep(backoff);
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return if MLX_LIFECYCLE.current_epoch() == epoch {
+                ReadinessOutcome::Ready
+            } else {
+                ReadinessOutcome::Superseded
+            };
+        }
+        let sleep_deadline = (Instant::now() + backoff).min(deadline);
+        while Instant::now() < sleep_deadline {
+            if MLX_LIFECYCLE.current_epoch() != epoch {
+                return ReadinessOutcome::Superseded;
+            }
+            thread::sleep(
+                Duration::from_millis(50)
+                    .min(sleep_deadline.saturating_duration_since(Instant::now())),
+            );
+        }
         backoff = (backoff * 2).min(Duration::from_secs(8));
     }
-    false
+    if MLX_LIFECYCLE.current_epoch() == epoch {
+        ReadinessOutcome::TimedOut
+    } else {
+        ReadinessOutcome::Superseded
+    }
 }
 
 /// Commit the "ready" state for an MLX activation, but ONLY while `epoch` is
@@ -309,7 +336,7 @@ fn mlx_finalize_timeout(epoch: u64, registration_id: &str) {
     );
 }
 
-fn monitor_mlx_exit(epoch: u64, model: String, registration_id: String) {
+fn monitor_mlx_exit(epoch: u64, model: String, registration_id: String) -> Result<(), String> {
     MLX_LIFECYCLE.monitor_exit(epoch, registration_id, move || {
         let mut slot = mlx_engine_slot()
             .lock()
@@ -320,7 +347,7 @@ fn monitor_mlx_exit(epoch: u64, model: String, registration_id: String) {
         drop(slot);
         clear_mlx_progress();
         update_mlx_job_phase("error", Some("SwiftLM exited unexpectedly".to_string()));
-    });
+    })
 }
 
 fn clear_mlx_runtime_state() {
@@ -451,13 +478,19 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
+    MLX_LIFECYCLE
+        .install_child(my_epoch, child, &bin)
+        .map_err(|_| "MLX start was superseded".to_string())?;
+    let registration_id = registration.id().to_string();
+    MLX_LIFECYCLE
+        .commit_registration(my_epoch, registration)
+        .map_err(|_| "MLX start was superseded".to_string())?;
+
     if let Some(out) = stdout {
         let ep = my_epoch;
-        thread::spawn(move || {
+        if let Err(error) = MLX_LIFECYCLE.spawn_worker(my_epoch, "lunery-mlx-stdout", move || {
             let reader = std::io::BufReader::new(out);
             for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-                // A newer start/stop superseded us — stop writing the shared
-                // progress/job slots so we don't clobber the new model's state.
                 if MLX_LIFECYCLE.current_epoch() != ep {
                     return;
                 }
@@ -465,11 +498,15 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
                     update_mlx_progress(phase, pct);
                 }
             }
-        });
+        }) {
+            MLX_LIFECYCLE.rollback_if_current(my_epoch, Some(&registration_id));
+            clear_mlx_runtime_state();
+            return Err(error);
+        }
     }
     if let Some(err) = stderr {
         let ep = my_epoch;
-        thread::spawn(move || {
+        if let Err(error) = MLX_LIFECYCLE.spawn_worker(my_epoch, "lunery-mlx-stderr", move || {
             let reader = std::io::BufReader::new(err);
             for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
                 if MLX_LIFECYCLE.current_epoch() != ep {
@@ -479,16 +516,12 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
                     update_mlx_progress(phase, pct);
                 }
             }
-        });
+        }) {
+            MLX_LIFECYCLE.rollback_if_current(my_epoch, Some(&registration_id));
+            clear_mlx_runtime_state();
+            return Err(error);
+        }
     }
-
-    MLX_LIFECYCLE
-        .install_child(my_epoch, child, &bin)
-        .map_err(|_| "MLX start was superseded".to_string())?;
-    let registration_id = registration.id().to_string();
-    MLX_LIFECYCLE
-        .commit_registration(my_epoch, registration)
-        .map_err(|_| "MLX start was superseded".to_string())?;
 
     // Background monitor — waits for port bind (up to 20 min) and finalises
     // MLX_JOB + mlx_engine_slot. The caller (bridge handler) returns ack
@@ -498,14 +531,22 @@ pub(crate) fn bridge_start_mlx(model: String) -> Result<MlxStartAck, String> {
     let model_clone = model.clone();
     let endpoint_clone = endpoint.clone();
     let timeout_registration_id = registration_id.clone();
-    thread::spawn(move || {
-        if wait_for_port_long(port, 1200) {
-            mlx_commit_ready(my_epoch, &endpoint_clone, &model_clone);
-        } else {
-            mlx_finalize_timeout(my_epoch, &timeout_registration_id);
+    if let Err(error) = MLX_LIFECYCLE.spawn_worker(my_epoch, "lunery-mlx-readiness", move || {
+        match wait_for_port_long(my_epoch, port, 1200) {
+            ReadinessOutcome::Ready => mlx_commit_ready(my_epoch, &endpoint_clone, &model_clone),
+            ReadinessOutcome::TimedOut => mlx_finalize_timeout(my_epoch, &timeout_registration_id),
+            ReadinessOutcome::Superseded => {}
         }
-    });
-    monitor_mlx_exit(my_epoch, model.clone(), registration_id);
+    }) {
+        MLX_LIFECYCLE.rollback_if_current(my_epoch, Some(&registration_id));
+        clear_mlx_runtime_state();
+        return Err(error);
+    }
+    if let Err(error) = monitor_mlx_exit(my_epoch, model.clone(), registration_id.clone()) {
+        MLX_LIFECYCLE.rollback_if_current(my_epoch, Some(&registration_id));
+        clear_mlx_runtime_state();
+        return Err(error);
+    }
 
     Ok(MlxStartAck {
         job_id,
@@ -531,7 +572,7 @@ pub(crate) fn bridge_stop_mlx() {
 mod tests {
     use super::{
         mlx_bridge_child, mlx_commit_ready, mlx_engine_slot, mlx_finalize_timeout,
-        mlx_model_arg_allowed, MLX_LIFECYCLE,
+        mlx_model_arg_allowed, wait_for_port_long, ReadinessOutcome, MLX_LIFECYCLE,
     };
     use crate::test_global_lock;
 
@@ -602,6 +643,33 @@ mod tests {
             mlx_bridge_child().lock().unwrap().is_none(),
             "current-epoch timeout must clear the child slot"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_reaps_never_ready_child_and_readiness_monitor_within_deadline() {
+        let _g = test_global_lock();
+        MLX_LIFECYCLE.stop();
+        let epoch = MLX_LIFECYCLE.next_epoch();
+        *mlx_bridge_child().lock().unwrap() = Some(spawn_fake_child());
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let outcome_worker = std::sync::Arc::clone(&outcome);
+        MLX_LIFECYCLE
+            .spawn_worker(epoch, "mlx-never-ready-test", move || {
+                *outcome_worker.lock().unwrap() = Some(wait_for_port_long(epoch, port, 1200));
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(75));
+
+        let started = std::time::Instant::now();
+        MLX_LIFECYCLE.stop();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(mlx_bridge_child().lock().unwrap().is_none());
+        assert_eq!(MLX_LIFECYCLE.worker_count(), 0);
+        assert_eq!(*outcome.lock().unwrap(), Some(ReadinessOutcome::Superseded));
     }
 
     #[test]

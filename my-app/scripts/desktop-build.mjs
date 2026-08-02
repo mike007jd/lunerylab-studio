@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -226,23 +226,9 @@ async function buildMac() {
   console.log(`  ${evidencePath}`);
 }
 
-function buildWindows() {
-  console.log("[desktop:build] Windows mode: NSIS");
-  runTauri(["--bundles", "nsis"], buildEnvironment({ unsigned: false }));
-  const nsisRoot = join(appRoot, "src-tauri", "target", "release", "bundle", "nsis");
-  const installers = existsSync(nsisRoot)
-    ? readdirSync(nsisRoot).filter((name) => name.endsWith("-setup.exe"))
-    : [];
-  if (installers.length !== 1) {
-    throw new Error(`Expected one NSIS installer in ${nsisRoot}; found ${installers.length}.`);
-  }
-  console.log(`[desktop:build] Windows installer ready: ${join(nsisRoot, installers[0])}`);
+if (process.platform !== "darwin") {
+  throw new Error(
+    `Desktop packaging is currently supported only on macOS; found ${process.platform}.`,
+  );
 }
-
-if (process.platform === "darwin") {
-  await buildMac();
-} else if (process.platform === "win32") {
-  buildWindows();
-} else {
-  throw new Error(`Desktop packaging is supported on macOS and Windows; found ${process.platform}.`);
-}
+await buildMac();

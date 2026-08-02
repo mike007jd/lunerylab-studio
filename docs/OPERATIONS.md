@@ -24,7 +24,9 @@ Tauri build.
 | `pnpm desktop:build` | Build the platform release artifact. |
 
 The release build runs `desktop:clean`, `build`, and `desktop:prepare` before
-Tauri packaging. macOS produces a DMG; Windows produces an NSIS installer.
+Tauri packaging. The supported release target is Apple Silicon macOS and
+produces a DMG. Windows packaging is disabled until its profile and local-engine
+paths have reparse-point-safe implementations and release acceptance coverage.
 
 ## CI Release Contract
 
@@ -33,11 +35,10 @@ Tauri packaging. macOS produces a DMG; Windows produces an NSIS installer.
 | Trigger/platform | Signing behavior | Publishes |
 | --- | --- | --- |
 | `v*` tag, macOS | Apple signing and notarization required; missing credentials fail closed. | Yes |
-| `v*` tag, Windows | Authenticode when configured; otherwise unsigned with a warning. | Yes |
 | Manual dispatch | Same build and signing rules as above. | No |
 
 The workflow verifies tag/package/Tauri version parity, runs the shared
-validation workflow, builds both installers, and publishes stable asset names
+validation workflow, builds the macOS installer, and publishes its stable asset name
 plus `SHA256SUMS.txt`.
 
 macOS order:
@@ -62,16 +63,10 @@ macOS secrets:
 - `APPLE_CERTIFICATE`
 - `APPLE_CERTIFICATE_PASSWORD`
 
-Windows secrets, all optional as one set:
-
-- `WINDOWS_CERTIFICATE`
-- `WINDOWS_CERTIFICATE_PASSWORD`
-
 Actions variables:
 
 - `SIGNING_CREDENTIAL_OWNER`
 - `NOTARIZATION_CREDENTIAL_ROTATED_AT`
-- `WINDOWS_EXPECTED_PUBLISHER` when Windows signing is enabled
 
 Apple credentials must have a named owner and a recorded rotation date no older
 than 180 days. Rotate immediately after suspected exposure. Never store signing

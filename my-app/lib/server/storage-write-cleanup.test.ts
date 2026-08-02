@@ -6,10 +6,16 @@ import * as path from "node:path";
 vi.mock("server-only", () => ({}));
 
 import * as storage from "@/lib/server/storage";
+import {
+  getWorkspaceOperationGateStateForTests,
+  resetWorkspaceOperationGateForTests,
+  withWorkspaceExclusive,
+} from "@/lib/server/workspace-operation-gate";
 
 let tmpDir: string;
 
 beforeEach(() => {
+  resetWorkspaceOperationGateForTests();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-cleanup-"));
   // Local filesystem rooted at the temp dir (absolute path required).
   vi.stubEnv("LUNERY_MEDIA_DIR", tmpDir);
@@ -17,6 +23,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  storage.__storageTestHooks.beforeFinalOpen = null;
   vi.unstubAllEnvs();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -65,6 +72,17 @@ describe("writeFilesOrCleanup (#7)", () => {
     });
   });
 
+  it("creates a missing project directory for the first nested restore", async () => {
+    const stored = await storage.restoreStoredFile({
+      storagePath: "generated/project_first/output.png",
+      bytes: Buffer.from("first"),
+      mimeType: "image/png",
+    });
+
+    expect(fs.readFileSync(stored.absolutePath!, "utf8")).toBe("first");
+    expect(fs.statSync(path.join(tmpDir, "generated", "project_first")).isDirectory()).toBe(true);
+  });
+
   it("stages deletion, restores on rollback, and removes only on commit", async () => {
     const original = storage.resolveStoragePath("generated/staged.png");
     fs.writeFileSync(original, "staged");
@@ -91,12 +109,75 @@ describe("writeFilesOrCleanup (#7)", () => {
         fs.symlinkSync(outside, path.join(tmpDir, "uploads"), "dir");
 
         await expect(storage.deleteStoredFile("uploads/victim.png")).rejects.toThrow(
-          "escapes the media root",
+          "Storage path component is a symlink",
         );
         await expect(storage.stageStoredFileDeletion("uploads/victim.png")).rejects.toThrow(
-          "escapes the media root",
+          "Storage path component is a symlink",
         );
         expect(fs.readFileSync(path.join(outside, "victim.png"), "utf8")).toBe("keep");
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects a media-root symlink before ensure or listing touches its target",
+    async () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "storage-root-target-"));
+      const missingTarget = path.join(outside, "missing-target");
+      const linkedRoot = path.join(tmpDir, "linked-media-root");
+      fs.symlinkSync(missingTarget, linkedRoot, "dir");
+      vi.stubEnv("LUNERY_MEDIA_DIR", linkedRoot);
+      try {
+        await expect(storage.ensureStorage()).rejects.toThrow(
+          "Storage root must be a real directory",
+        );
+        await expect(storage.listStoredRelativePaths()).rejects.toThrow(
+          "Storage root must be a real directory",
+        );
+        expect(fs.existsSync(missingTarget)).toBe(false);
+        expect(fs.readdirSync(outside)).toEqual([]);
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects bucket symlinks before ensure or listing touches their targets",
+    async () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "storage-bucket-target-"));
+      const missingTarget = path.join(outside, "missing-target");
+      fs.symlinkSync(missingTarget, path.join(tmpDir, "uploads"), "dir");
+      try {
+        await expect(storage.ensureStorage()).rejects.toThrow(
+          "Storage path component is a symlink",
+        );
+        await expect(storage.listStoredRelativePaths()).rejects.toThrow(
+          "Storage path component is a symlink",
+        );
+        expect(fs.existsSync(missingTarget)).toBe(false);
+        expect(fs.readdirSync(outside)).toEqual([]);
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects a symlinked project directory when preparing it for reveal",
+    async () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "storage-reveal-target-"));
+      try {
+        fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
+        fs.symlinkSync(outside, path.join(tmpDir, "generated", "project_reveal"), "dir");
+
+        await expect(
+          storage.ensureStorageSubdirectory("generated/project_reveal"),
+        ).rejects.toThrow("Storage path component is a symlink");
+        expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+        expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
       } finally {
         fs.rmSync(outside, { recursive: true, force: true });
       }
@@ -116,6 +197,147 @@ describe("writeFilesOrCleanup (#7)", () => {
 
       expect(fs.existsSync(linked)).toBe(false);
       expect(fs.readFileSync(outside, "utf8")).toBe("keep");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects read/write/restore/metadata/stream through bucket, project, or final symlinks",
+    async () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "storage-symlink-escape-"));
+      try {
+        fs.rmSync(path.join(tmpDir, "generated"), { recursive: true, force: true });
+        fs.writeFileSync(path.join(outside, "secret.png"), "secret");
+        fs.symlinkSync(outside, path.join(tmpDir, "generated"), "dir");
+
+        await expect(
+          storage.restoreStoredFile({
+            storagePath: "generated/escape.png",
+            bytes: Buffer.from("x"),
+            mimeType: "image/png",
+          }),
+        ).rejects.toThrow("Storage path component is a symlink");
+        await expect(storage.readStoredFile("generated/secret.png")).rejects.toThrow(
+          "Storage path component is a symlink",
+        );
+        await expect(storage.getStoredFileMetadata("generated/secret.png")).rejects.toThrow(
+          "Storage path component is a symlink",
+        );
+        await expect(storage.streamStoredFile("generated/secret.png")).rejects.toThrow(
+          "Storage path component is a symlink",
+        );
+        expect(fs.readFileSync(path.join(outside, "secret.png"), "utf8")).toBe("secret");
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+        fs.rmSync(path.join(tmpDir, "generated"), { recursive: true, force: true });
+        fs.mkdirSync(path.join(tmpDir, "generated"), { recursive: true });
+      }
+
+      const projectOutside = fs.mkdtempSync(path.join(os.tmpdir(), "storage-project-escape-"));
+      try {
+        fs.writeFileSync(path.join(projectOutside, "nested.png"), "nested");
+        fs.symlinkSync(projectOutside, path.join(tmpDir, "generated", "proj_1"), "dir");
+        await expect(storage.readStoredFile("generated/proj_1/nested.png")).rejects.toThrow(
+          "Storage path component is a symlink",
+        );
+        await expect(
+          storage.restoreStoredFile({
+            storagePath: "generated/proj_1/new.png",
+            bytes: Buffer.from("x"),
+            mimeType: "image/png",
+          }),
+        ).rejects.toThrow("Storage path component is a symlink");
+      } finally {
+        fs.rmSync(projectOutside, { recursive: true, force: true });
+      }
+
+      const finalOutside = path.join(tmpDir, "final-outside.png");
+      const finalLinked = storage.resolveStoragePath("generated/final-link.png");
+      fs.writeFileSync(finalOutside, "final");
+      fs.symlinkSync(finalOutside, finalLinked);
+      await expect(storage.readStoredFile("generated/final-link.png")).rejects.toThrow(
+        "Storage path component is a symlink",
+      );
+      await expect(storage.getStoredFileMetadata("generated/final-link.png")).rejects.toThrow(
+        "Storage path component is a symlink",
+      );
+      await expect(
+        storage.restoreStoredFile({
+          storagePath: "generated/final-link.png",
+          bytes: Buffer.from("overwrite"),
+          mimeType: "image/png",
+        }),
+      ).rejects.toThrow("Storage path component is a symlink");
+      expect(fs.readFileSync(finalOutside, "utf8")).toBe("final");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "uses O_NOFOLLOW when the final component is exchanged after canonical validation",
+    async () => {
+      const storedPath = storage.resolveStoragePath("generated/raced-final.png");
+      const outside = path.join(tmpDir, "raced-outside.png");
+      fs.writeFileSync(storedPath, "inside");
+      fs.writeFileSync(outside, "outside");
+      let exchanged = false;
+      storage.__storageTestHooks.beforeFinalOpen = (absolutePath) => {
+        if (exchanged || absolutePath !== storedPath) return;
+        exchanged = true;
+        fs.unlinkSync(storedPath);
+        fs.symlinkSync(outside, storedPath);
+      };
+
+      await expect(storage.readStoredFile("generated/raced-final.png")).rejects.toThrow(
+        "Storage path component is a symlink",
+      );
+      expect(fs.readFileSync(outside, "utf8")).toBe("outside");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects deterministic root, bucket, or project swaps before the final open",
+    async () => {
+      for (const component of ["root", "bucket", "project"] as const) {
+        const caseDir = path.join(tmpDir, `swap-${component}`);
+        const mediaRoot = path.join(caseDir, "media");
+        const storagePath = "generated/project_1/victim.txt";
+        const inside = path.join(mediaRoot, "generated", "project_1", "victim.txt");
+        const outside = path.join(caseDir, "outside");
+        const outsideVictim = component === "root"
+          ? path.join(outside, "generated", "project_1", "victim.txt")
+          : component === "bucket"
+            ? path.join(outside, "project_1", "victim.txt")
+            : path.join(outside, "victim.txt");
+        fs.mkdirSync(path.dirname(inside), { recursive: true });
+        fs.mkdirSync(path.dirname(outsideVictim), { recursive: true });
+        fs.writeFileSync(inside, "inside");
+        fs.writeFileSync(outsideVictim, "outside");
+        vi.stubEnv("LUNERY_MEDIA_DIR", mediaRoot);
+
+        const swapped = component === "root"
+          ? mediaRoot
+          : component === "bucket"
+            ? path.join(mediaRoot, "generated")
+            : path.join(mediaRoot, "generated", "project_1");
+        const held = `${swapped}.held`;
+        let didSwap = false;
+        storage.__storageTestHooks.beforeFinalOpen = () => {
+          if (didSwap) return;
+          didSwap = true;
+          fs.renameSync(swapped, held);
+          fs.symlinkSync(outside, swapped, "dir");
+        };
+
+        try {
+          await expect(storage.readStoredFile(storagePath)).rejects.toThrow(
+            /symlink|changed during final open|real directory/,
+          );
+          expect(fs.readFileSync(outsideVictim, "utf8")).toBe("outside");
+        } finally {
+          storage.__storageTestHooks.beforeFinalOpen = null;
+          if (fs.lstatSync(swapped).isSymbolicLink()) fs.unlinkSync(swapped);
+          fs.renameSync(held, swapped);
+        }
+      }
     },
   );
 
@@ -141,6 +363,49 @@ describe("writeFilesOrCleanup (#7)", () => {
 
     // The orphaned first file must be cleaned up, not left behind.
     expect(fs.existsSync(firstPath)).toBe(false);
+  });
+
+  it("keeps the batch lease through compensation before restore can start", async () => {
+    const firstPath = storage.resolveStoragePath("generated/batch-first.png");
+    let rejectSecond!: () => void;
+    const secondMayFail = new Promise<void>((resolve) => {
+      rejectSecond = resolve;
+    });
+    const batch = storage.writeFilesOrCleanup([
+      async () => {
+        fs.writeFileSync(firstPath, "partial");
+        return { storagePath: "generated/batch-first.png" };
+      },
+      async () => {
+        await secondMayFail;
+        throw new Error("second write failed");
+      },
+    ]);
+
+    await vi.waitFor(() => {
+      expect(fs.existsSync(firstPath)).toBe(true);
+      expect(getWorkspaceOperationGateStateForTests().sharedCount).toBe(1);
+    });
+
+    let filePresentWhenRestoreStarted: boolean | null = null;
+    const restore = withWorkspaceExclusive("restore", async () => {
+      filePresentWhenRestoreStarted = fs.existsSync(firstPath);
+    });
+    await vi.waitFor(() => {
+      expect(getWorkspaceOperationGateStateForTests().exclusivePending).toBe(true);
+    });
+
+    rejectSecond();
+    await expect(batch).rejects.toThrow("second write failed");
+    await restore;
+
+    expect(filePresentWhenRestoreStarted).toBe(false);
+    expect(fs.existsSync(firstPath)).toBe(false);
+    expect(getWorkspaceOperationGateStateForTests()).toMatchObject({
+      exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
+    });
   });
 
   it("returns all results and deletes nothing when every write succeeds", async () => {

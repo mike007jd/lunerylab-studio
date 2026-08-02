@@ -179,10 +179,12 @@ export async function prepareImageFiles(
 
 /**
  * Run multi-row asset writes in a single Prisma transaction so asset rows,
- * job terminal state, and related canvas mutations stay atomic.
+ * job terminal state, and related canvas mutations stay atomic. Holds the
+ * shared workspace mutation lease for the whole transaction.
  */
 export async function withAssetWriteTransaction<T>(
   write: (tx: PrismaTransactionClient) => Promise<T>,
 ): Promise<T> {
-  return prisma.$transaction(write);
+  const { withSharedMutationLease } = await import("@/lib/server/workspace-operation-gate");
+  return withSharedMutationLease(() => prisma.$transaction(write));
 }

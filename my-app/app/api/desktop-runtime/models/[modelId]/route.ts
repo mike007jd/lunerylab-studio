@@ -7,6 +7,7 @@ import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { findHfModelEntry, type HfModelEntry } from "@/lib/hf-model-catalog";
 import {
+  BridgeDownloadJobsError,
   bridgeFetch,
   getBridgeDownloadJobs,
   requireDesktopBridge,
@@ -18,7 +19,7 @@ import {
   finishImportedExternalModelRollback,
   commitImportedExternalModelFile,
   modelCachePath,
-  removeImportedModel,
+  removeImportedModelIfUnchanged,
   rollbackImportedExternalModelFile,
   stageImportedExternalModelFile,
   upsertImportedModel,
@@ -26,12 +27,19 @@ import {
   type StagedExternalModelFile,
 } from "@/lib/server/imported-model-registry";
 import {
+  attachManagedModelDeletionRecovery,
   catalogModelFiles,
-  removeManagedModelFiles,
+  finalizeManagedModelFiles,
+  markManagedModelFilesCommitted,
+  rollbackManagedModelFiles,
+  stageManagedModelFiles,
+  ManagedModelCleanupPendingError,
+  type StagedManagedModelFile,
 } from "@/lib/server/local-model-files";
 import { invalidateLocalModelInstallStatusCache } from "@/lib/server/local-model-inventory";
 import { prisma } from "@/lib/server/prisma";
 import { getLocalWorkspacePreferences, requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
+import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
 
 export const dynamic = "force-dynamic";
 
@@ -85,11 +93,14 @@ async function settleActiveDownloadsForPaths(
 ): Promise<void> {
   const destinations = new Set(await Promise.all(modelPaths.map(canonicalModelPath)));
   const matchingActiveJobs = async () => {
-    const jobs = await getBridgeDownloadJobs(bridge);
-    if (!jobs) {
+    let jobs: Awaited<ReturnType<typeof getBridgeDownloadJobs>>;
+    try {
+      jobs = await getBridgeDownloadJobs(bridge);
+    } catch (error) {
+      if (!(error instanceof BridgeDownloadJobsError)) throw error;
       throw new ApiError({
-        status: 503,
-        code: "bridge_unreachable",
+        status: error.code === "bridge_timeout" ? 504 : 503,
+        code: error.code,
         message: "Could not inspect active model downloads.",
         retryable: true,
       });
@@ -108,8 +119,8 @@ async function settleActiveDownloadsForPaths(
       method: "POST",
       body: JSON.stringify({ jobId: job.jobId }),
       signal: AbortSignal.timeout(15_000),
-    });
-    if (!response.ok) {
+    }).catch(() => null);
+    if (!response?.ok) {
       throw new ApiError({
         status: 503,
         code: "download_cancel_failed",
@@ -247,18 +258,116 @@ async function releaseModelDeleteLeases(
   if (leases.llamaModelPath) {
     releases.push(bridgeFetch(bridge, "/llama-delete-lease-release", {
       method: "POST",
-      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.llamaModelPath }),
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.llamaModelPath,
+      }),
       signal: AbortSignal.timeout(5_000),
     }));
   }
   if (leases.sdModelPath) {
     releases.push(bridgeFetch(bridge, "/sd-delete-lease-release", {
       method: "POST",
-      body: JSON.stringify({ leaseId: leases.leaseId, modelPath: leases.sdModelPath }),
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.sdModelPath,
+      }),
       signal: AbortSignal.timeout(5_000),
     }));
   }
   await Promise.allSettled(releases);
+}
+
+async function renewModelDeleteLeases(
+  bridge: DesktopBridge,
+  leases: ModelDeleteLeases,
+): Promise<void> {
+  const renewals: Array<{ endpoint: string; body: string }> = [];
+  if (leases.downloadPaths.length > 0) {
+    renewals.push({
+      endpoint: "/hf-download-delete-lease-acquire",
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        destinations: leases.downloadPaths,
+        renew: true,
+      }),
+    });
+  }
+  if (leases.llamaModelPath) {
+    renewals.push({
+      endpoint: "/llama-delete-lease-acquire",
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.llamaModelPath,
+        renew: true,
+      }),
+    });
+  }
+  if (leases.sdModelPath) {
+    renewals.push({
+      endpoint: "/sd-delete-lease-acquire",
+      body: JSON.stringify({
+        leaseId: leases.leaseId,
+        modelPath: leases.sdModelPath,
+        renew: true,
+      }),
+    });
+  }
+  const responses = await Promise.all(renewals.map((renewal) =>
+    bridgeFetch(bridge, renewal.endpoint, {
+      method: "POST",
+      body: renewal.body,
+      signal: AbortSignal.timeout(5_000),
+    }).catch(() => null)));
+  if (responses.some((response) => !response?.ok)) {
+    throw new ApiError({
+      status: 503,
+      code: "model_delete_lease_expired",
+      message: "Model deletion coordination expired. Try again.",
+      retryable: true,
+    });
+  }
+
+}
+
+const MODEL_DELETE_LEASE_HEARTBEAT_MS = 10_000;
+
+interface ModelDeleteLeaseHeartbeat {
+  assertHealthy(): Promise<void>;
+  stop(): Promise<unknown | null>;
+}
+
+function startModelDeleteLeaseHeartbeat(
+  bridge: DesktopBridge,
+  leases: ModelDeleteLeases,
+): ModelDeleteLeaseHeartbeat {
+  let stopped = false;
+  let failure: unknown | null = null;
+  let inFlight: Promise<void> | null = null;
+  const tick = () => {
+    if (stopped || failure || inFlight) return;
+    inFlight = renewModelDeleteLeases(bridge, leases)
+      .catch((error) => {
+        failure = error;
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+  const timer = setInterval(tick, MODEL_DELETE_LEASE_HEARTBEAT_MS);
+  timer.unref?.();
+  return {
+    async assertHealthy() {
+      await inFlight;
+      if (failure) throw failure;
+    },
+    async stop() {
+      stopped = true;
+      clearInterval(timer);
+      await inFlight;
+      return failure;
+    },
+  };
 }
 
 async function stopActiveLlama(
@@ -268,8 +377,8 @@ async function stopActiveLlama(
 ): Promise<void> {
   const response = await bridgeFetch(bridge, "/llama-status", {
     signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) {
+  }).catch(() => null);
+  if (!response?.ok) {
     throw new ApiError({
       status: 503,
       code: "bridge_unreachable",
@@ -293,12 +402,38 @@ async function stopActiveLlama(
   const stopResponse = await bridgeFetch(bridge, "/llama-stop", {
     method: "POST",
     signal: AbortSignal.timeout(15_000),
-  });
-  if (!stopResponse.ok) {
+  }).catch(() => null);
+  if (!stopResponse?.ok) {
     throw new ApiError({
       status: 503,
       code: "runtime_stop_failed",
       message: "Could not stop the running model. Try again.",
+      retryable: true,
+    });
+  }
+  const settledResponse = await bridgeFetch(bridge, "/llama-status", {
+    signal: AbortSignal.timeout(15_000),
+  }).catch(() => null);
+  if (!settledResponse?.ok) {
+    throw new ApiError({
+      status: 503,
+      code: "bridge_unreachable",
+      message: "Could not verify that the running model stopped.",
+      retryable: true,
+    });
+  }
+  const settled = (await settledResponse.json().catch(() => null)) as LlamaStatus | null;
+  const stillMatchesId = typeof settled?.modelId === "string" && selectionIds.has(settled.modelId);
+  const stillMatchesPath = Boolean(
+    modelPath
+      && settled?.modelPath
+      && path.resolve(settled.modelPath) === path.resolve(modelPath),
+  );
+  if (settled?.running && (stillMatchesId || stillMatchesPath)) {
+    throw new ApiError({
+      status: 503,
+      code: "runtime_stop_failed",
+      message: "The running model did not stop in time. Try again.",
       retryable: true,
     });
   }
@@ -307,8 +442,8 @@ async function stopActiveLlama(
 async function stopActiveSd(bridge: DesktopBridge, modelPath: string | null): Promise<void> {
   const response = await bridgeFetch(bridge, "/sd-status", {
     signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) {
+  }).catch(() => null);
+  if (!response?.ok) {
     throw new ApiError({
       status: 503,
       code: "bridge_unreachable",
@@ -334,8 +469,8 @@ async function stopActiveSd(bridge: DesktopBridge, modelPath: string | null): Pr
     method: "POST",
     body: JSON.stringify({ modelPath }),
     signal: AbortSignal.timeout(15_000),
-  });
-  if (!stopResponse.ok) {
+  }).catch(() => null);
+  if (!stopResponse?.ok) {
     throw new ApiError({
       status: 503,
       code: "runtime_stop_failed",
@@ -355,29 +490,36 @@ async function stopActiveSd(bridge: DesktopBridge, modelPath: string | null): Pr
 }
 
 interface ClearedModelDefaults {
-  cleared: string[];
+  cleared: Array<"text" | "image">;
   previous: { defaultTextModel: string; defaultImageModel: string };
 }
 
 async function clearDeletedModelDefaults(
   ownerId: string,
+  defaults: ClearedModelDefaults,
+): Promise<ClearedModelDefaults> {
+  const data: { defaultTextModel?: string; defaultImageModel?: string } = {};
+  if (defaults.cleared.includes("text")) data.defaultTextModel = "";
+  if (defaults.cleared.includes("image")) data.defaultImageModel = "";
+  if (Object.keys(data).length > 0) {
+    await prisma.userSettings.update({ where: { userId: ownerId }, data });
+  }
+  return defaults;
+}
+
+async function inspectDeletedModelDefaults(
+  ownerId: string,
   modelId: string,
 ): Promise<ClearedModelDefaults> {
   const settings = await getLocalWorkspacePreferences(ownerId);
   const ids = modelSelectionIds(modelId);
-  const data: { defaultTextModel?: string; defaultImageModel?: string } = {};
-  const cleared: string[] = [];
+  const cleared: Array<"text" | "image"> = [];
 
   if (ids.has(settings.defaultTextModel)) {
-    data.defaultTextModel = "";
     cleared.push("text");
   }
   if (ids.has(settings.defaultImageModel)) {
-    data.defaultImageModel = "";
     cleared.push("image");
-  }
-  if (cleared.length > 0) {
-    await prisma.userSettings.update({ where: { userId: ownerId }, data });
   }
   return {
     cleared,
@@ -412,6 +554,11 @@ export async function DELETE(
       );
     }
     const owner = await requireLocalWorkspaceOwner();
+    // Model deletion spans native cancellation/leases, profile bytes, registry
+    // metadata, and default selections. Exclusive workspace ownership makes
+    // that whole transaction atomic with settings validation+commit while
+    // remaining re-entrant for Prisma/profile mutations below.
+    return await withWorkspaceExclusive("model-delete", async () => {
     const rawModelId = (await params).modelId;
     const parsed = MODEL_ID.safeParse(rawModelId);
     if (!parsed.success) {
@@ -443,7 +590,15 @@ export async function DELETE(
       && requestBody.confirmation === EXTERNAL_MODEL_DELETE_CONFIRMATION;
 
     const bridgeResult = requireDesktopBridge();
-    const bridge = bridgeResult instanceof NextResponse ? null : bridgeResult;
+    if (bridgeResult instanceof NextResponse) {
+      throw new ApiError({
+        status: 503,
+        code: "bridge_unreachable",
+        message: "Could not coordinate model deletion with the desktop runtime.",
+        retryable: true,
+      });
+    }
+    const bridge = bridgeResult;
     const warnings: string[] = [];
 
     const modelPath = catalogEntry
@@ -460,60 +615,35 @@ export async function DELETE(
     const isLlamaModel = catalogEntry?.runtimeTarget === "llama-cpp"
       || imported?.runtimeTarget === "llama-cpp";
     let leases: ModelDeleteLeases | null = null;
-    if (bridge) {
-      try {
-        leases = await acquireModelDeleteLeases(
-          bridge,
-          downloadablePaths,
-          isLlamaModel ? modelPath : null,
-          isSdModel ? modelPath : null,
-        );
-      } catch (error) {
-        if (!(error instanceof ApiError) || error.code !== "bridge_unreachable") throw error;
-        warnings.push("runtime_delete_lease_unavailable");
-      }
-    }
+    let heartbeat: ModelDeleteLeaseHeartbeat | null = null;
     try {
-    if (bridge && downloadablePaths.length > 0) {
-      try {
-        await settleActiveDownloadsForPaths(bridge, downloadablePaths);
-      } catch (error) {
-        if (!(error instanceof ApiError) || error.code !== "bridge_unreachable") throw error;
-        warnings.push("download_not_stopped");
-      }
-    } else if (downloadablePaths.length > 0) {
-      warnings.push("download_not_stopped");
+    leases = await acquireModelDeleteLeases(
+      bridge,
+      downloadablePaths,
+      isLlamaModel ? modelPath : null,
+      isSdModel ? modelPath : null,
+    );
+    if (downloadablePaths.length > 0) {
+      await settleActiveDownloadsForPaths(bridge, downloadablePaths);
     }
-    if (catalogEntry?.runtimeTarget === "llama-cpp" || imported?.runtimeTarget === "llama-cpp") {
-      if (bridge) {
-        try {
-          await stopActiveLlama(bridge, modelId, modelPath);
-        } catch {
-          warnings.push("runtime_not_stopped");
-        }
-      } else {
-        warnings.push("runtime_not_stopped");
-      }
+    if (isLlamaModel) {
+      await stopActiveLlama(bridge, modelId, modelPath);
     }
     if (isSdModel) {
-      if (bridge) {
-        try {
-          // A positively identified active run must settle before its file is removed.
-          await stopActiveSd(bridge, modelPath);
-        } catch (error) {
-          if (!(error instanceof ApiError) || error.code !== "bridge_unreachable") throw error;
-          warnings.push("runtime_not_stopped");
-        }
-      } else {
-        // Bridge availability is not permission to delete. A missing probe can
-        // only reduce cleanup confidence; it must not disable the user action.
-        warnings.push("runtime_not_stopped");
-      }
+      await stopActiveSd(bridge, modelPath);
     }
+
+    // Cancel/stop polling can consume most of a lease lifetime. Refresh every
+    // acquired lease with the same leaseId immediately before any file stage
+    // or metadata commit; an unavailable/expired renewal is a hard stop.
+    await renewModelDeleteLeases(bridge, leases);
+    heartbeat = startModelDeleteLeaseHeartbeat(bridge, leases);
 
     const paths = catalogEntry ? catalogModelPaths(catalogEntry) : importedModelPaths(imported!);
     let stagedExternal: StagedExternalModelFile | null = null;
+    let stagedManaged: StagedManagedModelFile[] = [];
     let clearedDefaults: ClearedModelDefaults | null = null;
+    let registryRemoved = false;
     let removedFiles = 0;
     try {
       if (imported?.source === "local-path" && deleteExternalFile) {
@@ -522,31 +652,73 @@ export async function DELETE(
           warnings.push("external_file_changed_preserved");
         }
       }
-      removedFiles = await removeManagedModelFiles(paths);
-      clearedDefaults = await clearDeletedModelDefaults(owner.id, modelId);
-      if (imported) await removeImportedModel(modelId);
-      if (stagedExternal) {
-        removedFiles += await commitImportedExternalModelFile(stagedExternal);
+      stagedManaged = await stageManagedModelFiles(paths);
+      await heartbeat.assertHealthy();
+      clearedDefaults = await inspectDeletedModelDefaults(owner.id, modelId);
+      await attachManagedModelDeletionRecovery(stagedManaged, {
+        ownerId: owner.id,
+        modelId,
+        ...(imported ? { importedModel: imported } : {}),
+        defaults: {
+          cleared: clearedDefaults.cleared,
+          previous: clearedDefaults.previous,
+        },
+      });
+      await clearDeletedModelDefaults(owner.id, clearedDefaults);
+      await heartbeat.assertHealthy();
+      if (imported) {
+        await removeImportedModelIfUnchanged(imported);
+        registryRemoved = true;
       }
+      await markManagedModelFilesCommitted(stagedManaged);
+      await heartbeat.assertHealthy();
     } catch (error) {
-      if (stagedExternal && imported) {
-        try {
+      try {
+        await rollbackManagedModelFiles(stagedManaged);
+        if (stagedExternal && imported) {
           const restored = await rollbackImportedExternalModelFile(stagedExternal, imported);
           await upsertImportedModel(restored);
-          if (clearedDefaults) {
-            await restoreDeletedModelDefaults(owner.id, clearedDefaults);
-          }
           await finishImportedExternalModelRollback(stagedExternal);
-        } catch {
-          throw new ApiError({
-            status: 503,
-            code: "external_model_delete_rollback_failed",
-            message: "Model deletion could not be completed or fully rolled back. Restart Studio and try again.",
-            retryable: true,
-          });
+        } else if (registryRemoved && imported) {
+          await upsertImportedModel(imported);
         }
+        if (clearedDefaults) {
+          await restoreDeletedModelDefaults(owner.id, clearedDefaults);
+        }
+      } catch {
+        throw new ApiError({
+          status: 503,
+          code: "model_delete_rollback_failed",
+          message: "Model deletion could not be completed or fully rolled back. Restart Studio and try again.",
+          retryable: true,
+        });
       }
       throw error;
+    }
+
+    let cleanupPending = false;
+    try {
+      removedFiles = await finalizeManagedModelFiles(stagedManaged);
+    } catch (error) {
+      cleanupPending = true;
+      warnings.push("managed_file_cleanup_pending");
+      if (error instanceof ManagedModelCleanupPendingError) {
+        removedFiles = error.removedFiles;
+      }
+    }
+    if (stagedExternal) {
+      try {
+        removedFiles += await commitImportedExternalModelFile(stagedExternal);
+      } catch {
+        cleanupPending = true;
+        warnings.push("external_file_cleanup_pending");
+      }
+    }
+    const heartbeatFailure = await heartbeat.stop();
+    heartbeat = null;
+    if (heartbeatFailure) {
+      cleanupPending = true;
+      warnings.push("model_delete_lease_expired_after_commit");
     }
     invalidateLocalModelInstallStatusCache();
 
@@ -558,11 +730,14 @@ export async function DELETE(
       preservedExternalFile: imported?.source === "local-path"
         && (!deleteExternalFile || Boolean(stagedExternal?.preservedChangedFile)),
       clearedDefaults: clearedDefaults?.cleared ?? [],
+      cleanupPending,
       warnings,
     });
     } finally {
-      if (bridge && leases) await releaseModelDeleteLeases(bridge, leases);
+      if (heartbeat) await heartbeat.stop();
+      if (leases) await releaseModelDeleteLeases(bridge, leases);
     }
+    });
   } catch (error) {
     return jsonError(error);
   }

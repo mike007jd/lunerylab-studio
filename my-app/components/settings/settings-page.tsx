@@ -13,6 +13,8 @@ import {
 import { lunaMotion } from "@/components/design-system/grammar/motion";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
 import { useModelCatalog } from "@/lib/client/use-model-catalog";
+import { fetchInstallStatuses } from "@/components/settings/local-models/catalog-utils";
+import type { InstallStatusMap } from "@/components/settings/local-models/types";
 import { useI18n } from "@/lib/i18n/provider";
 import { useT } from "@/lib/i18n/useT";
 import { cn } from "@/lib/utils";
@@ -92,6 +94,28 @@ export function resolveSettingsModelValue(persisted: string, draft: string | nul
   return draft ?? persisted;
 }
 
+export function buildInstalledLocalTextOptions(statuses: InstallStatusMap) {
+  return Object.values(statuses)
+    .filter((status) => status.installed && status.capability === "planner-llm")
+    .map((status) => ({
+      id: `local:${status.id}`,
+      label: `Local — ${status.label?.trim() || status.id}`,
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label));
+}
+
+export function isVerifiedSettingsDefaultReady(
+  value: string,
+  options: ReadonlyArray<{ id: string }>,
+  loading: boolean,
+  catalogError: boolean,
+): boolean {
+  return !loading
+    && !catalogError
+    && Boolean(value)
+    && options.some((option) => option.id === value);
+}
+
 // Keeps its panel mounted (so tab switches don't refetch / lose local state)
 // while hiding the inactive ones. `animate` keys off `active` so the enter fade
 // replays each time the tab becomes visible — without ever changing the child
@@ -143,7 +167,12 @@ export function SettingsPage({
   const pathname = usePathname();
   const t = useT();
   const reduced = useMotionReducedPreference();
-  const { imageModels, videoModels, loading: modelsLoading } = useModelCatalog();
+  const {
+    imageModels,
+    videoModels,
+    loading: modelsLoading,
+    error: modelsError,
+  } = useModelCatalog();
   const [bootstrap, setBootstrap] = useState(initialData);
   const [defaultImageModelDraft, setDefaultImageModelDraft] = useState<string | null>(null);
   const [defaultTextModelDraft, setDefaultTextModelDraft] = useState<string | null>(null);
@@ -151,6 +180,9 @@ export function SettingsPage({
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [localeError, setLocaleError] = useState("");
+  const [localTextStatuses, setLocalTextStatuses] = useState<InstallStatusMap>({});
+  const [localTextCatalogLoading, setLocalTextCatalogLoading] = useState(true);
+  const [localTextCatalogError, setLocalTextCatalogError] = useState(false);
 
   // URL is the single source of truth for the active tab.
   // Derived on every render — no setState required.
@@ -162,13 +194,39 @@ export function SettingsPage({
   useEffect(() => {
     let active = true;
     const syncBootstrap = async () => {
-      const next = await fetchBootstrapSnapshot();
-      if (active && next) setBootstrap(next);
+      const [next, statuses] = await Promise.all([
+        fetchBootstrapSnapshot(),
+        fetchInstallStatuses().catch(() => null),
+      ]);
+      if (!active) return;
+      if (next) setBootstrap(next);
+      if (statuses) setLocalTextStatuses(statuses);
+      setLocalTextCatalogLoading(false);
+      setLocalTextCatalogError(statuses === null);
     };
     window.addEventListener(BOOTSTRAP_INVALIDATION_EVENT, syncBootstrap);
     return () => {
       active = false;
       window.removeEventListener(BOOTSTRAP_INVALIDATION_EVENT, syncBootstrap);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void fetchInstallStatuses()
+      .then((statuses) => {
+        if (!active) return;
+        setLocalTextStatuses(statuses);
+        setLocalTextCatalogError(false);
+      })
+      .catch(() => {
+        if (active) setLocalTextCatalogError(true);
+      })
+      .finally(() => {
+        if (active) setLocalTextCatalogLoading(false);
+      });
+    return () => {
+      active = false;
     };
   }, []);
 
@@ -210,14 +268,8 @@ export function SettingsPage({
       if (!modelId || bootstrap.providers[providerId]?.configured !== true) return [];
       return [{ id: `byok:${providerId}:${modelId}`, label: `${providerId} — ${modelId}` }];
     });
-    if (bootstrap.app.defaultTextModel.startsWith("local:")) {
-      options.unshift({
-        id: bootstrap.app.defaultTextModel,
-        label: `Local — ${bootstrap.app.defaultTextModel.slice("local:".length)}`,
-      });
-    }
-    return options;
-  }, [bootstrap.app.defaultTextModel, bootstrap.providerConnections, bootstrap.providers]);
+    return [...buildInstalledLocalTextOptions(localTextStatuses), ...options];
+  }, [bootstrap.providerConnections, bootstrap.providers, localTextStatuses]);
   const videoOptions = useMemo(() => videoModels.map((model) => ({
     id: model.id,
     label: `${model.brand} — ${model.label}`,
@@ -245,14 +297,29 @@ export function SettingsPage({
     const capability = searchParams.get("capability");
     if (!returnTo?.startsWith("/canvas/")) return;
     const ready = capability === "text"
-      ? Boolean(bootstrap.app.defaultTextModel)
+      ? isVerifiedSettingsDefaultReady(
+          bootstrap.app.defaultTextModel,
+          textOptions,
+          localTextCatalogLoading,
+          localTextCatalogError,
+        )
       : capability === "image"
-        ? Boolean(bootstrap.app.defaultImageModel)
+        ? isVerifiedSettingsDefaultReady(
+            bootstrap.app.defaultImageModel,
+            imageModels,
+            modelsLoading,
+            modelsError,
+          )
         : capability === "video"
-          ? Boolean(bootstrap.app.defaultVideoModel)
+          ? isVerifiedSettingsDefaultReady(
+              bootstrap.app.defaultVideoModel,
+              videoOptions,
+              modelsLoading,
+              modelsError,
+            )
           : false;
     if (ready) router.replace(returnTo);
-  }, [bootstrap.app.defaultImageModel, bootstrap.app.defaultTextModel, bootstrap.app.defaultVideoModel, router, searchParams]);
+  }, [bootstrap.app.defaultImageModel, bootstrap.app.defaultTextModel, bootstrap.app.defaultVideoModel, imageModels, localTextCatalogError, localTextCatalogLoading, modelsError, modelsLoading, router, searchParams, textOptions, videoOptions]);
 
   async function handleLocaleChange(nextLocale: Locale) {
     setLocaleError("");
@@ -292,6 +359,28 @@ export function SettingsPage({
         ? { defaultTextModel }
         : { defaultVideoModel });
       if (capability === "text") setDefaultTextModelDraft(null);
+      else setDefaultVideoModelDraft(null);
+      setFeedback({ tone: "success", text: t("settings.saved") });
+    } catch (error) {
+      setFeedback({ tone: "error", text: toErrorMessage(error, t("settings.saveError")) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleClearDefault(capability: "text" | "image" | "video") {
+    setSaving(true);
+    setFeedback(null);
+    try {
+      await patchSettings(
+        capability === "text"
+          ? { defaultTextModel: "" }
+          : capability === "image"
+            ? { defaultImageModel: "" }
+            : { defaultVideoModel: "" },
+      );
+      if (capability === "text") setDefaultTextModelDraft(null);
+      else if (capability === "image") setDefaultImageModelDraft(null);
       else setDefaultVideoModelDraft(null);
       setFeedback({ tone: "success", text: t("settings.saved") });
     } catch (error) {
@@ -355,11 +444,14 @@ export function SettingsPage({
                   capability="text"
                   value={defaultTextModel}
                   options={textOptions}
+                  loading={localTextCatalogLoading}
+                  catalogError={localTextCatalogError}
                   saving={saving}
                   changed={defaultTextModel !== bootstrap.app.defaultTextModel}
                   feedback={feedback}
                   onChange={setDefaultTextModelDraft}
                   onSave={() => void handleSaveCapabilityDefault("text")}
+                  onClear={() => void handleClearDefault("text")}
                 />
                 <LocalModelsPanel capability="text" />
                 <DesktopRuntimeCard capability="text" />
@@ -383,8 +475,11 @@ export function SettingsPage({
                   feedback={feedback}
                   locale={selectedLocale}
                   models={imageModels}
+                  loading={modelsLoading}
+                  catalogError={modelsError}
                   onModelChange={setDefaultImageModelDraft}
                   onSave={() => void handleSaveModel()}
+                  onClear={() => void handleClearDefault("image")}
                   saving={saving}
                 />
                 <LocalModelsPanel capability="image" />
@@ -407,11 +502,14 @@ export function SettingsPage({
                   capability="video"
                   value={defaultVideoModel}
                   options={videoOptions}
+                  loading={modelsLoading}
+                  catalogError={modelsError}
                   saving={saving}
                   changed={defaultVideoModel !== bootstrap.app.defaultVideoModel}
                   feedback={feedback}
                   onChange={setDefaultVideoModelDraft}
                   onSave={() => void handleSaveCapabilityDefault("video")}
+                  onClear={() => void handleClearDefault("video")}
                 />
                 <DesktopRuntimeCard capability="video" />
               </div>

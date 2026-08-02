@@ -11,7 +11,7 @@ export interface ProviderConnectionStatus {
   configured: boolean;
   source: "environment" | "system-keychain" | "none";
   secret_store: string;
-  keychain_status: "present" | "missing" | "unavailable";
+  keychain_status: "present" | "absent" | "unknown";
 }
 
 export interface LocalRuntimeStatus {

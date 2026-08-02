@@ -21,6 +21,7 @@ import {
 } from "@/lib/server/generation-job";
 import {
   isDetachedVideoAdmission,
+  runWithDetachedVideoAdmission,
   type DetachedVideoAdmission,
 } from "@/lib/server/workspace-operation-gate";
 
@@ -69,79 +70,81 @@ export async function runVideoJob(input: RunVideoJobInput): Promise<void> {
   const admission = input.workspaceAdmission;
 
   try {
-    // Backend was frozen at submission — never re-resolve here (no model drift).
-    const runtime = input.runtime;
-    if (runtime.backend === "none") {
-      await failJob(
-        input,
-        "no_video_backend",
-        "No video backend is configured. Connect a BYOK provider (fal / replicate / minimax).",
-      );
-      return;
-    }
-
-    try {
-      let result: VideoCallResult;
-      if (runtime.backend === "byok" && runtime.providerId) {
-        const byok = await generateVideoByok(
-          {
-            prompt: input.prompt,
-            modelId: runtime.modelId,
-            durationSeconds: input.durationSeconds,
-            aspectRatio: input.aspectRatio,
-            referenceImage: input.referenceImage,
-            abortSignal: input.abortSignal,
-          },
-          runtime.providerId,
+    await runWithDetachedVideoAdmission(admission, async () => {
+      // Backend was frozen at submission — never re-resolve here (no model drift).
+      const runtime = input.runtime;
+      if (runtime.backend === "none") {
+        await failJob(
+          input,
+          "no_video_backend",
+          "No video backend is configured. Connect a BYOK provider (fal / replicate / minimax).",
         );
-        result = byok;
-      } else {
-        await failJob(input, "no_video_backend", "No BYOK video backend is configured.");
         return;
       }
 
-      const stored = await writeGeneratedVideo(result.video.bytes, input.projectId);
+      try {
+        let result: VideoCallResult;
+        if (runtime.backend === "byok" && runtime.providerId) {
+          const byok = await generateVideoByok(
+            {
+              prompt: input.prompt,
+              modelId: runtime.modelId,
+              durationSeconds: input.durationSeconds,
+              aspectRatio: input.aspectRatio,
+              referenceImage: input.referenceImage,
+              abortSignal: input.abortSignal,
+            },
+            runtime.providerId,
+          );
+          result = byok;
+        } else {
+          await failJob(input, "no_video_backend", "No BYOK video backend is configured.");
+          return;
+        }
 
-      // Asset creation AND the job's terminal state commit in the same
-      // transaction so we never leave a successful asset under a FAILED job (or an
-      // asset whose row was deleted but file kept). On rollback we delete the file.
-      await withAssetWriteTransaction(async (tx) => {
-        await tx.asset.create({
-          data: {
-            userId: input.userId,
-            projectId: input.projectId || undefined,
+        const stored = await writeGeneratedVideo(result.video.bytes, input.projectId);
+
+        // Asset creation AND the job's terminal state commit in the same
+        // transaction so we never leave a successful asset under a FAILED job (or an
+        // asset whose row was deleted but file kept). On rollback we delete the file.
+        await withAssetWriteTransaction(async (tx) => {
+          await tx.asset.create({
+            data: {
+              userId: input.userId,
+              projectId: input.projectId || undefined,
+              jobId: input.jobId,
+              kind: "GENERATED",
+              modality: "VIDEO",
+              storagePath: stored.storagePath,
+              mimeType: stored.mimeType,
+              byteSize: stored.byteSize,
+              format: stored.mimeType.split("/")[1] ?? "mp4",
+              durationSeconds: input.durationSeconds,
+              agentTaskId: input.agentTaskId,
+              summary: input.agentTaskId ? input.prompt.slice(0, 280) : undefined,
+            },
+          });
+          await completeGenerationJob({
             jobId: input.jobId,
-            kind: "GENERATED",
-            modality: "VIDEO",
-            storagePath: stored.storagePath,
-            mimeType: stored.mimeType,
-            byteSize: stored.byteSize,
-            format: stored.mimeType.split("/")[1] ?? "mp4",
-            durationSeconds: input.durationSeconds,
-            agentTaskId: input.agentTaskId,
-            summary: input.agentTaskId ? input.prompt.slice(0, 280) : undefined,
-          },
+            model: result.model,
+            provider: result.provider,
+            successCount: 1,
+            requestedCount: 1,
+            client: tx,
+          });
+        }).catch(async (error) => {
+          await deleteStoredFile(stored.storagePath);
+          throw error;
         });
-        await completeGenerationJob({
-          jobId: input.jobId,
-          model: result.model,
-          provider: result.provider,
-          successCount: 1,
-          requestedCount: 1,
-          client: tx,
-        });
-      }).catch(async (error) => {
-        await deleteStoredFile(stored.storagePath);
-        throw error;
-      });
-    } catch (error) {
-      const code = error instanceof ApiError ? error.code : "video_generation_failed";
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Video generation failed unexpectedly.";
-      await failJob(input, code, message);
-    }
+      } catch (error) {
+        const code = error instanceof ApiError ? error.code : "video_generation_failed";
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Video generation failed unexpectedly.";
+        await failJob(input, code, message);
+      }
+    });
   } finally {
     admission.release();
   }

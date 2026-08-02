@@ -36,7 +36,7 @@ describe("desktop installer packaging", () => {
     }
   });
 
-  it("routes each platform through one controlled packaging entrypoint", () => {
+  it("keeps the supported release target on one controlled packaging entrypoint", () => {
     const packageJson = JSON.parse(source("package.json"));
     const tauri = JSON.parse(source("src-tauri/tauri.conf.json"));
     const build = source("scripts/desktop-build.mjs");
@@ -45,10 +45,11 @@ describe("desktop installer packaging", () => {
     expect(packageJson.scripts["desktop:build"]).toBe("node scripts/desktop-build.mjs");
     expect(packageJson.scripts["desktop:build:local"]).toBe("node scripts/desktop-build-local.mjs");
     expect(tauri.bundle.targets).toEqual(["app"]);
-    expect(build).toContain('runTauri(["--bundles", "nsis"]');
     expect(build).toContain('const tauriArgs = ["--bundles", "app"]');
     expect(build).toContain("createMacDmg");
     expect(build).toContain("verifyMacDmg");
+    expect(build).toContain("currently supported only on macOS");
+    expect(build).not.toContain('"--bundles", "nsis"');
     expect(localBuild).toContain('"--local-unsigned"');
   });
 
@@ -96,7 +97,10 @@ describe("desktop installer packaging", () => {
     const tauriConfig = JSON.parse(source("src-tauri/tauri.conf.json"));
 
     expect(tauriConfig.app.windows[0].visible).toBe(false);
-    expect(tauriSource).toContain("boot_desktop_runtime(startup_app, startup_download_state)");
+    expect(tauriSource).toContain(
+      "schedule_desktop_runtime_boot(startup_app, startup_download_state)",
+    );
+    expect(tauriSource).toContain('spawn_lifecycle_task("lunery-desktop-boot"');
     expect(tauriSource).toContain('navigate_and_show(app, "tauri://localhost/error.html")');
     expect(tauriSource).toContain("probe_desktop_health(port, expected_session_hash)");
     expect(bundleAssets).toContain('await invoke("retry_desktop_runtime")');
@@ -118,10 +122,16 @@ describe("desktop installer packaging", () => {
 
   it("recovers an incompatible prelaunch database without blocking the window", () => {
     const runtime = source("scripts/desktop-runtime-server.mjs");
+    const migrations = source("scripts/desktop-pglite-migrations.mjs");
 
-    expect(runtime).toContain("class IncompatibleDesktopDatabaseError extends Error");
-    expect(runtime).toContain("archiveIncompatibleDatabase(dataRoot)");
-    expect(runtime).toContain('path.join(path.dirname(dataRoot), "recovery")');
+    expect(migrations).toContain("class IncompatibleDesktopDatabaseError extends Error");
+    expect(migrations).toContain("archiveIncompatibleDatabase(dataRoot)");
+    expect(migrations).toContain('path.join(path.dirname(dataRoot), "recovery")');
+    expect(migrations).toContain("await db.transaction(async (tx) =>");
+    expect(runtime).toContain('from "./desktop-pglite-migrations.mjs"');
+    const bundleAssets = source("scripts/desktop-bundle-assets.mjs");
+    expect(bundleAssets).toContain('path.join(root, "scripts", "desktop-pglite-migrations.mjs")');
+    expect(bundleAssets).toContain('path.join(appOut, "desktop-pglite-migrations.mjs")');
     expect(runtime).toContain("const db = await openDesktopDatabase(dataRoot, migrationsDir)");
     expect(runtime).toContain('process.env.LUNERY_PARENT_PID || "0"');
     expect(runtime).not.toContain("idleTimeout:");
@@ -140,7 +150,8 @@ describe("desktop installer packaging", () => {
 
     expect(workflow).toContain("run: pnpm desktop:build");
     expect(workflow).toContain("runner: macos-latest");
-    expect(workflow).toContain("runner: windows-latest");
+    expect(workflow).not.toContain("runner: windows-latest");
+    expect(workflow).not.toContain("Lunery-Lab-Studio-Windows-x64.exe");
     // Hosted runners import the Developer ID certificate into an ephemeral
     // keychain under RUNNER_TEMP and delete the decoded .p12 before building.
     expect(workflow).toContain("Import Apple Developer certificate into a temporary keychain");
