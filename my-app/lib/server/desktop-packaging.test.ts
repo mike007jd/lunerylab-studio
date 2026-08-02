@@ -96,7 +96,10 @@ describe("desktop installer packaging", () => {
     const tauriConfig = JSON.parse(source("src-tauri/tauri.conf.json"));
 
     expect(tauriConfig.app.windows[0].visible).toBe(false);
-    expect(tauriSource).toContain("boot_desktop_runtime(startup_app, startup_download_state)");
+    expect(tauriSource).toContain(
+      "schedule_desktop_runtime_boot(startup_app, startup_download_state)",
+    );
+    expect(tauriSource).toContain('spawn_lifecycle_task("lunery-desktop-boot"');
     expect(tauriSource).toContain('navigate_and_show(app, "tauri://localhost/error.html")');
     expect(tauriSource).toContain("probe_desktop_health(port, expected_session_hash)");
     expect(bundleAssets).toContain('await invoke("retry_desktop_runtime")');
