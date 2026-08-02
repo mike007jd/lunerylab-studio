@@ -11,6 +11,13 @@ import {
 } from "@/lib/server/storage";
 import { ApiError } from "@/lib/server/errors";
 import { luneryConfigDir } from "@/lib/server/lunery-profile";
+import {
+  nativeCleanupWorkspaceRestore,
+  nativePrepareWorkspaceRestore,
+  nativePromoteWorkspaceRestoreRoots,
+  nativeSealWorkspaceRestoreRoot,
+  nativeWriteWorkspaceRestoreFile,
+} from "@/lib/server/native-profile-fs";
 import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
 import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
 import {
@@ -18,8 +25,6 @@ import {
   RESTORE_JOURNAL_VERSION,
   WORKSPACE_RESTORE_COMMIT_ID,
   buildExpectedRestoreSwaps,
-  fsyncDirectory,
-  fsyncTree,
   pathExists,
   reconcileWorkspaceRestoreState,
   removeRestoreJournal,
@@ -127,12 +132,8 @@ export type RestorePromotionBoundary =
   | "after-media-stage-fsync"
   | "after-config-stage-files"
   | "after-config-stage-fsync"
-  | "before-media-root-to-previous"
-  | "after-media-root-to-previous"
-  | "after-media-staged-to-root"
-  | "before-config-root-to-previous"
-  | "after-config-root-to-previous"
-  | "after-config-staged-to-root"
+  | "before-native-root-promotion"
+  | "after-native-root-promotion"
   | "after-commit-marker";
 
 type RestorePromotionHook = (boundary: RestorePromotionBoundary) => void | Promise<void>;
@@ -512,22 +513,6 @@ function reviveDates(row: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-async function removeStagedSwaps(swaps: RestoreJournalSwap[]): Promise<void> {
-  const failures: unknown[] = [];
-  for (const swap of swaps) {
-    try {
-      if (await pathExists(swap.staged)) {
-        await fs.rm(swap.staged, { recursive: true, force: true });
-      }
-    } catch (error) {
-      failures.push(error);
-    }
-  }
-  if (failures.length > 0) {
-    throw failures[0];
-  }
-}
-
 /**
  * Replace the current workspace with a verified backup. A durable journal is
  * published before staging begins; staged trees and promoted parent metadata
@@ -557,36 +542,47 @@ export async function restoreWorkspaceBackup(
     const expected = buildExpectedRestoreSwaps(token);
 
     const stageDirectory = async (
-      plan: RestoreJournalSwap,
       entries: Array<{ path: string; base64: string }>,
       boundaryPrefix: "media" | "config",
       allowedRoots?: ReadonlySet<string>,
     ): Promise<void> => {
-      try {
-        await fs.mkdir(plan.staged, { recursive: true });
-        for (const entry of entries) {
-          const relative = assertRelativeBackupPath(entry.path, allowedRoots);
-          const target = path.join(plan.staged, ...relative.split("/"));
-          await fs.mkdir(path.dirname(target), { recursive: true });
-          await fs.writeFile(target, Buffer.from(entry.base64, "base64"), { flag: "wx" });
-        }
-        await hitRestoreBoundary(`after-${boundaryPrefix}-stage-files`);
-        await fsyncTree(plan.staged);
-        await hitRestoreBoundary(`after-${boundaryPrefix}-stage-fsync`);
-      } catch (error) {
-        await fs.rm(plan.staged, { recursive: true, force: true });
-        throw error;
+      for (const entry of entries) {
+        const relative = assertRelativeBackupPath(entry.path, allowedRoots);
+        await nativeWriteWorkspaceRestoreFile(
+          token,
+          boundaryPrefix,
+          relative,
+          Buffer.from(entry.base64, "base64"),
+        );
       }
+      await hitRestoreBoundary(`after-${boundaryPrefix}-stage-files`);
+      await nativeSealWorkspaceRestoreRoot(token, boundaryPrefix);
+      await hitRestoreBoundary(`after-${boundaryPrefix}-stage-fsync`);
     };
 
     const swaps: RestoreJournalSwap[] = [];
     for (const plan of expected) {
-      await fs.mkdir(path.dirname(plan.root), { recursive: true });
+      const metadata = await fs.lstat(plan.root, { bigint: true });
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new Error("Workspace restore root must be a real directory.");
+      }
       swaps.push({
         ...plan,
-        previousExisted: await pathExists(plan.root),
+        previousExisted: true,
+        originalDevice: metadata.dev.toString(),
+        originalInode: metadata.ino.toString(),
       });
     }
+    const originalIdentities = {
+      media: {
+        device: swaps[0]!.originalDevice,
+        inode: swaps[0]!.originalInode,
+      },
+      config: {
+        device: swaps[1]!.originalDevice,
+        inode: swaps[1]!.originalInode,
+      },
+    };
 
     let journalWritten = false;
     try {
@@ -601,40 +597,18 @@ export async function restoreWorkspaceBackup(
       journalWritten = true;
       await hitRestoreBoundary("after-journal-before-staging");
 
-      const mediaSwap = swaps[0]!;
-      const configSwap = swaps[1]!;
+      await nativePrepareWorkspaceRestore(token, originalIdentities);
+
       await stageDirectory(
-        mediaSwap,
         backup.media,
         "media",
         new Set(["generated", "uploads"]),
       );
-      await stageDirectory(configSwap, backup.config, "config");
+      await stageDirectory(backup.config, "config");
 
-      await hitRestoreBoundary("before-media-root-to-previous");
-      if (mediaSwap.previousExisted) await fs.rename(mediaSwap.root, mediaSwap.previous);
-      await hitRestoreBoundary("after-media-root-to-previous");
-      await fs.rename(mediaSwap.staged, mediaSwap.root);
-      await hitRestoreBoundary("after-media-staged-to-root");
-
-      await hitRestoreBoundary("before-config-root-to-previous");
-      if (configSwap.previousExisted) await fs.rename(configSwap.root, configSwap.previous);
-      await hitRestoreBoundary("after-config-root-to-previous");
-      await fs.rename(configSwap.staged, configSwap.root);
-      await hitRestoreBoundary("after-config-staged-to-root");
-
-      // Parent-directory metadata for the promoted roots must be durable before
-      // the DB commit marker lands.
-      await fsyncDirectory(path.dirname(mediaSwap.root));
-      await fsyncDirectory(path.dirname(configSwap.root));
-      await fsyncDirectory(mediaSwap.root).catch((error) => {
-        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
-        throw error;
-      });
-      await fsyncDirectory(configSwap.root).catch((error) => {
-        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
-        throw error;
-      });
+      await hitRestoreBoundary("before-native-root-promotion");
+      await nativePromoteWorkspaceRestoreRoots(token);
+      await hitRestoreBoundary("after-native-root-promotion");
 
       await prisma.$transaction(
         async (tx) => {
@@ -708,7 +682,8 @@ export async function restoreWorkspaceBackup(
           });
         }
       } else {
-        await removeStagedSwaps(swaps);
+        // No native staging authority or filesystem mutation exists before the
+        // durable journal is published.
       }
       throw error;
     }
@@ -726,15 +701,10 @@ export async function restoreWorkspaceBackup(
         });
       }
     }
-    for (const swap of swaps) {
-      if (!swap.previousExisted) continue;
-      try {
-        await fs.rm(swap.previous, { recursive: true, force: true });
-      } catch {
-        warnings.push(
-          `Previous ${path.basename(swap.root)} directory cleanup is pending and will retry on restart.`,
-        );
-      }
+    try {
+      await nativeCleanupWorkspaceRestore(token, originalIdentities);
+    } catch {
+      warnings.push("Previous workspace directories cleanup is pending and will retry on restart.");
     }
 
     if (warnings.length === 0) {

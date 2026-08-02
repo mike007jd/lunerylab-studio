@@ -5,6 +5,12 @@ import path from "node:path";
 import { prisma } from "@/lib/server/prisma";
 import { luneryConfigDir, luneryDataDir, luneryMediaDir } from "@/lib/server/lunery-profile";
 import {
+  nativeCleanupWorkspaceRestore,
+  nativeRefreshWorkspaceRestoreRoots,
+  nativeRollbackWorkspaceRestoreRoots,
+  type NativeWorkspaceRestoreOriginalIdentities,
+} from "@/lib/server/native-profile-fs";
+import {
   getWorkspaceExclusiveCapability,
   hasWorkspaceMutationAuthority,
   withWorkspaceExclusive,
@@ -22,6 +28,8 @@ export interface RestoreJournalSwap {
   staged: string;
   previous: string;
   previousExisted: boolean;
+  originalDevice: string;
+  originalInode: string;
 }
 
 export interface RestoreJournal {
@@ -128,7 +136,9 @@ function siblingRestorePath(root: string, kind: "stage" | "previous", token: str
  * Canonical media+config swap descriptors for the current resolved profile roots
  * and a restore token. Callers fill `previousExisted` after probing the roots.
  */
-export function buildExpectedRestoreSwaps(token: string): Omit<RestoreJournalSwap, "previousExisted">[] {
+export function buildExpectedRestoreSwaps(
+  token: string,
+): Omit<RestoreJournalSwap, "previousExisted" | "originalDevice" | "originalInode">[] {
   assertRestoreToken(token);
   const mediaRoot = path.resolve(luneryMediaDir());
   const configRoot = path.resolve(luneryConfigDir());
@@ -180,6 +190,10 @@ export function validateRestoreJournal(journal: RestoreJournal): RestoreJournal 
       typeof actual.staged !== "string" ||
       typeof actual.previous !== "string" ||
       typeof actual.previousExisted !== "boolean" ||
+      typeof actual.originalDevice !== "string" ||
+      typeof actual.originalInode !== "string" ||
+      !/^\d+$/.test(actual.originalDevice) ||
+      !/^\d+$/.test(actual.originalInode) ||
       !samePath(actual.root, want.root) ||
       !samePath(actual.staged, want.staged) ||
       !samePath(actual.previous, want.previous)
@@ -191,6 +205,8 @@ export function validateRestoreJournal(journal: RestoreJournal): RestoreJournal 
       staged: want.staged,
       previous: want.previous,
       previousExisted: actual.previousExisted,
+      originalDevice: actual.originalDevice,
+      originalInode: actual.originalInode,
     });
   }
   return {
@@ -198,6 +214,17 @@ export function validateRestoreJournal(journal: RestoreJournal): RestoreJournal 
     version: RESTORE_JOURNAL_VERSION,
     token,
     swaps,
+  };
+}
+
+function journalOriginalIdentities(
+  journal: RestoreJournal,
+): NativeWorkspaceRestoreOriginalIdentities {
+  const media = journal.swaps[0]!;
+  const config = journal.swaps[1]!;
+  return {
+    media: { device: media.originalDevice, inode: media.originalInode },
+    config: { device: config.originalDevice, inode: config.originalInode },
   };
 }
 
@@ -304,97 +331,6 @@ export async function clearRestoreCommitMarker(): Promise<void> {
   });
 }
 
-type SwapPhase =
-  | "not_started"
-  | "root_moved"
-  | "promoted"
-  | "promoted_empty_baseline"
-  | "clean";
-
-/**
- * Infer restore phase from durable root/staged/previous presence. Never trust
- * previousExisted alone to delete an untouched root (media promoted / config
- * still original is the critical case).
- */
-async function inferSwapPhase(swap: RestoreJournalSwap): Promise<SwapPhase> {
-  const rootExists = await pathExists(swap.root);
-  const stagedExists = await pathExists(swap.staged);
-  const previousExists = await pathExists(swap.previous);
-
-  if (previousExists) {
-    return rootExists ? "promoted" : "root_moved";
-  }
-  if (stagedExists) {
-    // Promotion never began for this swap — root still holds the original tree
-    // (or remains absent when previousExisted was false).
-    return "not_started";
-  }
-  if (rootExists && !swap.previousExisted) {
-    // Empty baseline was replaced by staged→root; roll back by removing root.
-    return "promoted_empty_baseline";
-  }
-  if (rootExists && swap.previousExisted) {
-    // previousExisted claimed an old root, but previous is absent and staged is
-    // gone — treat as not started / already rolled back; never delete root.
-    return "not_started";
-  }
-  return "clean";
-}
-
-async function removePathIfPresent(target: string): Promise<void> {
-  if (await pathExists(target)) {
-    await fs.rm(target, { recursive: true, force: true });
-  }
-}
-
-async function rollbackSwap(swap: RestoreJournalSwap): Promise<void> {
-  const phase = await inferSwapPhase(swap);
-  switch (phase) {
-    case "promoted": {
-      await removePathIfPresent(swap.root);
-      await fs.rename(swap.previous, swap.root);
-      await removePathIfPresent(swap.staged);
-      break;
-    }
-    case "root_moved": {
-      await fs.rename(swap.previous, swap.root);
-      await removePathIfPresent(swap.staged);
-      break;
-    }
-    case "promoted_empty_baseline": {
-      await removePathIfPresent(swap.root);
-      await removePathIfPresent(swap.staged);
-      break;
-    }
-    case "not_started": {
-      // Keep untouched root (old config after media-only promotion).
-      await removePathIfPresent(swap.staged);
-      await removePathIfPresent(swap.previous);
-      break;
-    }
-    case "clean": {
-      await removePathIfPresent(swap.staged);
-      await removePathIfPresent(swap.previous);
-      break;
-    }
-    default: {
-      const _exhaustive: never = phase;
-      throw new Error(`Unknown restore swap phase: ${_exhaustive}`);
-    }
-  }
-}
-
-async function finishCommittedSwap(swap: RestoreJournalSwap): Promise<void> {
-  if (!(await pathExists(swap.root))) {
-    // The DB commit proves the new workspace is authoritative. Never discard
-    // the previous tree when the promoted root is missing; preserve the
-    // journal and recovery material for fail-closed diagnosis/retry.
-    throw new Error(`Committed workspace restore root is missing: ${path.basename(swap.root)}`);
-  }
-  await removePathIfPresent(swap.staged);
-  await removePathIfPresent(swap.previous);
-}
-
 /**
  * Reconcile a crash mid-restore into a deterministic old+old or new+new state.
  * Journal absent → no-op (clear orphan marker). Marker absent → phase-correct
@@ -428,13 +364,13 @@ async function reconcileWorkspaceRestoreStateWithAuthority(): Promise<void> {
         );
       }
     }
-    for (const swap of journal.swaps) {
-      await finishCommittedSwap(swap);
-    }
+    // Startup may have freshly pinned these roots; an in-process recovery may
+    // still hold the pre-swap identities. The native boundary validates the
+    // live roots before publishing both identities together.
+    await nativeRefreshWorkspaceRestoreRoots(journal.token);
+    await nativeCleanupWorkspaceRestore(journal.token, journalOriginalIdentities(journal));
   } else {
-    for (const swap of [...journal.swaps].reverse()) {
-      await rollbackSwap(swap);
-    }
+    await nativeRollbackWorkspaceRestoreRoots(journal.token, journalOriginalIdentities(journal));
   }
 
   await removeRestoreJournal();

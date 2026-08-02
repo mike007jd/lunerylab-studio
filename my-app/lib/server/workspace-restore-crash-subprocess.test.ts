@@ -215,18 +215,17 @@ async function listRecoveryResidue(profileRoot: string): Promise<string[]> {
   return residue;
 }
 
+// JavaScript can truthfully observe staging and the native pair operation only
+// before/after its bridge call. Native media/config partial-rename crash phases
+// are covered by descriptor-level Rust rollback seam tests.
 const UNCOMMITTED_BOUNDARIES: RestorePromotionBoundary[] = [
   "after-journal-before-staging",
   "after-media-stage-files",
   "after-media-stage-fsync",
   "after-config-stage-files",
   "after-config-stage-fsync",
-  "before-media-root-to-previous",
-  "after-media-root-to-previous",
-  "after-media-staged-to-root",
-  "before-config-root-to-previous",
-  "after-config-root-to-previous",
-  "after-config-staged-to-root",
+  "before-native-root-promotion",
+  "after-native-root-promotion",
 ];
 
 (isCrashChild ? describe : describe.skip)("restore crash child", () => {

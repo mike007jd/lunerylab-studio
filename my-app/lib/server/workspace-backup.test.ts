@@ -77,6 +77,7 @@ import {
   writeRestoreJournal,
 } from "@/lib/server/workspace-restore-journal";
 import { createHash } from "node:crypto";
+import { resetNativeProfileFsRestoreForTests } from "@/lib/server/native-profile-fs";
 
 let testRoot = "";
 
@@ -85,6 +86,7 @@ beforeEach(async () => {
   for (const key of Object.keys(mocks.models)) delete mocks.models[key];
   resetWorkspaceOperationGateForTests();
   resetWorkspaceRestoreReconcileForTests();
+  resetNativeProfileFsRestoreForTests();
   mocks.getStoredFileMetadata.mockResolvedValue({
     byteSize: 0,
     mimeType: "application/octet-stream",
@@ -93,6 +95,8 @@ beforeEach(async () => {
   vi.stubEnv("LUNERY_CONFIG_DIR", path.join(testRoot, "config"));
   vi.stubEnv("LUNERY_MEDIA_DIR", path.join(testRoot, "media"));
   vi.stubEnv("LUNERY_DATA_DIR", path.join(testRoot, "data"));
+  await fs.mkdir(path.join(testRoot, "config"));
+  await fs.mkdir(path.join(testRoot, "media"));
   // $transaction passes a tx that proxies to the same per-model mocks.
   mocks.transaction.mockImplementation(async (fn: (tx: unknown) => unknown) => {
     const txHandler = {
@@ -108,6 +112,7 @@ beforeEach(async () => {
 afterEach(async () => {
   resetWorkspaceOperationGateForTests();
   resetWorkspaceRestoreReconcileForTests();
+  resetNativeProfileFsRestoreForTests();
   vi.unstubAllEnvs();
   await fs.rm(testRoot, { recursive: true, force: true });
 });
@@ -508,10 +513,24 @@ describe("restore crash reconciliation", () => {
     await fs.writeFile(path.join(config.root, "new.json"), "new-config");
     await fs.writeFile(path.join(media.previous, "generated/old.png"), "old-media");
     await fs.writeFile(path.join(config.previous, "old.json"), "old-config");
+    const [mediaOriginal, configOriginal] = await Promise.all([
+      fs.lstat(media.previous, { bigint: true }),
+      fs.lstat(config.previous, { bigint: true }),
+    ]);
     return {
       swaps: [
-        { ...media, previousExisted: true },
-        { ...config, previousExisted: true },
+        {
+          ...media,
+          previousExisted: true,
+          originalDevice: mediaOriginal.dev.toString(),
+          originalInode: mediaOriginal.ino.toString(),
+        },
+        {
+          ...config,
+          previousExisted: true,
+          originalDevice: configOriginal.dev.toString(),
+          originalInode: configOriginal.ino.toString(),
+        },
       ],
     };
   }
@@ -541,6 +560,33 @@ describe("restore crash reconciliation", () => {
     // Idempotent across a second restart with no residue.
     await reconcileWorkspaceRestoreState();
     expect(await fs.readFile(path.join(testRoot, "media/generated/old.png"), "utf8")).toBe("old-media");
+  });
+
+  it("rejects a replaced durable previous root before mutating either live root", async () => {
+    const token = "crash-previous-replaced";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await fs.rm(swaps[0]!.previous, { recursive: true, force: true });
+    await fs.mkdir(path.join(swaps[0]!.previous, "generated"), { recursive: true });
+    await fs.writeFile(path.join(swaps[0]!.previous, "generated/replacement.png"), "replacement");
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
+
+    await expect(reconcileWorkspaceRestoreState()).rejects.toThrow(
+      "previous root identity changed",
+    );
+
+    expect(await fs.readFile(path.join(testRoot, "config/new.json"), "utf8")).toBe("new-config");
+    expect(await fs.readFile(path.join(swaps[1]!.previous, "old.json"), "utf8")).toBe("old-config");
+    expect(
+      await fs.readFile(path.join(swaps[0]!.previous, "generated/replacement.png"), "utf8"),
+    ).toBe("replacement");
+    await expect(fs.access(restoreJournalPath())).resolves.toBeUndefined();
   });
 
   it("holds startup crash reconciliation exclusively before sync config writes", async () => {
@@ -641,14 +687,28 @@ describe("restore crash reconciliation", () => {
     await fs.writeFile(path.join(media.previous, "generated/old.png"), "old-media");
     await fs.writeFile(path.join(config.root, "old.json"), "old-config");
     await fs.writeFile(path.join(config.staged, "new.json"), "new-config");
+    const [mediaOriginal, configOriginal] = await Promise.all([
+      fs.lstat(media.previous, { bigint: true }),
+      fs.lstat(config.root, { bigint: true }),
+    ]);
 
     await writeRestoreJournal({
       format: "lunery-workspace-restore-journal",
       version: 1,
       token,
       swaps: [
-        { ...media, previousExisted: true },
-        { ...config, previousExisted: true },
+        {
+          ...media,
+          previousExisted: true,
+          originalDevice: mediaOriginal.dev.toString(),
+          originalInode: mediaOriginal.ino.toString(),
+        },
+        {
+          ...config,
+          previousExisted: true,
+          originalDevice: configOriginal.dev.toString(),
+          originalInode: configOriginal.ino.toString(),
+        },
       ],
     });
     mocks.models.workspaceRestoreCommit = makeModel();

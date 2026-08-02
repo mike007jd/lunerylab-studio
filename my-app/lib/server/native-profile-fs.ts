@@ -8,13 +8,24 @@ import { NextResponse } from "next/server";
 import { bridgeFetch, requireDesktopBridge } from "@/lib/server/desktop-bridge";
 import {
   luneryConfigDir,
+  luneryDataDir,
+  luneryLogDir,
   luneryMediaDir,
   luneryModelsDir,
+  luneryPgliteDir,
+  luneryProfileRoot,
   luneryRuntimeDir,
 } from "@/lib/server/lunery-profile";
 import { ApiError } from "@/lib/server/errors";
 
 export type NativeProfileRoot = "config" | "media" | "models" | "runtime";
+export type NativeWorkspaceRestoreRoot = "config" | "media";
+export type NativeWorkspaceRestoreOriginalIdentities = Record<
+  NativeWorkspaceRestoreRoot,
+  { device: string; inode: string }
+>;
+
+const WORKSPACE_RESTORE_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/;
 
 type ProfileFsRequest =
   | { operation: "mkdir"; root: NativeProfileRoot; relative_path: string }
@@ -45,7 +56,27 @@ type ProfileFsRequest =
       expected_inode: string;
       expected_size: string;
       expected_modified_at_ns: string;
-    };
+    }
+  | ({ operation: "prepare-workspace-restore"; token: string } & RestoreIdentityRequest)
+  | {
+      operation: "write-workspace-restore-file";
+      token: string;
+      root: NativeWorkspaceRestoreRoot;
+      relative_path: string;
+      source_path: string;
+    }
+  | { operation: "seal-workspace-restore-root"; token: string; root: NativeWorkspaceRestoreRoot }
+  | { operation: "promote-workspace-restore-roots"; token: string }
+  | ({ operation: "rollback-workspace-restore-roots"; token: string } & RestoreIdentityRequest)
+  | ({ operation: "cleanup-workspace-restore"; token: string } & RestoreIdentityRequest)
+  | { operation: "refresh-workspace-restore-roots"; token: string };
+
+type RestoreIdentityRequest = {
+  config_original_device: string;
+  config_original_inode: string;
+  media_original_device: string;
+  media_original_inode: string;
+};
 
 export const __nativeProfileFsTestHooks = {
   execute: null as null | ((request: ProfileFsRequest) => Promise<void> | void),
@@ -91,6 +122,101 @@ function rootPath(root: NativeProfileRoot): string {
   }
 }
 
+function validateWorkspaceRestoreToken(token: string): string {
+  if (!WORKSPACE_RESTORE_TOKEN_PATTERN.test(token)) {
+    throw new Error("Invalid workspace restore token.");
+  }
+  return token;
+}
+
+function restoreIdentityRequest(
+  identities: NativeWorkspaceRestoreOriginalIdentities,
+): RestoreIdentityRequest {
+  for (const root of ["media", "config"] as const) {
+    if (!/^\d+$/.test(identities[root].device) || !/^\d+$/.test(identities[root].inode)) {
+      throw new Error("Invalid workspace restore root identity.");
+    }
+  }
+  return {
+    config_original_device: identities.config.device,
+    config_original_inode: identities.config.inode,
+    media_original_device: identities.media.device,
+    media_original_inode: identities.media.inode,
+  };
+}
+
+function identitiesFromRequest(request: RestoreIdentityRequest): NativeWorkspaceRestoreOriginalIdentities {
+  return {
+    config: {
+      device: request.config_original_device,
+      inode: request.config_original_inode,
+    },
+    media: {
+      device: request.media_original_device,
+      inode: request.media_original_inode,
+    },
+  };
+}
+
+function fallbackRestorePaths(root: NativeWorkspaceRestoreRoot, token: string) {
+  const live = path.resolve(/* turbopackIgnore: true */ rootPath(root));
+  const prefix = path.join(path.dirname(live), `.${path.basename(live)}.restore`);
+  return {
+    live,
+    staged: `${prefix}-stage-${token}`,
+    previous: `${prefix}-previous-${token}`,
+    discarded: `${prefix}-discarded-${token}`,
+  };
+}
+
+type FallbackDirectoryIdentity = { device: string; inode: string };
+const fallbackRestoreAuthorities = new Map<
+  string,
+  Record<NativeWorkspaceRestoreRoot, FallbackDirectoryIdentity>
+>();
+
+export function resetNativeProfileFsRestoreForTests(): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("Native profile restore state can only be reset in tests.");
+  }
+  fallbackRestoreAuthorities.clear();
+}
+
+async function fallbackRealDirectory(target: string): Promise<import("node:fs").BigIntStats> {
+  const metadata = await fs.lstat(target, { bigint: true });
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error("Workspace restore path must be a real directory.");
+  }
+  return metadata;
+}
+
+async function fallbackDirectoryExists(target: string): Promise<boolean> {
+  try {
+    await fallbackRealDirectory(target);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function assertFallbackRestoreAuthority(
+  token: string,
+  root: NativeWorkspaceRestoreRoot,
+): Promise<string> {
+  const authority = fallbackRestoreAuthorities.get(token)?.[root];
+  if (!authority) throw new Error("Workspace restore staging authority is unavailable.");
+  const staged = fallbackRestorePaths(root, token).staged;
+  const metadata = await fallbackRealDirectory(staged);
+  if (
+    metadata.dev.toString() !== authority.device
+    || metadata.ino.toString() !== authority.inode
+  ) {
+    throw new Error("Workspace restore staging root identity changed.");
+  }
+  return staged;
+}
+
 async function assertTestProfileParents(
   rootKind: NativeProfileRoot,
   root: string,
@@ -110,12 +236,17 @@ async function assertTestProfileParents(
     current = path.join(current, segment);
     try {
       const metadata = await fs.lstat(current);
-      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      if (metadata.isSymbolicLink()) {
         throw new Error(
           rootKind === "media"
             ? "Storage path component is a symlink."
             : "Profile resource path contains a symlink.",
         );
+      }
+      if (!metadata.isDirectory()) {
+        const conflict = new Error("Profile destination already exists.") as NodeJS.ErrnoException;
+        conflict.code = "EEXIST";
+        throw conflict;
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -197,6 +328,221 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
         throw new Error("Staged external file identity changed; replacement preserved.");
       }
       await fs.unlink(request.absolute_path);
+      return;
+    }
+    case "prepare-workspace-restore": {
+      const token = validateWorkspaceRestoreToken(request.token);
+      if (fallbackRestoreAuthorities.has(token)) return;
+      if (fallbackRestoreAuthorities.size > 0) {
+        throw new Error("Another workspace restore staging authority is active.");
+      }
+      const mediaLive = fallbackRestorePaths("media", token).live;
+      const configLive = fallbackRestorePaths("config", token).live;
+      const relativeMediaToConfig = path.relative(mediaLive, configLive);
+      const relativeConfigToMedia = path.relative(configLive, mediaLive);
+      if (
+        mediaLive === configLive
+        || (!relativeMediaToConfig.startsWith("..") && !path.isAbsolute(relativeMediaToConfig))
+        || (!relativeConfigToMedia.startsWith("..") && !path.isAbsolute(relativeConfigToMedia))
+      ) {
+        throw new Error("Config and media restore roots must not overlap.");
+      }
+      const protectedResources = [
+        luneryProfileRoot(),
+        luneryDataDir(),
+        luneryPgliteDir(),
+        luneryModelsDir(),
+        luneryRuntimeDir(),
+        luneryLogDir(),
+      ].map((resource) => path.resolve(resource));
+      for (const restoreRoot of [mediaLive, configLive]) {
+        if (protectedResources.some((resource) => {
+          const relative = path.relative(restoreRoot, resource);
+          return !relative.startsWith("..") && !path.isAbsolute(relative);
+        })) {
+          throw new Error(
+            "Workspace restore root must not contain a protected profile resource.",
+          );
+        }
+      }
+      const authority = {} as Record<NativeWorkspaceRestoreRoot, FallbackDirectoryIdentity>;
+      const created: string[] = [];
+      try {
+        for (const root of ["media", "config"] as const) {
+          const paths = fallbackRestorePaths(root, token);
+          await fallbackRealDirectory(path.dirname(paths.live));
+          if (!(await fallbackDirectoryExists(paths.live))) {
+            await fs.mkdir(paths.live, { recursive: false, mode: 0o700 });
+          }
+          const liveMetadata = await fallbackRealDirectory(paths.live);
+          const expected = identitiesFromRequest(request)[root];
+          if (
+            liveMetadata.dev.toString() !== expected.device
+            || liveMetadata.ino.toString() !== expected.inode
+          ) {
+            throw new Error("Workspace restore live root identity changed.");
+          }
+          for (const residue of [paths.staged, paths.previous, paths.discarded]) {
+            if (await fallbackDirectoryExists(residue)) {
+              throw new Error("Workspace restore target already exists.");
+            }
+          }
+          await fs.mkdir(paths.staged, { recursive: false, mode: 0o700 });
+          created.push(paths.staged);
+          const metadata = await fallbackRealDirectory(paths.staged);
+          authority[root] = {
+            device: metadata.dev.toString(),
+            inode: metadata.ino.toString(),
+          };
+        }
+        fallbackRestoreAuthorities.set(token, authority);
+      } catch (error) {
+        for (const staged of created.reverse()) {
+          await fs.rmdir(staged).catch(() => undefined);
+        }
+        throw error;
+      }
+      return;
+    }
+    case "write-workspace-restore-file": {
+      const token = validateWorkspaceRestoreToken(request.token);
+      const relativePath = validateRelativePath(request.relative_path);
+      const staged = await assertFallbackRestoreAuthority(token, request.root);
+      await assertTestProfileParents(request.root, staged, relativePath);
+      const destination = path.join(staged, ...relativePath.split("/"));
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.copyFile(
+        request.source_path,
+        destination,
+        (await import("node:fs")).constants.COPYFILE_EXCL,
+      );
+      return;
+    }
+    case "seal-workspace-restore-root": {
+      const staged = await assertFallbackRestoreAuthority(
+        validateWorkspaceRestoreToken(request.token),
+        request.root,
+      );
+      const handle = await fs.open(/* turbopackIgnore: true */ staged, "r");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      return;
+    }
+    case "promote-workspace-restore-roots": {
+      const token = validateWorkspaceRestoreToken(request.token);
+      for (const root of ["media", "config"] as const) {
+        const paths = fallbackRestorePaths(root, token);
+        await fallbackRealDirectory(paths.live);
+        await assertFallbackRestoreAuthority(token, root);
+        if (
+          await fallbackDirectoryExists(paths.previous)
+          || await fallbackDirectoryExists(paths.discarded)
+        ) {
+          throw new Error("Workspace restore promotion destination already exists.");
+        }
+      }
+      for (const root of ["media", "config"] as const) {
+        const paths = fallbackRestorePaths(root, token);
+        await fs.rename(paths.live, paths.previous);
+        await fs.rename(paths.staged, paths.live);
+      }
+      return;
+    }
+    case "rollback-workspace-restore-roots": {
+      const token = validateWorkspaceRestoreToken(request.token);
+      const expectedIdentities = identitiesFromRequest(request);
+      for (const root of ["config", "media"] as const) {
+        const paths = fallbackRestorePaths(root, token);
+        if (await fallbackDirectoryExists(paths.previous)) {
+          const previousMetadata = await fallbackRealDirectory(paths.previous);
+          if (
+            previousMetadata.dev.toString() !== expectedIdentities[root].device
+            || previousMetadata.ino.toString() !== expectedIdentities[root].inode
+          ) {
+            throw new Error("Workspace restore previous root identity changed during rollback.");
+          }
+          if (
+            await fallbackDirectoryExists(paths.live)
+            && await fallbackDirectoryExists(paths.staged)
+            && await fallbackDirectoryExists(paths.discarded)
+          ) {
+            throw new Error("Workspace restore rollback destination already exists.");
+          }
+        } else if (!(await fallbackDirectoryExists(paths.live))) {
+          throw new Error("Workspace restore root is missing during rollback.");
+        }
+        await fallbackDirectoryExists(paths.staged);
+        await fallbackDirectoryExists(paths.discarded);
+      }
+      for (const root of ["config", "media"] as const) {
+        const paths = fallbackRestorePaths(root, token);
+        const previousExists = await fallbackDirectoryExists(paths.previous);
+        const liveExists = await fallbackDirectoryExists(paths.live);
+        const stagedExists = await fallbackDirectoryExists(paths.staged);
+        if (previousExists) {
+          const previousMetadata = await fallbackRealDirectory(paths.previous);
+          if (
+            previousMetadata.dev.toString() !== expectedIdentities[root].device
+            || previousMetadata.ino.toString() !== expectedIdentities[root].inode
+          ) {
+            throw new Error("Workspace restore previous root identity changed during rollback.");
+          }
+          if (liveExists) {
+            const destination = stagedExists ? paths.discarded : paths.staged;
+            if (await fallbackDirectoryExists(destination)) {
+              throw new Error("Workspace restore rollback destination already exists.");
+            }
+            await fs.rename(paths.live, destination);
+          }
+          await fs.rename(paths.previous, paths.live);
+        }
+        for (const residue of [paths.staged, paths.discarded]) {
+          await fs.rm(residue, { recursive: true, force: true });
+        }
+      }
+      fallbackRestoreAuthorities.delete(token);
+      return;
+    }
+    case "cleanup-workspace-restore": {
+      const token = validateWorkspaceRestoreToken(request.token);
+      const expectedIdentities = identitiesFromRequest(request);
+      for (const root of ["media", "config"] as const) {
+        const paths = fallbackRestorePaths(root, token);
+        if (await fallbackDirectoryExists(paths.previous)) {
+          const previousMetadata = await fallbackRealDirectory(paths.previous);
+          if (
+            previousMetadata.dev.toString() !== expectedIdentities[root].device
+            || previousMetadata.ino.toString() !== expectedIdentities[root].inode
+          ) {
+            throw new Error("Workspace restore previous root identity changed during cleanup.");
+          }
+        }
+      }
+      for (const root of ["media", "config"] as const) {
+        const paths = fallbackRestorePaths(root, token);
+        if (await fallbackDirectoryExists(paths.previous)) {
+          const previousMetadata = await fallbackRealDirectory(paths.previous);
+          if (
+            previousMetadata.dev.toString() !== expectedIdentities[root].device
+            || previousMetadata.ino.toString() !== expectedIdentities[root].inode
+          ) {
+            throw new Error("Workspace restore previous root identity changed during cleanup.");
+          }
+        }
+        for (const residue of [paths.staged, paths.previous, paths.discarded]) {
+          await fs.rm(residue, { recursive: true, force: true });
+        }
+      }
+      fallbackRestoreAuthorities.delete(token);
+      return;
+    }
+    case "refresh-workspace-restore-roots": {
+      validateWorkspaceRestoreToken(request.token);
+      await fallbackRealDirectory(rootPath("media"));
+      await fallbackRealDirectory(rootPath("config"));
       return;
     }
   }
@@ -296,6 +642,92 @@ export async function nativeProfileWrite(
   } finally {
     await fs.rm(tempDirectory, { recursive: true, force: true });
   }
+}
+
+export async function nativePrepareWorkspaceRestore(
+  token: string,
+  identities: NativeWorkspaceRestoreOriginalIdentities,
+): Promise<void> {
+  await execute({
+    operation: "prepare-workspace-restore",
+    token: validateWorkspaceRestoreToken(token),
+    ...restoreIdentityRequest(identities),
+  });
+}
+
+export async function nativeWriteWorkspaceRestoreFile(
+  token: string,
+  root: NativeWorkspaceRestoreRoot,
+  relativePath: string,
+  bytes: Buffer,
+): Promise<void> {
+  const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "lunery-native-restore-"));
+  const sourcePath = path.join(tempDirectory, randomUUID());
+  try {
+    const source = await fs.open(sourcePath, "wx", 0o600);
+    try {
+      await source.writeFile(bytes);
+      await source.sync();
+    } finally {
+      await source.close();
+    }
+    await execute({
+      operation: "write-workspace-restore-file",
+      token: validateWorkspaceRestoreToken(token),
+      root,
+      relative_path: validateRelativePath(relativePath),
+      source_path: sourcePath,
+    });
+  } finally {
+    await fs.rm(tempDirectory, { recursive: true, force: true });
+  }
+}
+
+export async function nativeSealWorkspaceRestoreRoot(
+  token: string,
+  root: NativeWorkspaceRestoreRoot,
+): Promise<void> {
+  await execute({
+    operation: "seal-workspace-restore-root",
+    token: validateWorkspaceRestoreToken(token),
+    root,
+  });
+}
+
+export async function nativePromoteWorkspaceRestoreRoots(token: string): Promise<void> {
+  await execute({
+    operation: "promote-workspace-restore-roots",
+    token: validateWorkspaceRestoreToken(token),
+  });
+}
+
+export async function nativeRollbackWorkspaceRestoreRoots(
+  token: string,
+  identities: NativeWorkspaceRestoreOriginalIdentities,
+): Promise<void> {
+  await execute({
+    operation: "rollback-workspace-restore-roots",
+    token: validateWorkspaceRestoreToken(token),
+    ...restoreIdentityRequest(identities),
+  });
+}
+
+export async function nativeCleanupWorkspaceRestore(
+  token: string,
+  identities: NativeWorkspaceRestoreOriginalIdentities,
+): Promise<void> {
+  await execute({
+    operation: "cleanup-workspace-restore",
+    token: validateWorkspaceRestoreToken(token),
+    ...restoreIdentityRequest(identities),
+  });
+}
+
+export async function nativeRefreshWorkspaceRestoreRoots(token: string): Promise<void> {
+  await execute({
+    operation: "refresh-workspace-restore-roots",
+    token: validateWorkspaceRestoreToken(token),
+  });
 }
 
 export async function nativeProfileRename(
