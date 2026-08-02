@@ -61,17 +61,45 @@ describe("native profile filesystem bridge admission", () => {
     expect(native.__nativeProfileFsTestHooks.sleep).not.toHaveBeenCalled();
   });
 
-  it("does not retry an ambiguous transport failure", async () => {
-    mocks.bridgeFetch.mockRejectedValue(new Error("connection reset"));
+  it("retries an ambiguous mutation with the same native request id", async () => {
+    mocks.bridgeFetch
+      .mockRejectedValueOnce(new Error("connection reset"))
+      .mockResolvedValueOnce(Response.json({ ok: true }));
     const native = await import("@/lib/server/native-profile-fs");
-    native.__nativeProfileFsTestHooks.sleep = vi.fn();
+    const delays: number[] = [];
+    native.__nativeProfileFsTestHooks.sleep = (delayMs) => {
+      delays.push(delayMs);
+    };
 
-    await expect(native.nativeProfileMkdir("media", "generated")).rejects.toMatchObject({
-      code: "safe_file_mutation_failed",
-    });
+    await native.nativeProfileWrite(
+      "media",
+      "generated/result.webp",
+      Buffer.from("result"),
+      { replace: false },
+    );
 
-    expect(mocks.bridgeFetch).toHaveBeenCalledTimes(1);
-    expect(native.__nativeProfileFsTestHooks.sleep).not.toHaveBeenCalled();
+    expect(mocks.bridgeFetch).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([25]);
+    const first = JSON.parse(String((mocks.bridgeFetch.mock.calls[0]?.[2] as RequestInit).body));
+    const second = JSON.parse(String((mocks.bridgeFetch.mock.calls[1]?.[2] as RequestInit).body));
+    expect(first.request_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second.request_id).toBe(first.request_id);
+  });
+
+  it("retries an ambiguous mkdir transport failure because mkdir is idempotent", async () => {
+    mocks.bridgeFetch
+      .mockRejectedValueOnce(new Error("idle preconnect closed"))
+      .mockResolvedValueOnce(Response.json({ ok: true }));
+    const native = await import("@/lib/server/native-profile-fs");
+    const delays: number[] = [];
+    native.__nativeProfileFsTestHooks.sleep = (delayMs) => {
+      delays.push(delayMs);
+    };
+
+    await expect(native.nativeProfileMkdir("media", "generated")).resolves.toBeUndefined();
+
+    expect(mocks.bridgeFetch).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([25]);
   });
 
   it("forwards modification time in the external staged-file identity", async () => {
@@ -104,5 +132,19 @@ describe("native profile filesystem bridge admission", () => {
     await expect(native.nativeProfileRename("models", "a.tmp", "a.json")).rejects.toMatchObject({
       code: "EEXIST",
     });
+  });
+
+  it("maps a native no-replace write collision to EEXIST", async () => {
+    mocks.bridgeFetch.mockResolvedValue(
+      Response.json({ error: "Profile destination already exists" }, { status: 409 }),
+    );
+    const native = await import("@/lib/server/native-profile-fs");
+
+    await expect(native.nativeProfileWrite(
+      "runtime",
+      ".workspace-initialization.lock",
+      Buffer.from("owner"),
+      { replace: false },
+    )).rejects.toMatchObject({ code: "EEXIST" });
   });
 });

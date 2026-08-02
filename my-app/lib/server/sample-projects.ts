@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/server/prisma";
 import {
   deleteStoredFile,
@@ -97,52 +98,54 @@ export async function restoreBundledSampleAssetStorage(
 
 async function seedOneSample(userId: string, def: SampleProjectDef, t: SampleTranslator) {
   return withSharedMutationLease(async () => {
-  const projectName = t(`samples.${def.id}.projectName`);
-  const jobPrompt = t(`samples.${def.id}.jobPrompt`);
-  const sessionTitle = t(`samples.${def.id}.sessionTitle`);
-  // The storage write has to land before the Asset row (since the row
-  // references the storagePath), so we cannot move it inside the tx. To avoid
-  // orphan files on rollback, clean up the just-written files if the tx
-  // throws — the success path leaves them in place.
-  const copied = await writeFilesOrCleanup(
-    def.layers.map((layer) => () => copySampleImageToStorage(layer.source)),
-  );
+    const projectName = t(`samples.${def.id}.projectName`);
+    const jobPrompt = t(`samples.${def.id}.jobPrompt`);
+    const sessionTitle = t(`samples.${def.id}.sessionTitle`);
+    // The storage write has to land before the Asset row (since the row
+    // references the storagePath), so we cannot move it inside the tx. To avoid
+    // orphan files on rollback, clean up the just-written files if the tx
+    // throws — the success path leaves them in place.
+    const copied = await writeFilesOrCleanup(
+      def.layers.map((layer) => () => copySampleImageToStorage(layer.source)),
+    );
 
-  try {
-    await prisma.$transaction(async (tx) => {
-      const project = await tx.project.create({
-        data: {
-          userId,
-          name: projectName,
-          category: "STUDIO",
-          isTemplate: true,
-          templateKey: def.id,
-        },
-        select: { id: true },
-      });
+    try {
+      await prisma.$transaction(async (tx) => {
+        const project = await tx.project.create({
+          data: {
+            userId,
+            name: projectName,
+            category: "STUDIO",
+            isTemplate: true,
+            templateKey: def.id,
+          },
+          select: { id: true },
+        });
 
-      const job = await tx.generationJob.create({
-        data: {
-          userId,
-          projectId: project.id,
-          source: "STUDIO",
-          origin: "TEMPLATE",
-          prompt: jobPrompt,
-          referenceCount: 0,
-          requestedCount: def.layers.length,
-          successCount: def.layers.length,
-          status: "SUCCEEDED",
-          provider: "sample",
-          model: "sample",
-          type: "image",
-          completedAt: new Date(),
-        },
-        select: { id: true },
-      });
+        const job = await tx.generationJob.create({
+          data: {
+            userId,
+            projectId: project.id,
+            source: "STUDIO",
+            origin: "TEMPLATE",
+            prompt: jobPrompt,
+            referenceCount: 0,
+            requestedCount: def.layers.length,
+            successCount: def.layers.length,
+            status: "SUCCEEDED",
+            provider: "sample",
+            model: "sample",
+            type: "image",
+            completedAt: new Date(),
+          },
+          select: { id: true },
+        });
 
-      const assets = await Promise.all(
-        copied.map((file) =>
-          tx.asset.create({
+        // PGlite has one connection. Keep writes sequential even inside the
+        // transaction so no sibling query competes for that connection.
+        const assets: Array<{ id: string }> = [];
+        for (const file of copied) {
+          assets.push(await tx.asset.create({
             data: {
               userId,
               projectId: project.id,
@@ -156,47 +159,52 @@ async function seedOneSample(userId: string, def: SampleProjectDef, t: SampleTra
               height: file.height,
             },
             select: { id: true },
-          })
-        )
+          }));
+        }
+
+        const session = await tx.canvasSession.create({
+          data: {
+            userId,
+            projectId: project.id,
+            title: sessionTitle,
+            status: "EDITING",
+            zoom: 0.6,
+            panX: 0,
+            panY: 0,
+            selectedAssetId: assets[0]?.id ?? null,
+          },
+          select: { id: true },
+        });
+
+        await tx.canvasLayer.createMany({
+          data: def.layers.map((layer, index) => {
+            const asset = assets[index];
+            if (!asset) throw new Error("sample seed: asset/layer index mismatch");
+            return {
+              sessionId: session.id,
+              assetId: asset.id,
+              x: layer.x,
+              y: layer.y,
+              width: layer.width,
+              height: layer.height,
+              rotation: 0,
+              zIndex: index,
+            };
+          }),
+        });
+      });
+    } catch (error) {
+      await Promise.allSettled(
+        copied.map((file) => deleteStoredFile(file.storagePath)),
       );
-
-      const session = await tx.canvasSession.create({
-        data: {
-          userId,
-          projectId: project.id,
-          title: sessionTitle,
-          status: "EDITING",
-          zoom: 0.6,
-          panX: 0,
-          panY: 0,
-          selectedAssetId: assets[0]?.id ?? null,
-        },
-        select: { id: true },
-      });
-
-      await tx.canvasLayer.createMany({
-        data: def.layers.map((layer, index) => {
-          const asset = assets[index];
-          if (!asset) throw new Error("sample seed: asset/layer index mismatch");
-          return {
-            sessionId: session.id,
-            assetId: asset.id,
-            x: layer.x,
-            y: layer.y,
-            width: layer.width,
-            height: layer.height,
-            rotation: 0,
-            zIndex: index,
-          };
-        }),
-      });
-    });
-  } catch (error) {
-    await Promise.allSettled(
-      copied.map((file) => deleteStoredFile(file.storagePath)),
-    );
-    throw error;
-  }
+      // The native first-boot lock prevents normal cross-bundle overlap. Keep
+      // the unique-key arbiter as a final fail-safe if another initializer
+      // nevertheless wins before this transaction commits.
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        return;
+      }
+      throw error;
+    }
   });
 }
 

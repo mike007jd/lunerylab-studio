@@ -65,6 +65,9 @@ vi.mock("@/lib/server/imported-model-registry", () => ({
 vi.mock("@/lib/server/local-model-files", () => ({
   reconcileStagedManagedModelFiles: mocks.reconcileStagedManagedModelFiles,
 }));
+vi.mock("@/lib/server/workspace-initialization-lock", () => ({
+  withWorkspaceInitializationLock: (work: () => Promise<unknown>) => work(),
+}));
 
 import { ensureLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 

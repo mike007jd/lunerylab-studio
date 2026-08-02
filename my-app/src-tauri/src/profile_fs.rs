@@ -3,6 +3,8 @@ use std::path::{Component, Path};
 
 use crate::profile::ProfileDirs;
 
+const WORKSPACE_INITIALIZATION_LOCK: &str = ".workspace-initialization.lock";
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ProfileFsRoot {
@@ -10,6 +12,13 @@ pub(crate) enum ProfileFsRoot {
     Media,
     Models,
     Runtime,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ProfileFsEnvelope {
+    pub(crate) request_id: String,
+    #[serde(flatten)]
+    pub(crate) request: ProfileFsRequest,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +96,14 @@ pub(crate) fn execute_profile_fs(request: ProfileFsRequest) -> Result<(), String
         // back to pathname operations would reopen the containment race.
         Err("Safe profile file mutation is unavailable on this platform".to_string())
     }
+}
+
+pub(crate) fn clear_stale_workspace_initialization_lock() -> Result<(), String> {
+    execute_profile_fs(ProfileFsRequest::Unlink {
+        root: ProfileFsRoot::Runtime,
+        relative_path: WORKSPACE_INITIALIZATION_LOCK.to_string(),
+        missing_ok: true,
+    })
 }
 
 pub(crate) fn initialize_profile_fs_roots(dirs: &ProfileDirs) -> Result<(), String> {
@@ -429,10 +446,11 @@ mod unix {
             | if replace { 0 } else { libc::O_EXCL };
         let fd = unsafe { libc::openat(parent, leaf.as_ptr(), create_flags, 0o600) };
         if fd < 0 {
-            return Err(errno(
-                io::Error::last_os_error(),
-                "Could not open profile file",
-            ));
+            let error = io::Error::last_os_error();
+            if !replace && error.raw_os_error() == Some(libc::EEXIST) {
+                return Err("Profile destination already exists".to_string());
+            }
+            return Err(errno(error, "Could not open profile file"));
         }
         let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut metadata) } < 0 {
@@ -739,12 +757,14 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::{
-            capture_roots, execute, open_root_with_roots, ProfileFsRequest, ProfileFsRoot,
-            BEFORE_RENAME_HOOK,
+            capture_roots, execute, open_root_with_roots, open_target, ProfileFsRequest,
+            ProfileFsRoot, BEFORE_RENAME_HOOK,
         };
         use crate::profile::ProfileDirs;
+        use std::ffi::CString;
         use std::fs;
         use std::io::{Seek, SeekFrom, Write};
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::symlink;
         use std::os::unix::fs::MetadataExt;
         use std::path::PathBuf;
@@ -794,6 +814,23 @@ mod unix {
         fn modified_at_ns(metadata: &fs::Metadata) -> String {
             (i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()))
                 .to_string()
+        }
+
+        #[test]
+        fn no_replace_write_reports_a_stable_destination_collision() {
+            let root = temp_root("write-collision");
+            let directory = fs::File::open(&root).expect("open fixture directory");
+            let leaf = CString::new("workspace.lock").expect("lock name");
+            let first =
+                open_target(directory.as_raw_fd(), &leaf, false).expect("create first lock");
+            first.sync_all().expect("sync first lock");
+
+            let error = open_target(directory.as_raw_fd(), &leaf, false)
+                .expect_err("second no-replace write must collide");
+
+            assert_eq!(error, "Profile destination already exists");
+            drop(first);
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]

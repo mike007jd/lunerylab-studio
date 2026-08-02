@@ -43,6 +43,9 @@ vi.mock("@/lib/server/imported-model-registry", () => ({
 vi.mock("@/lib/server/local-model-files", () => ({
   reconcileStagedManagedModelFiles: mocks.reconcileStagedManagedModelFiles,
 }));
+vi.mock("@/lib/server/workspace-initialization-lock", () => ({
+  withWorkspaceInitializationLock: (work: () => Promise<unknown>) => work(),
+}));
 
 beforeEach(async () => {
   vi.resetModules();
@@ -109,7 +112,7 @@ describe("local workspace owner initialization", () => {
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledTimes(1);
   });
 
-  it("shares the first-boot single-flight across separately compiled module instances", async () => {
+  it("shares the first-boot single-flight across module instances in one isolate", async () => {
     const reconciliation = { release: null as (() => void) | null };
     mocks.ensureWorkspaceRestoreReconciled.mockImplementationOnce(
       () => new Promise<void>((resolve) => {

@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,7 +26,7 @@ use crate::engine_sd::{
 };
 use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
-use crate::profile_fs::{execute_profile_fs, ProfileFsRequest};
+use crate::profile_fs::{execute_profile_fs, ProfileFsEnvelope};
 use crate::secrets::{
     audit_secret_read, delete_provider_secret, get_provider_secret, save_provider_secret,
     ProviderIdPayload, ProviderSecretMutationError, ProviderSecretPayload, ProviderSecretReadError,
@@ -42,6 +42,46 @@ const BRIDGE_MAX_CONNECTIONS: usize = 24;
 const BRIDGE_MAX_LONG: usize = 8;
 /// Control lane: status, cancel, secrets, stop, lease, reset, and other short ops.
 const BRIDGE_MAX_CONTROL: usize = 8;
+const PROFILE_FS_RESULT_CACHE_LIMIT: usize = 1024;
+
+#[derive(Default)]
+struct ProfileFsResultCache {
+    results: HashMap<String, Result<(), String>>,
+    order: VecDeque<String>,
+}
+
+impl ProfileFsResultCache {
+    fn execute(&mut self, envelope: ProfileFsEnvelope) -> Result<(), String> {
+        if !valid_profile_fs_request_id(&envelope.request_id) {
+            return Err("Invalid profile filesystem request id".to_string());
+        }
+        if let Some(result) = self.results.get(&envelope.request_id) {
+            return result.clone();
+        }
+
+        // Hold the cache mutex through execution. A retry that arrives before
+        // the first response is written waits here, then observes the stored
+        // result instead of executing the mutation twice.
+        let result = execute_profile_fs(envelope.request);
+        while self.results.len() >= PROFILE_FS_RESULT_CACHE_LIMIT {
+            if let Some(expired) = self.order.pop_front() {
+                self.results.remove(&expired);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(envelope.request_id.clone());
+        self.results.insert(envelope.request_id, result.clone());
+        result
+    }
+}
+
+fn valid_profile_fs_request_id(value: &str) -> bool {
+    (16..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BridgeLane {
@@ -251,14 +291,19 @@ impl Drop for DesktopBridgeServer {
     }
 }
 
+enum HttpRequestReadError {
+    EmptyConnection,
+    Invalid,
+}
+
 fn read_http_request(
     stream: &mut TcpStream,
-) -> Result<(String, String, HashMap<String, String>, String), String> {
+) -> Result<(String, String, HashMap<String, String>, String), HttpRequestReadError> {
     // Per-chunk read timeout: short enough that a slow-loris attacker can't
     // hold the socket open by dribbling one byte every few seconds.
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|err| err.to_string())?;
+        .map_err(|_| HttpRequestReadError::Invalid)?;
 
     // Per-connection envelope: even if each chunk arrives just inside the 2s
     // read timeout, the whole request still has to land within 10s. Anything
@@ -275,17 +320,32 @@ fn read_http_request(
 
     loop {
         if start.elapsed() > MAX_REQUEST_DURATION {
-            return Err("Request envelope exceeded 10s".to_string());
+            return Err(HttpRequestReadError::Invalid);
         }
-        let read = stream.read(&mut chunk).map_err(|err| err.to_string())?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error)
+                if buffer.is_empty()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return Err(HttpRequestReadError::EmptyConnection);
+            }
+            Err(_) => return Err(HttpRequestReadError::Invalid),
+        };
         if read == 0 {
+            if buffer.is_empty() {
+                return Err(HttpRequestReadError::EmptyConnection);
+            }
             break;
         }
         buffer.extend_from_slice(&chunk[..read]);
 
         if header_end.is_none() {
             if buffer.len() > MAX_HEADER_BYTES {
-                return Err("Request headers too large".to_string());
+                return Err(HttpRequestReadError::Invalid);
             }
             if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
                 header_end = Some(position + 4);
@@ -295,7 +355,7 @@ fn read_http_request(
                         if name.eq_ignore_ascii_case("content-length") {
                             content_length = value.trim().parse::<usize>().unwrap_or_default();
                             if content_length >= MAX_BODY_BYTES {
-                                return Err("Request body too large".to_string());
+                                return Err(HttpRequestReadError::Invalid);
                             }
                         }
                     }
@@ -310,13 +370,11 @@ fn read_http_request(
         }
     }
 
-    let end = header_end.ok_or_else(|| "Invalid HTTP request".to_string())?;
+    let end = header_end.ok_or(HttpRequestReadError::Invalid)?;
     let header_text = String::from_utf8_lossy(&buffer[..end]).to_string();
     let body = String::from_utf8_lossy(&buffer[end..]).to_string();
     let mut lines = header_text.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "Missing request line".to_string())?;
+    let request_line = lines.next().ok_or(HttpRequestReadError::Invalid)?;
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts.next().unwrap_or_default().to_string();
     let path = request_parts.next().unwrap_or_default().to_string();
@@ -542,11 +600,16 @@ fn handle_bridge_request(
     token: &str,
     download_state: Arc<DownloadState>,
     workspace_reset: WorkspaceResetHandler,
+    profile_fs_results: Arc<Mutex<ProfileFsResultCache>>,
     admission: Arc<BridgeAdmission>,
 ) {
-    let Ok((method, path, headers, body)) = read_http_request(&mut stream) else {
-        bridge_error(&mut stream, "400 Bad Request", "Invalid request");
-        return;
+    let (method, path, headers, body) = match read_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(HttpRequestReadError::EmptyConnection) => return,
+        Err(HttpRequestReadError::Invalid) => {
+            bridge_error(&mut stream, "400 Bad Request", "Invalid request");
+            return;
+        }
     };
 
     if admission.is_revoked() {
@@ -630,10 +693,14 @@ fn handle_bridge_request(
             Err(err) => bridge_error(&mut stream, "500 Internal Server Error", &err.to_string()),
         },
         ("POST", "/profile-fs") => {
-            match serde_json::from_str::<ProfileFsRequest>(&body)
+            match serde_json::from_str::<ProfileFsEnvelope>(&body)
                 .map_err(|error| error.to_string())
-                .and_then(execute_profile_fs)
-            {
+                .and_then(|envelope| {
+                    profile_fs_results
+                        .lock()
+                        .map_err(|_| "Profile filesystem result cache is poisoned".to_string())?
+                        .execute(envelope)
+                }) {
                 Ok(()) => write_http_response(
                     &mut stream,
                     "200 OK",
@@ -1307,6 +1374,8 @@ pub(crate) fn start_desktop_bridge(
     let listener_admission = Arc::clone(&admission);
 
     let listener_download_state = Arc::clone(&download_state);
+    let profile_fs_results = Arc::new(Mutex::new(ProfileFsResultCache::default()));
+    let listener_profile_fs_results = Arc::clone(&profile_fs_results);
     let listener_thread = thread::spawn(move || {
         while !listener_shutdown.load(Ordering::Acquire) && !listener_admission.is_revoked() {
             let mut stream = match listener.accept() {
@@ -1331,10 +1400,18 @@ pub(crate) fn start_desktop_bridge(
             let token = bridge_token.clone();
             let ds = Arc::clone(&listener_download_state);
             let reset = Arc::clone(&workspace_reset);
+            let profile_fs_results = Arc::clone(&listener_profile_fs_results);
             let admission_for_worker = Arc::clone(&listener_admission);
             let worker = thread::Builder::new().spawn(move || {
                 let _worker_guard = WorkerGuard::new(Arc::clone(&admission_for_worker));
-                handle_bridge_request(stream, &token, ds, reset, Arc::clone(&admission_for_worker));
+                handle_bridge_request(
+                    stream,
+                    &token,
+                    ds,
+                    reset,
+                    profile_fs_results,
+                    Arc::clone(&admission_for_worker),
+                );
             });
             match worker {
                 Ok(handle) => listener_admission.register_worker_handle(handle),
@@ -1357,14 +1434,16 @@ pub(crate) fn start_desktop_bridge(
 mod tests {
     use super::{
         classify_bridge_lane, provider_secret_mutation_http_status, start_desktop_bridge,
-        BridgeAdmission, BridgeLane, ProviderSecretMutationError, WorkspaceResetHandler,
-        BRIDGE_MAX_CONTROL, BRIDGE_MAX_LONG,
+        BridgeAdmission, BridgeLane, ProfileFsResultCache, ProviderSecretMutationError,
+        WorkspaceResetHandler, BRIDGE_MAX_CONTROL, BRIDGE_MAX_LONG,
     };
     use crate::download::{
         auxiliary_head_for_shutdown_test, update_job_status, DownloadCancel, DownloadJob,
         DownloadState, JobSnapshot,
     };
+    use crate::profile_fs::{ProfileFsEnvelope, ProfileFsRequest, ProfileFsRoot};
     use crate::test_global_lock;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1422,6 +1501,79 @@ mod tests {
             1,
             "explicit shutdown + Drop must run the stop body exactly once"
         );
+    }
+
+    #[test]
+    fn idle_http_preconnect_closes_without_a_bad_request_response() {
+        let _g = test_global_lock();
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server =
+            start_desktop_bridge(Arc::new(DownloadState::default()), reset).expect("start bridge");
+        let mut idle =
+            TcpStream::connect(("127.0.0.1", server.bridge.port)).expect("open idle preconnect");
+        idle.set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("idle read timeout");
+
+        let mut response = [0_u8; 256];
+        let read = idle
+            .read(&mut response)
+            .expect("bridge should close idle preconnect");
+
+        assert_eq!(
+            read, 0,
+            "idle preconnect must close without an HTTP response"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn profile_fs_retry_returns_the_cached_result_without_reexecution() {
+        let _g = test_global_lock();
+        let root = std::env::temp_dir().join(format!(
+            "lunery-profile-fs-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        for directory in [
+            "config",
+            "data/pglite",
+            "data/media",
+            "models",
+            "runtime",
+            "logs",
+        ] {
+            fs::create_dir_all(root.join(directory)).expect("profile directory");
+        }
+        std::env::set_var("LUNERY_HOME", &root);
+        fs::write(root.join("models/source.tmp"), b"first").expect("source");
+        let mut cache = ProfileFsResultCache::default();
+        let request = || ProfileFsEnvelope {
+            request_id: "request-id-00000001".to_string(),
+            request: ProfileFsRequest::Rename {
+                root: ProfileFsRoot::Models,
+                source_relative_path: "source.tmp".to_string(),
+                destination_relative_path: "destination.json".to_string(),
+                replace: false,
+            },
+        };
+
+        cache.execute(request()).expect("first rename");
+        fs::write(root.join("models/source.tmp"), b"second").expect("replacement source");
+        cache.execute(request()).expect("cached retry");
+
+        assert_eq!(
+            fs::read(root.join("models/source.tmp")).expect("retry source preserved"),
+            b"second"
+        );
+        assert_eq!(
+            fs::read(root.join("models/destination.json")).expect("first destination"),
+            b"first"
+        );
+        std::env::remove_var("LUNERY_HOME");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

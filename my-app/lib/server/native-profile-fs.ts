@@ -52,9 +52,10 @@ export const __nativeProfileFsTestHooks = {
   sleep: null as null | ((delayMs: number) => Promise<void> | void),
 };
 
-// A 429 is emitted before the native bridge executes the mutation, so it is
-// the only failure that is safe to retry. Network failures and other statuses
-// may be ambiguous or definitive and must remain single-attempt operations.
+// A 429 is emitted before the native bridge executes the mutation. Every
+// logical operation also carries one request id; the native bridge caches the
+// first completed result while it is alive, so an ambiguous transport retry
+// with that same id can never execute the mutation twice.
 const CAPACITY_RETRY_DELAYS_MS = [25, 50, 100, 200, 400] as const;
 
 async function waitForCapacity(delayMs: number): Promise<void> {
@@ -200,7 +201,7 @@ async function execute(request: ProfileFsRequest): Promise<void> {
       retryable: true,
     });
   }
-  const body = JSON.stringify(request);
+  const body = JSON.stringify({ ...request, request_id: randomUUID() });
   for (let attempt = 0; ; attempt += 1) {
     const response = await bridgeFetch(bridge, "/profile-fs", {
       method: "POST",
@@ -210,7 +211,7 @@ async function execute(request: ProfileFsRequest): Promise<void> {
     if (response?.ok) return;
     if (
       response?.status === 409
-      && request.operation === "rename"
+      && (request.operation === "rename" || request.operation === "write")
       && !request.replace
     ) {
       const payload = await response.json().catch(() => null) as { error?: unknown } | null;
@@ -220,7 +221,12 @@ async function execute(request: ProfileFsRequest): Promise<void> {
         throw conflict;
       }
     }
-    if (response?.status !== 429 || attempt >= CAPACITY_RETRY_DELAYS_MS.length) {
+    const retryableBeforeExecution = response?.status === 429;
+    const retryableIdempotentTransport = response === null;
+    if (
+      (!retryableBeforeExecution && !retryableIdempotentTransport)
+      || attempt >= CAPACITY_RETRY_DELAYS_MS.length
+    ) {
       throw new ApiError({
         status: 503,
         code: "safe_file_mutation_failed",
@@ -228,7 +234,7 @@ async function execute(request: ProfileFsRequest): Promise<void> {
         retryable: true,
       });
     }
-    await response.body?.cancel().catch(() => undefined);
+    await response?.body?.cancel().catch(() => undefined);
     await waitForCapacity(CAPACITY_RETRY_DELAYS_MS[attempt]!);
   }
 }

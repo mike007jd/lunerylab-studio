@@ -8,6 +8,7 @@ import { ensureBuiltInProjectTemplates } from "@/lib/server/sample-projects";
 import { reconcileStagedStoredFileDeletions } from "@/lib/server/storage";
 import { reconcileStagedManagedModelFiles } from "@/lib/server/local-model-files";
 import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
+import { withWorkspaceInitializationLock } from "@/lib/server/workspace-initialization-lock";
 
 export interface LocalWorkspaceOwner {
   id: string;
@@ -49,15 +50,14 @@ const processGlobal = globalThis as typeof globalThis & {
 const runtime = processGlobal[LOCAL_WORKSPACE_OWNER_RUNTIME] ?? { ensurePromise: null };
 processGlobal[LOCAL_WORKSPACE_OWNER_RUNTIME] = runtime;
 
-// Next can compile callers into separate server bundles. A module-level guard
-// is duplicated across those bundles, so concurrent first-boot requests can
-// still overlap owner recovery and PGlite template transactions. Keep the
-// single-flight on globalThis, beside the other process-wide workspace gates.
+// Keep one single-flight for every module instance that shares this JavaScript
+// isolate. Separately compiled Next server bundles can still run outside this
+// global; ensureLocalWorkspaceOwnerOnce() also takes the native profile lock.
 export function resetLocalWorkspaceOwnerForTests(): void {
   runtime.ensurePromise = null;
 }
 
-async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
+async function ensureLocalWorkspaceOwnerUnlocked(): Promise<void> {
   // Crash recovery must finish before any owner/bootstrap query so workspace
   // APIs never observe a split media/config/DB restore.
   await ensureWorkspaceRestoreReconciled();
@@ -104,6 +104,10 @@ async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
   );
 
   await ensureBuiltInProjectTemplates(LOCAL_WORKSPACE_OWNER.id);
+}
+
+async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
+  await withWorkspaceInitializationLock(ensureLocalWorkspaceOwnerUnlocked);
 }
 
 export const ensureLocalWorkspaceOwner = cache(async (): Promise<void> => {

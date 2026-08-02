@@ -28,9 +28,9 @@ use crate::profile::{
     acquire_profile_advisory_lock, ensure_profile_dirs, profile_dirs, ProfileAdvisoryLock,
     ProfileDirs, ProfileStorageDirs,
 };
-use crate::profile_fs::initialize_profile_fs_roots;
 #[cfg(not(debug_assertions))]
 use crate::profile_fs::refresh_profile_fs_roots;
+use crate::profile_fs::{clear_stale_workspace_initialization_lock, initialize_profile_fs_roots};
 use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
 use crate::security::bridge_token;
@@ -1439,6 +1439,10 @@ fn start_desktop_server(
     }
     let profile = profile_dirs()?;
     ensure_profile_dirs(&profile)?;
+    // A backend crash can leave the cross-bundle first-boot lock behind while
+    // the Tauri shell remains alive. We only reach this point after proving
+    // there is no live desktop child, so its lock cannot have a current owner.
+    clear_stale_workspace_initialization_lock()?;
 
     let root = desktop_server_root(app)?;
     let app_dir = root.join("app");
@@ -1944,6 +1948,10 @@ pub fn run() {
             }
             if let Err(err) = initialize_profile_fs_roots(&profile) {
                 eprintln!("desktop safe profile filesystem unavailable: {err}");
+                return Err(Box::<dyn std::error::Error>::from(err));
+            }
+            if let Err(err) = clear_stale_workspace_initialization_lock() {
+                eprintln!("desktop workspace initialization lock cleanup failed: {err}");
                 return Err(Box::<dyn std::error::Error>::from(err));
             }
 

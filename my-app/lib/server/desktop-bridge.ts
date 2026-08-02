@@ -143,6 +143,10 @@ export async function proxyToBridge(
       headers: {
         ...(init?.body != null ? { "content-type": "application/json" } : {}),
         ...init?.headers,
+        // The Rust bridge intentionally closes every response. Explicitly opt
+        // out of Undici keep-alive so a later mutation is never assigned to an
+        // idle preconnection at the same moment the bridge expires it.
+        connection: "close",
         "x-lunery-desktop-token": bridge.token,
       },
       body: init?.body,
@@ -187,6 +191,7 @@ export function bridgeFetch(
     headers: {
       ...(init?.body != null ? { "content-type": "application/json" } : {}),
       ...init?.headers,
+      connection: "close",
       "x-lunery-desktop-token": bridge.token,
     },
     body: init?.body,

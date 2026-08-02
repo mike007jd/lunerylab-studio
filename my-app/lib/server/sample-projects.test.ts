@@ -147,8 +147,8 @@ describe("built-in project template initialization", () => {
     mocks.transaction.mockImplementation(async (operation: (tx: unknown) => unknown) => {
       activeTransactions += 1;
       maximumActiveTransactions = Math.max(maximumActiveTransactions, activeTransactions);
-      await new Promise<void>((resolve) => queueMicrotask(resolve));
       try {
+        await new Promise<void>((resolve) => queueMicrotask(resolve));
         return await operation({
           project: { create: mocks.projectCreate },
           generationJob: { create: mocks.generationJobCreate },
@@ -163,8 +163,25 @@ describe("built-in project template initialization", () => {
 
     await ensureBuiltInProjectTemplates("owner-1");
 
-    expect(mocks.transaction).toHaveBeenCalledTimes(2);
+    expect(mocks.projectCreate).toHaveBeenCalledTimes(2);
     expect(maximumActiveTransactions).toBe(1);
+  });
+
+  it("serializes asset inserts inside each transaction", async () => {
+    let activeWrites = 0;
+    let maximumActiveWrites = 0;
+    mocks.assetCreate.mockImplementation(async () => {
+      activeWrites += 1;
+      maximumActiveWrites = Math.max(maximumActiveWrites, activeWrites);
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      activeWrites -= 1;
+      return { id: `asset-${mocks.assetCreate.mock.calls.length}` };
+    });
+
+    await ensureBuiltInProjectTemplates("owner-1");
+
+    expect(mocks.assetCreate).toHaveBeenCalledTimes(2);
+    expect(maximumActiveWrites).toBe(1);
   });
 
   it("cleans the first file when a later sample-layer write fails, then retries once", async () => {
