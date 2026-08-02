@@ -224,14 +224,16 @@ export async function ensureBuiltInProjectTemplates(userId: string): Promise<voi
         select: { templateKey: true },
       })).flatMap((project) => project.templateKey ? [project.templateKey] : []),
     );
-    const results = await Promise.allSettled(
-      SAMPLE_PROJECTS
-        .filter((def) => !existingTemplateKeys.has(def.id))
-        .map((def) => seedOneSample(userId, def, t)),
-    );
-    for (const result of results) {
-      if (result.status === "rejected") {
-        console.error("[sample_project_seed_failed]", { userId, error: result.reason });
+    // PGlite runs with one database connection. Parallel interactive
+    // transactions can each reserve part of that connection lifecycle and
+    // wait indefinitely, leaving first-run templates absent. Keep each
+    // template independently recoverable, but serialize their transactions.
+    for (const def of SAMPLE_PROJECTS) {
+      if (existingTemplateKeys.has(def.id)) continue;
+      try {
+        await seedOneSample(userId, def, t);
+      } catch (error) {
+        console.error("[sample_project_seed_failed]", { userId, error });
       }
     }
 

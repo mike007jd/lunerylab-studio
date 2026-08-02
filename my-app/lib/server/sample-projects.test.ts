@@ -15,19 +15,20 @@ const mocks = vi.hoisted(() => ({
   writeFilesOrCleanup: vi.fn(),
   deleteStoredFile: vi.fn(),
   getPlainT: vi.fn(),
-}));
-
-vi.mock("node:fs", () => ({
-  promises: { readFile: vi.fn().mockResolvedValue(Buffer.from("sample")) },
-}));
-vi.mock("@/lib/sample-data", () => ({
-  SAMPLE_PROJECTS: [{
+  sampleProjects: [{
     id: "built-in-one",
     layers: [
       { source: "samples/coffee-scene.webp", x: 0, y: 0, width: 100, height: 100 },
       { source: "samples/ceramic-vase.webp", x: 100, y: 0, width: 100, height: 100 },
     ],
   }],
+}));
+
+vi.mock("node:fs", () => ({
+  promises: { readFile: vi.fn().mockResolvedValue(Buffer.from("sample")) },
+}));
+vi.mock("@/lib/sample-data", () => ({
+  SAMPLE_PROJECTS: mocks.sampleProjects,
   SAMPLE_SOURCE_MIME_TYPE: "image/webp",
 }));
 vi.mock("@/lib/i18n/plain", () => ({
@@ -51,6 +52,7 @@ import { ensureBuiltInProjectTemplates } from "@/lib/server/sample-projects";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.sampleProjects.splice(1);
   const templateKeys = new Set<string>();
   mocks.projectFindMany.mockImplementation(async () =>
     [...templateKeys].map((templateKey) => ({ templateKey })),
@@ -131,6 +133,38 @@ describe("built-in project template initialization", () => {
 
     await expect(ensureBuiltInProjectTemplates("owner-1")).resolves.toBeUndefined();
     expect(mocks.deleteStoredFile).toHaveBeenCalledWith("generated/sample.webp");
+  });
+
+  it("serializes template transactions for the single-connection PGlite runtime", async () => {
+    mocks.sampleProjects.push({
+      id: "built-in-two",
+      layers: [
+        { source: "samples/coffee-scene.webp", x: 0, y: 0, width: 100, height: 100 },
+      ],
+    });
+    let activeTransactions = 0;
+    let maximumActiveTransactions = 0;
+    mocks.transaction.mockImplementation(async (operation: (tx: unknown) => unknown) => {
+      activeTransactions += 1;
+      maximumActiveTransactions = Math.max(maximumActiveTransactions, activeTransactions);
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      try {
+        return await operation({
+          project: { create: mocks.projectCreate },
+          generationJob: { create: mocks.generationJobCreate },
+          asset: { create: mocks.assetCreate },
+          canvasSession: { create: mocks.canvasSessionCreate },
+          canvasLayer: { createMany: mocks.canvasLayerCreateMany },
+        });
+      } finally {
+        activeTransactions -= 1;
+      }
+    });
+
+    await ensureBuiltInProjectTemplates("owner-1");
+
+    expect(mocks.transaction).toHaveBeenCalledTimes(2);
+    expect(maximumActiveTransactions).toBe(1);
   });
 
   it("cleans the first file when a later sample-layer write fails, then retries once", async () => {
