@@ -61,8 +61,8 @@ async function ensureLocalWorkspaceOwnerUnlocked(): Promise<void> {
   // Crash recovery must finish before any owner/bootstrap query so workspace
   // APIs never observe a split media/config/DB restore.
   await ensureWorkspaceRestoreReconciled();
-  await reconcileExternalModelDeleteJournals();
   await reconcileStagedManagedModelFiles();
+  await reconcileExternalModelDeleteJournals();
 
   const existing = await prisma.user.findUnique({
     where: { id: LOCAL_WORKSPACE_OWNER.id },

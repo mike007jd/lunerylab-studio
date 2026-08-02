@@ -239,6 +239,81 @@ describe("managed local model file deletion", () => {
     });
   });
 
+  it("restores an external model across managed and external crash journals in startup order", async () => {
+    const files = await import("@/lib/server/local-model-files");
+    const registry = await import("@/lib/server/imported-model-registry");
+    const modelPath = path.join(tmpDir, "external", "cross-journal.gguf");
+    fs.mkdirSync(modelsDir, { recursive: true });
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "external-model");
+    const resolved = await registry.resolveLocalModelPath(modelPath);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const imported = {
+      id: "imported-llama-cpp-cross-journal-12345678",
+      label: "Cross journal",
+      source: "local-path" as const,
+      runtimeTarget: "llama-cpp" as const,
+      capability: "planner-llm" as const,
+      format: "gguf" as const,
+      fileName: path.basename(modelPath),
+      modelPath,
+      sizeBytes: resolved.sizeBytes,
+      fileIdentity: resolved.fileIdentity,
+      sha256: null,
+      status: "ready" as const,
+      createdAt: "2026-08-03T00:00:00.000Z",
+    };
+    const settings = {
+      defaultTextModel: `local:${imported.id}`,
+      defaultImageModel: "",
+    };
+    mocks.userSettingsUpdate.mockImplementation(async (operation: {
+      data: Partial<typeof settings>;
+    }) => {
+      Object.assign(settings, operation.data);
+      return settings;
+    });
+    await registry.upsertImportedModel(imported);
+    const stagedExternal = await registry.stageImportedExternalModelFile(imported);
+    const stagedManaged = await files.stageManagedModelFiles([]);
+    await files.attachManagedModelDeletionRecovery(stagedManaged, {
+      ownerId: "owner-1",
+      modelId: imported.id,
+      importedModel: imported,
+      defaults: {
+        cleared: ["text"],
+        previous: { ...settings },
+      },
+    });
+
+    settings.defaultTextModel = "";
+    await registry.removeImportedModel(imported.id);
+    const managedJournalDir = path.join(modelsDir, ".managed-delete-journal");
+    const managedJournalEntries = fs.readdirSync(managedJournalDir);
+    expect(fs.existsSync(modelPath)).toBe(false);
+    expect(fs.existsSync(stagedExternal.stagedPath)).toBe(true);
+    expect(await registry.findImportedModel(imported.id)).toBeUndefined();
+    expect(settings.defaultTextModel).toBe("");
+    expect(managedJournalEntries.filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    expect(managedJournalEntries.some((name) => name.endsWith(".committed"))).toBe(false);
+
+    await files.reconcileStagedManagedModelFiles();
+    await registry.reconcileExternalModelDeleteJournals();
+
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("external-model");
+    expect(await registry.findImportedModel(imported.id)).toEqual(imported);
+    expect(settings).toEqual({
+      defaultTextModel: `local:${imported.id}`,
+      defaultImageModel: "",
+    });
+    expect(fs.existsSync(stagedExternal.stagedPath)).toBe(false);
+    expect(fs.existsSync(stagedExternal.journalPath)).toBe(false);
+    expect(
+      fs.readdirSync(managedJournalDir)
+        .filter((name) => name.endsWith(".json")),
+    ).toEqual([]);
+  });
+
   it("keeps bytes staged until crash metadata restoration succeeds", async () => {
     const files = await import("@/lib/server/local-model-files");
     const modelPath = path.join(modelsDir, "sd-cpp", "retry-recovery.safetensors");

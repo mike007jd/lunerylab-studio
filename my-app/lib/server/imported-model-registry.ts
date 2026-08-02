@@ -555,6 +555,26 @@ function isExternalDeleteJournal(value: unknown): value is ExternalModelDeleteJo
     && journal.record.modelPath === journal.originalPath;
 }
 
+async function unlinkExpectedExternalDeleteStage(
+  journal: ExternalModelDeleteJournal,
+): Promise<boolean> {
+  if (
+    process.env.NODE_ENV === "test"
+    && __importedModelRegistryTestHooks.beforeExternalReconcileDelete
+  ) {
+    await __importedModelRegistryTestHooks.beforeExternalReconcileDelete(journal.stagedPath);
+  }
+  try {
+    // The native service resolves and verifies the staged file through one
+    // descriptor-relative operation. A replacement after our recovery scan is
+    // user data, so leave both it and the journal for the next reconciliation.
+    await nativeUnlinkExternalIdentity(journal.stagedPath, journal.fileIdentity);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function reconcileExternalModelDeleteJournals(): Promise<void> {
   let journalNames: string[];
   try {
@@ -582,11 +602,15 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
     }
 
     const index = records.findIndex((record) => record.id === journal.modelId);
+    let stagedState: "missing" | "matching" | "changed" = "missing";
     let stagedIdentity: ExternalPathIdentity | null = null;
     try {
       const stagedStat = await fs.lstat(journal.stagedPath, { bigint: true });
       if (!externalIdentityMatches(journal.fileIdentity, stagedStat)) {
+        stagedState = "changed";
         stagedIdentity = externalPathIdentity(stagedStat);
+      } else {
+        stagedState = "matching";
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
@@ -604,6 +628,13 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
             ...records[index]!,
             modelPath: restoredPath,
             fileName: path.basename(restoredPath),
+            sizeBytes: Number(stagedIdentity.sizeBytes),
+            fileIdentity: {
+              device: stagedIdentity.device,
+              inode: stagedIdentity.inode,
+              sizeBytes: stagedIdentity.sizeBytes,
+              modifiedAtNs: stagedIdentity.modifiedAtNs,
+            },
           };
           registryChanged = true;
         }
@@ -668,8 +699,11 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
       continue;
     }
     if (index < 0) {
-      if (await statMatches(journal.stagedPath, journal.fileIdentity)) {
-        await fs.unlink(journal.stagedPath);
+      if (
+        stagedState === "matching"
+        && !(await unlinkExpectedExternalDeleteStage(journal))
+      ) {
+        continue;
       }
       completed.push(journalPath);
       continue;
@@ -678,8 +712,11 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
     let restoredPath: string | null = null;
     if (await statMatches(journal.originalPath, journal.fileIdentity)) {
       restoredPath = journal.originalPath;
-      if (await statMatches(journal.stagedPath, journal.fileIdentity)) {
-        await fs.unlink(journal.stagedPath);
+      if (
+        stagedState === "matching"
+        && !(await unlinkExpectedExternalDeleteStage(journal))
+      ) {
+        continue;
       }
     } else if (await statMatches(journal.stagedPath, journal.fileIdentity)) {
       restoredPath = journal.originalPath;
@@ -949,6 +986,7 @@ export async function restoreImportedModelAfterFailedQueue(
 export const __importedModelRegistryTestHooks = {
   beforeWrite: null as null | (() => Promise<void> | void),
   beforeExternalFinalize: null as null | ((stage: StagedExternalModelFile) => Promise<void> | void),
+  beforeExternalReconcileDelete: null as null | ((stagedPath: string) => Promise<void> | void),
 };
 
 async function writeImportedModels(records: ImportedModelRecord[]): Promise<void> {

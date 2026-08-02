@@ -137,10 +137,17 @@ describe("local workspace owner initialization", () => {
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledTimes(1);
   });
 
-  it("reconciles restore state before any owner bootstrap query", async () => {
+  it("reconciles restore and managed deletes before external deletes and owner queries", async () => {
     const order: string[] = [];
     mocks.ensureWorkspaceRestoreReconciled.mockImplementation(async () => {
-      order.push("reconcile");
+      order.push("restore");
+    });
+    mocks.reconcileStagedManagedModelFiles.mockImplementation(async () => {
+      order.push("managed-delete");
+      return 0;
+    });
+    mocks.reconcileExternalModelDeleteJournals.mockImplementation(async () => {
+      order.push("external-delete");
     });
     mocks.userFindUnique.mockImplementation(async () => {
       order.push("owner-query");
@@ -150,7 +157,7 @@ describe("local workspace owner initialization", () => {
 
     await ensureLocalWorkspaceOwner();
 
-    expect(order).toEqual(["reconcile", "owner-query"]);
+    expect(order).toEqual(["restore", "managed-delete", "external-delete", "owner-query"]);
   });
 
   it("reconciles staged file deletions against current asset references", async () => {
