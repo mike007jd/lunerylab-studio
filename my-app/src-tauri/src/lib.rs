@@ -25,8 +25,8 @@ use crate::external_apps::{is_lmstudio_installed, is_ollama_installed};
 use crate::hardware::{cached_accel, detect_hardware, probe_local_runtime, AccelInfo};
 use crate::http_bridge::{start_desktop_bridge, DesktopBridgeServer, WorkspaceResetHandler};
 use crate::profile::{
-    acquire_profile_advisory_lock, ensure_profile_dirs, profile_dirs, ProfileDirs,
-    ProfileStorageDirs,
+    acquire_profile_advisory_lock, ensure_profile_dirs, profile_dirs, ProfileAdvisoryLock,
+    ProfileDirs, ProfileStorageDirs,
 };
 use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
@@ -38,7 +38,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(not(debug_assertions))]
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 #[cfg(not(debug_assertions))]
 use std::io::Read;
 use std::io::Write;
@@ -101,7 +101,7 @@ struct DesktopServerState {
     dev_bridge_server: Mutex<Option<DesktopBridgeServer>>,
     /// OS advisory lock for the resolved profile. Held for the app lifetime;
     /// the lock file itself is persistent and must not be unlinked on unlock.
-    profile_lock: Mutex<Option<File>>,
+    profile_lock: Mutex<Option<ProfileAdvisoryLock>>,
     runtime_operation: AtomicU8,
     /// Flipped by `shutdown` so the local-runtime watcher thread exits cleanly
     /// on app shutdown instead of being a daemon leak. The watcher reads this
@@ -328,21 +328,148 @@ const RUNTIME_OPERATION_BOOT: u8 = 1;
 #[cfg(not(debug_assertions))]
 const RUNTIME_OPERATION_RESET: u8 = 2;
 
-#[cfg(any(test, not(debug_assertions)))]
-fn remove_profile_owned_path(path: &Path) -> Result<(), String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(format!("Could not inspect {}: {err}", path.display())),
-    };
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn profile_directory_identity(file: &std::fs::File) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Could not inspect pinned profile directory: {error}"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
 
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        std::fs::remove_file(path)
-            .map_err(|err| format!("Could not remove {}: {err}", path.display()))
-    } else {
-        std::fs::remove_dir_all(path)
-            .map_err(|err| format!("Could not remove {}: {err}", path.display()))
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn verify_profile_root_identity(root_path: &Path, expected: (u64, u64)) -> Result<(), String> {
+    use rustix::fs::{open, Mode, OFlags};
+    let current = std::fs::File::from(
+        open(
+            root_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("Profile root changed during reset: {error}"))?,
+    );
+    if profile_directory_identity(&current)? != expected {
+        return Err("Profile root changed during reset".to_string());
     }
+    Ok(())
+}
+
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn remove_directory_contents_at(directory: &std::fs::File) -> Result<(), String> {
+    use rustix::fs::{openat, unlinkat, AtFlags, Mode, OFlags};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    #[cfg(target_vendor = "apple")]
+    use std::os::unix::ffi::OsStrExt;
+
+    #[cfg(target_os = "linux")]
+    let directory_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    #[cfg(target_vendor = "apple")]
+    let directory_path = PathBuf::from(std::ffi::OsStr::from_bytes(
+        rustix::fs::getpath(directory)
+            .map_err(|error| format!("Could not resolve pinned profile data: {error}"))?
+            .to_bytes(),
+    ));
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    let directory_path: PathBuf =
+        return Err("Workspace reset is unavailable on this Unix platform".to_string());
+    let names = std::fs::read_dir(&directory_path)
+        .map_err(|error| format!("Could not enumerate profile data: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| format!("Could not enumerate profile data: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for name in names {
+        match openat(
+            directory,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(child) => {
+                let child = std::fs::File::from(child);
+                remove_directory_contents_at(&child)?;
+                unlinkat(directory, &name, AtFlags::REMOVEDIR).map_err(|error| {
+                    format!("Could not remove profile directory entry: {error}")
+                })?;
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+                unlinkat(directory, &name, AtFlags::empty())
+                    .map_err(|error| format!("Could not remove profile file entry: {error}"))?;
+            }
+            Err(error) => {
+                return Err(format!("Could not inspect profile data entry: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn reset_workspace_data_unix<F>(dirs: &ProfileDirs, after_pin: F) -> Result<(), String>
+where
+    F: FnOnce(),
+{
+    use rustix::fs::{mkdirat, open, openat, unlinkat, AtFlags, Mode, OFlags};
+
+    let canonical_root = dirs.root.canonicalize().map_err(|error| {
+        format!(
+            "Could not verify profile root {}: {error}",
+            dirs.root.display()
+        )
+    })?;
+    let root = std::fs::File::from(
+        open(
+            &canonical_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("Could not pin profile root: {error}"))?,
+    );
+    let root_identity = profile_directory_identity(&root)?;
+    after_pin();
+    verify_profile_root_identity(&dirs.root, root_identity)?;
+
+    match openat(
+        &root,
+        "data",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(data) => {
+            let data = std::fs::File::from(data);
+            remove_directory_contents_at(&data)?;
+            unlinkat(&root, "data", AtFlags::REMOVEDIR)
+                .map_err(|error| format!("Could not remove profile data directory: {error}"))?;
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+            unlinkat(&root, "data", AtFlags::empty())
+                .map_err(|error| format!("Could not remove profile data entry: {error}"))?;
+        }
+        Err(error) => return Err(format!("Could not inspect profile data directory: {error}")),
+    }
+    verify_profile_root_identity(&dirs.root, root_identity)?;
+    mkdirat(&root, "data", Mode::from_raw_mode(0o700))
+        .map_err(|error| format!("Could not recreate profile data directory: {error}"))?;
+    let data = std::fs::File::from(
+        openat(
+            &root,
+            "data",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("Could not pin recreated profile data: {error}"))?,
+    );
+    for child in ["pglite", "media"] {
+        mkdirat(&data, child, Mode::from_raw_mode(0o700))
+            .map_err(|error| format!("Could not recreate profile {child} directory: {error}"))?;
+    }
+    verify_profile_root_identity(&dirs.root, root_identity)
 }
 
 #[cfg(any(test, not(debug_assertions)))]
@@ -394,34 +521,17 @@ fn reset_workspace_data(dirs: &ProfileDirs) -> Result<(), String> {
         }
     }
 
-    let canonical_root = dirs.root.canonicalize().map_err(|err| {
-        format!(
-            "Could not verify profile root {}: {err}",
-            dirs.root.display()
+    #[cfg(unix)]
+    {
+        reset_workspace_data_unix(dirs, || {})
+    }
+    #[cfg(not(unix))]
+    {
+        Err(
+            "Workspace reset is unavailable until reparse-safe directory operations are enabled"
+                .to_string(),
         )
-    })?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&dirs.data) {
-        if !metadata.file_type().is_symlink() {
-            let canonical_data = dirs.data.canonicalize().map_err(|err| {
-                format!(
-                    "Could not verify profile data directory {}: {err}",
-                    dirs.data.display()
-                )
-            })?;
-            if canonical_data.parent() != Some(canonical_root.as_path()) {
-                return Err(
-                    "Profile data directory escapes the resolved Lunery profile".to_string()
-                );
-            }
-        }
     }
-
-    remove_profile_owned_path(&dirs.data)?;
-    for dir in [&dirs.data, &dirs.pglite, &dirs.media] {
-        std::fs::create_dir_all(dir)
-            .map_err(|err| format!("Could not recreate {}: {err}", dir.display()))?;
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1843,6 +1953,8 @@ mod desktop_server_lifecycle_tests {
 mod workspace_reset_tests {
     use crate::profile::ProfileDirs;
     use crate::reset_workspace_data;
+    #[cfg(unix)]
+    use crate::reset_workspace_data_unix;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1949,6 +2061,40 @@ mod workspace_reset_tests {
 
         let _ = std::fs::remove_dir_all(link_parent);
         let _ = std::fs::remove_dir_all(actual_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_rejects_root_swap_after_pin_without_touching_outside_data() {
+        use std::os::unix::fs::symlink;
+
+        let dirs = profile(unique_root("root-swap"));
+        let moved_root = unique_root("root-swap-moved");
+        let outside = unique_root("root-swap-outside");
+        std::fs::create_dir_all(&dirs.data).expect("create profile data");
+        std::fs::write(dirs.data.join("profile.txt"), b"profile").expect("seed profile");
+        std::fs::create_dir_all(outside.join("data")).expect("create outside data");
+        std::fs::write(outside.join("data/sentinel.txt"), b"outside-sentinel")
+            .expect("seed outside sentinel");
+
+        let error = reset_workspace_data_unix(&dirs, || {
+            std::fs::rename(&dirs.root, &moved_root).expect("move pinned profile root");
+            symlink(&outside, &dirs.root).expect("replace profile root with symlink");
+        })
+        .expect_err("root replacement must fail closed");
+
+        assert!(error.contains("Profile root changed"));
+        assert_eq!(
+            std::fs::read(outside.join("data/sentinel.txt")).expect("outside sentinel"),
+            b"outside-sentinel"
+        );
+        assert_eq!(
+            std::fs::read(moved_root.join("data/profile.txt")).expect("profile data preserved"),
+            b"profile"
+        );
+        std::fs::remove_file(&dirs.root).expect("remove root symlink");
+        std::fs::remove_dir_all(moved_root).expect("remove moved profile");
+        std::fs::remove_dir_all(outside).expect("remove outside fixture");
     }
 
     #[test]
