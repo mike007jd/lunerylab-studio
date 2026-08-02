@@ -1,8 +1,16 @@
-import { describe, expect, it, vi } from "vitest";
+// @vitest-environment happy-dom
+
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useHfDownload } from "@/hooks/use-hf-download";
 import {
   HfDownloadCancelCoordinator,
   resolveHfDownloadStartOwnership,
 } from "@/lib/client/hf-download-progress";
+
+const CANONICAL_JOB_ID = "11111111-1111-4111-8111-111111111111";
+const MODEL_ID = "qwen3.6-35b-a3b-ud-q4-k-m";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -11,12 +19,17 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+type HfDownloadApi = ReturnType<typeof useHfDownload>;
+
+declare global {
+  var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
+}
+
 /**
  * Hook-level ownership contract tests.
  *
- * The hook itself is a thin React wrapper around these helpers: generate a
- * client UUID, registerJob before await, and never route ambiguous ownership
- * through failJobRequest/local-canceled.
+ * Helpers below document the register-before-await contract. The mounted
+ * React harness is the authority that the real hook keeps that contract.
  */
 describe("useHfDownload client-preassigned ownership", () => {
   it("registers the known jobId before the start await and cancels it if the response is lost", async () => {
@@ -53,7 +66,7 @@ describe("useHfDownload client-preassigned ownership", () => {
     resolveStart!(new TypeError("POST response lost after bridge accept") as never);
 
     const startOutcome = await resolveHfDownloadStartOwnership(
-      { modelId: "qwen3.6-35b-a3b-ud-q4-k-m", jobId },
+      { modelId: MODEL_ID, jobId },
       { fetcher, retryIdempotentStart: false },
     );
     // Lost response stays non-terminal; cancel uses the known id rather than
@@ -72,7 +85,7 @@ describe("useHfDownload client-preassigned ownership", () => {
     coordinator.registerJob("job-no-fail");
 
     const outcome = await resolveHfDownloadStartOwnership(
-      { modelId: "qwen3.6-35b-a3b-ud-q4-k-m", jobId: "job-no-fail" },
+      { modelId: MODEL_ID, jobId: "job-no-fail" },
       { fetcher, retryIdempotentStart: false },
     );
 
@@ -102,7 +115,7 @@ describe("useHfDownload client-preassigned ownership", () => {
     const fetcher = vi.fn(async () => jsonResponse({ jobId: "job-body" }));
     await resolveHfDownloadStartOwnership(
       {
-        modelId: "qwen3.6-35b-a3b-ud-q4-k-m",
+        modelId: MODEL_ID,
         jobId: "job-body",
         file: "companion.safetensors",
       },
@@ -114,11 +127,139 @@ describe("useHfDownload client-preassigned ownership", () => {
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
-          modelId: "qwen3.6-35b-a3b-ud-q4-k-m",
+          modelId: MODEL_ID,
           file: "companion.safetensors",
           jobId: "job-body",
         }),
       }),
     );
+  });
+});
+
+describe("useHfDownload mounted ownership harness", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  let latest: HfDownloadApi | null;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  let deleteSeen = false;
+  let eventSourceOpened = 0;
+
+  beforeEach(() => {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    latest = null;
+    deleteSeen = false;
+    eventSourceOpened = 0;
+
+    vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue(CANONICAL_JOB_ID);
+
+    class StubEventSource {
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      constructor(url: string) {
+        eventSourceOpened += 1;
+        throw new Error(`EventSource must not open during ambiguous ownership: ${url}`);
+      }
+      close() {}
+    }
+    vi.stubGlobal("EventSource", StubEventSource);
+
+    fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (method === "POST" && url.endsWith("/hf-download")) {
+        // Public start accepted on the wire, but the response never returns.
+        throw new TypeError("POST response lost after bridge accept");
+      }
+
+      if (method === "DELETE" && url.endsWith(`/hf-download/${CANONICAL_JOB_ID}`)) {
+        deleteSeen = true;
+        return jsonResponse({
+          ok: true,
+          cancelRequested: true,
+          jobId: CANONICAL_JOB_ID,
+        });
+      }
+
+      if (url.endsWith(`/hf-download/${CANONICAL_JOB_ID}`)) {
+        if (deleteSeen) {
+          return jsonResponse({
+            status: "canceled",
+            received: 0,
+            total: 1,
+            error: null,
+          });
+        }
+        // Ownership GET stays ambiguous/non-terminal after the lost start.
+        throw new TypeError("ownership status temporarily unavailable");
+      }
+
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    latest = null;
+  });
+
+  it("keeps queued ownership under the preassigned UUID and cancels by that id after a lost start", async () => {
+    function Probe() {
+      latest = useHfDownload();
+      return null;
+    }
+
+    await act(async () => {
+      root.render(createElement(Probe));
+    });
+    expect(latest).not.toBeNull();
+
+    let startPromise!: Promise<void>;
+    await act(async () => {
+      startPromise = latest!.start(MODEL_ID);
+      await startPromise;
+    });
+
+    expect(eventSourceOpened).toBe(0);
+    expect(latest!.jobId).toBe(CANONICAL_JOB_ID);
+    expect(latest!.status).toBe("queued");
+    expect(latest!.status).not.toBe("error");
+    expect(latest!.status).not.toBe("canceled");
+    expect(latest!.status).not.toBe("idle");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/desktop-runtime/hf-download",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ modelId: MODEL_ID, jobId: CANONICAL_JOB_ID }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/desktop-runtime/hf-download/${CANONICAL_JOB_ID}`,
+      { cache: "no-store" },
+    );
+
+    let cancelPromise!: Promise<void>;
+    await act(async () => {
+      cancelPromise = latest!.cancel();
+      await cancelPromise;
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/desktop-runtime/hf-download/${CANONICAL_JOB_ID}`,
+      { method: "DELETE", cache: "no-store" },
+    );
+    expect(latest!.status).toBe("canceled");
+    expect(latest!.jobId).toBe(CANONICAL_JOB_ID);
+    expect(eventSourceOpened).toBe(0);
   });
 });
