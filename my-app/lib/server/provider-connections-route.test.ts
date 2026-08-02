@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   ensureWorkspaceRestoreReconciled: vi.fn(),
   setByokConnectionMeta: vi.fn(),
   getByokConnectionMeta: vi.fn(),
+  listByokConnectionMeta: vi.fn(),
   validateProviderEndpoint: vi.fn(),
 }));
 
@@ -24,7 +25,7 @@ vi.mock("@/lib/server/desktop-bridge", () => ({
 vi.mock("@/lib/server/byok-connection-store", () => ({
   deleteByokConnectionMeta: mocks.deleteByokConnectionMeta,
   getByokConnectionMeta: mocks.getByokConnectionMeta,
-  listByokConnectionMeta: vi.fn(),
+  listByokConnectionMeta: mocks.listByokConnectionMeta,
   setByokConnectionMeta: mocks.setByokConnectionMeta,
 }));
 vi.mock("@/lib/server/byok-shared", () => ({
@@ -41,7 +42,7 @@ vi.mock("@/lib/server/workspace-restore-journal", () => ({
   ensureWorkspaceRestoreReconciled: mocks.ensureWorkspaceRestoreReconciled,
 }));
 
-import { DELETE, POST } from "@/app/api/desktop-runtime/provider-connections/route";
+import { DELETE, GET, POST } from "@/app/api/desktop-runtime/provider-connections/route";
 import {
   getWorkspaceOperationGateStateForTests,
   resetWorkspaceOperationGateForTests,
@@ -90,6 +91,19 @@ beforeEach(() => {
 });
 
 describe("provider connection metadata removal", () => {
+  it("holds a shared snapshot lease while reading profile connection metadata", async () => {
+    mocks.requireDesktopBridge.mockReturnValue({ url: "http://127.0.0.1:9", token: "t" });
+    mocks.listByokConnectionMeta.mockImplementation(() => {
+      expect(getWorkspaceOperationGateStateForTests().sharedCount).toBe(1);
+      return {};
+    });
+
+    const response = await GET();
+
+    expect(response.status).toBe(200);
+    expect(mocks.listByokConnectionMeta).toHaveBeenCalledOnce();
+  });
+
   it("clears owned defaults before unlinking metadata without requiring the native bridge", async () => {
     const order: string[] = [];
     mocks.clearDefaultsOwnedByProvider.mockImplementation(async () => {

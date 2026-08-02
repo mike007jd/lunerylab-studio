@@ -27,6 +27,7 @@ import {
   type ProjectActivityResponse,
   type ProjectActivitySession,
 } from "@/lib/project-pagination";
+import { withSharedWorkspaceRead } from "@/lib/server/workspace-operation-gate";
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -44,21 +45,23 @@ export interface BootstrapData {
 }
 
 export async function fetchBootstrapData(userId: string): Promise<BootstrapData> {
-  const [settings, providers] = await Promise.all([
-    getLocalWorkspacePreferences(userId),
-    getProviderStatus(),
-  ]);
+  return withSharedWorkspaceRead(async () => {
+    const [settings, providers] = await Promise.all([
+      getLocalWorkspacePreferences(userId),
+      getProviderStatus(),
+    ]);
 
-  return {
-    app: {
-      defaultLocale: settings.defaultLocale,
-      defaultTextModel: settings.defaultTextModel,
-      defaultImageModel: settings.defaultImageModel,
-      defaultVideoModel: settings.defaultVideoModel,
-    },
-    providers,
-    providerConnections: listByokConnectionMeta(),
-  };
+    return {
+      app: {
+        defaultLocale: settings.defaultLocale,
+        defaultTextModel: settings.defaultTextModel,
+        defaultImageModel: settings.defaultImageModel,
+        defaultVideoModel: settings.defaultVideoModel,
+      },
+      providers,
+      providerConnections: listByokConnectionMeta(),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,10 @@ import {
   restoreClearedProviderDefaults,
 } from "@/lib/server/clear-provider-defaults";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
-import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
+import {
+  withSharedWorkspaceRead,
+  withWorkspaceExclusive,
+} from "@/lib/server/workspace-operation-gate";
 import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
 
 export const dynamic = "force-dynamic";
@@ -54,7 +57,9 @@ export async function GET() {
     const bridge = requireDesktopBridge();
     if (bridge instanceof NextResponse) return bridge;
     await ensureWorkspaceRestoreReconciled();
-    return NextResponse.json({ connections: listByokConnectionMeta() });
+    return await withSharedWorkspaceRead(async () =>
+      NextResponse.json({ connections: listByokConnectionMeta() }),
+    );
   } catch (error) {
     return jsonError(error);
   }

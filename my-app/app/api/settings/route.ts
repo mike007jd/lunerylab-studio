@@ -9,7 +9,10 @@ import { listLocalModelInstallStatuses } from "@/lib/server/local-model-inventor
 import { ApiError, jsonError } from "@/lib/server/errors";
 import { parseJsonBody } from "@/lib/server/http-validation";
 import { requireLocalWorkspaceOwner, getLocalWorkspacePreferences } from "@/lib/server/local-workspace-owner";
-import { withSharedWorkspaceRead } from "@/lib/server/workspace-operation-gate";
+import {
+  withSharedMutationLease,
+  withSharedWorkspaceRead,
+} from "@/lib/server/workspace-operation-gate";
 
 const settingsPatchSchema = z
   .object({
@@ -52,107 +55,109 @@ export async function PATCH(request: Request) {
     // message in the top-level `message` for plain callers.
     const body = await parseJsonBody(request, settingsPatchSchema);
 
-    const data: {
-      defaultTextModel?: string;
-      defaultImageModel?: string;
-      defaultVideoModel?: string;
-      defaultLocale?: string;
-    } = {};
+    return await withSharedMutationLease(async () => {
+      const data: {
+        defaultTextModel?: string;
+        defaultImageModel?: string;
+        defaultVideoModel?: string;
+        defaultLocale?: string;
+      } = {};
 
-    if (body.defaultTextModel !== undefined) {
-      if (body.defaultTextModel) {
-        const byok = parseByokModelSelection(body.defaultTextModel);
-        if (byok) {
-          const [providerStatus, connection] = await Promise.all([
-            getProviderStatus(),
-            Promise.resolve(getByokConnectionMeta(byok.providerId)),
-          ]);
-          if (
-            !providerStatus[byok.providerId]?.configured
-            || connection?.models?.text !== byok.modelId
-          ) {
+      if (body.defaultTextModel !== undefined) {
+        if (body.defaultTextModel) {
+          const byok = parseByokModelSelection(body.defaultTextModel);
+          if (byok) {
+            const [providerStatus, connection] = await Promise.all([
+              getProviderStatus(),
+              Promise.resolve(getByokConnectionMeta(byok.providerId)),
+            ]);
+            if (
+              !providerStatus[byok.providerId]?.configured
+              || connection?.models?.text !== byok.modelId
+            ) {
+              throw new ApiError({
+                status: 400,
+                code: "invalid_model",
+                message: `Text model is not configured for provider: ${byok.providerId}`,
+                retryable: false,
+              });
+            }
+          } else if (/^local:[A-Za-z0-9._/-]+$/.test(body.defaultTextModel)) {
+            const localId = body.defaultTextModel.slice("local:".length);
+            const inventory = await listLocalModelInstallStatuses();
+            const installed = inventory.find((model) =>
+              model.id === localId
+              && model.installed
+              && model.capability === "planner-llm");
+            if (!installed) {
+              throw new ApiError({
+                status: 400,
+                code: "invalid_model",
+                message: `Local text model is not installed: ${localId}`,
+                retryable: false,
+              });
+            }
+          } else {
             throw new ApiError({
               status: 400,
               code: "invalid_model",
-              message: `Text model is not configured for provider: ${byok.providerId}`,
+              message: `Unknown text model selection: ${body.defaultTextModel}`,
               retryable: false,
             });
           }
-        } else if (/^local:[A-Za-z0-9._/-]+$/.test(body.defaultTextModel)) {
-          const localId = body.defaultTextModel.slice("local:".length);
-          const inventory = await listLocalModelInstallStatuses();
-          const installed = inventory.find((model) =>
-            model.id === localId
-            && model.installed
-            && model.capability === "planner-llm");
-          if (!installed) {
+        }
+        data.defaultTextModel = body.defaultTextModel;
+      }
+
+      if (body.defaultImageModel !== undefined) {
+        if (body.defaultImageModel) {
+          const modelEntry = await resolveImageModelEntry(body.defaultImageModel);
+          if (!modelEntry) {
             throw new ApiError({
               status: 400,
               code: "invalid_model",
-              message: `Local text model is not installed: ${localId}`,
+              message: `Unknown model: ${body.defaultImageModel}`,
               retryable: false,
             });
           }
-        } else {
-          throw new ApiError({
-            status: 400,
-            code: "invalid_model",
-            message: `Unknown text model selection: ${body.defaultTextModel}`,
-            retryable: false,
-          });
         }
+        data.defaultImageModel = body.defaultImageModel;
       }
-      data.defaultTextModel = body.defaultTextModel;
-    }
 
-    if (body.defaultImageModel !== undefined) {
-      if (body.defaultImageModel) {
-        const modelEntry = await resolveImageModelEntry(body.defaultImageModel);
-        if (!modelEntry) {
-          throw new ApiError({
-            status: 400,
-            code: "invalid_model",
-            message: `Unknown model: ${body.defaultImageModel}`,
-            retryable: false,
-          });
+      if (body.defaultVideoModel !== undefined) {
+        if (body.defaultVideoModel) {
+          const modelEntry = await resolveVideoModelEntry(body.defaultVideoModel);
+          if (!modelEntry) {
+            throw new ApiError({
+              status: 400,
+              code: "invalid_model",
+              message: `Unknown video model: ${body.defaultVideoModel}`,
+              retryable: false,
+            });
+          }
         }
+        data.defaultVideoModel = body.defaultVideoModel;
       }
-      data.defaultImageModel = body.defaultImageModel;
-    }
 
-    if (body.defaultVideoModel !== undefined) {
-      if (body.defaultVideoModel) {
-        const modelEntry = await resolveVideoModelEntry(body.defaultVideoModel);
-        if (!modelEntry) {
-          throw new ApiError({
-            status: 400,
-            code: "invalid_model",
-            message: `Unknown video model: ${body.defaultVideoModel}`,
-            retryable: false,
-          });
-        }
+      if (body.defaultLocale !== undefined) {
+        data.defaultLocale = body.defaultLocale;
       }
-      data.defaultVideoModel = body.defaultVideoModel;
-    }
 
-    if (body.defaultLocale !== undefined) {
-      data.defaultLocale = body.defaultLocale;
-    }
+      const settings = await prisma.userSettings.update({
+        where: { userId: user.id },
+        data,
+      });
+      const providers = await getProviderStatus();
 
-    const settings = await prisma.userSettings.update({
-      where: { userId: user.id },
-      data,
-    });
-    const providers = await getProviderStatus();
-
-    return NextResponse.json({
-      app: {
-        defaultLocale: settings.defaultLocale,
-        defaultTextModel: settings.defaultTextModel,
-        defaultImageModel: settings.defaultImageModel,
-        defaultVideoModel: settings.defaultVideoModel,
-      },
-      providers,
+      return NextResponse.json({
+        app: {
+          defaultLocale: settings.defaultLocale,
+          defaultTextModel: settings.defaultTextModel,
+          defaultImageModel: settings.defaultImageModel,
+          defaultVideoModel: settings.defaultVideoModel,
+        },
+        providers,
+      });
     });
   } catch (error) {
     return jsonError(error);

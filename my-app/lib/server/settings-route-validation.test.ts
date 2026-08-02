@@ -32,7 +32,11 @@ vi.mock("@/lib/server/local-model-inventory", () => ({
 }));
 
 import { GET, PATCH } from "@/app/api/settings/route";
-import { acquireWorkspaceExclusive, resetWorkspaceOperationGateForTests } from "@/lib/server/workspace-operation-gate";
+import {
+  acquireWorkspaceExclusive,
+  getWorkspaceOperationGateStateForTests,
+  resetWorkspaceOperationGateForTests,
+} from "@/lib/server/workspace-operation-gate";
 
 function patch(defaultTextModel: string) {
   return PATCH(new Request("http://localhost/api/settings", {
@@ -100,6 +104,50 @@ describe("settings text-model server validation", () => {
     const response = await patch("byok:openai:gpt-5.6");
     expect(response.status).toBe(400);
     expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps provider validation and the settings write in one shared lease", async () => {
+    let releaseValidation!: () => void;
+    let validationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      validationStarted = resolve;
+    });
+    mocks.getProviderStatus
+      .mockImplementationOnce(async () => {
+        validationStarted();
+        await new Promise<void>((resolve) => {
+          releaseValidation = resolve;
+        });
+        return { openai: { configured: true, source: "keychain" } };
+      })
+      .mockResolvedValueOnce({ openai: { configured: true, source: "keychain" } });
+    mocks.getByokConnectionMeta.mockReturnValue({
+      endpoint: "https://api.openai.com/v1",
+      models: { text: "gpt-5.6" },
+      updatedAt: new Date(0).toISOString(),
+    });
+    mocks.update.mockResolvedValue({
+      defaultLocale: "en",
+      defaultTextModel: "byok:openai:gpt-5.6",
+      defaultImageModel: "",
+      defaultVideoModel: "",
+    });
+
+    const settingsWrite = patch("byok:openai:gpt-5.6");
+    await started;
+    const unlinkExclusive = acquireWorkspaceExclusive("provider-unlink");
+    await vi.waitFor(() => {
+      expect(getWorkspaceOperationGateStateForTests().exclusivePending).toBe(true);
+    });
+    expect(mocks.update).not.toHaveBeenCalled();
+
+    releaseValidation();
+    const response = await settingsWrite;
+    expect(response.status).toBe(200);
+    expect(mocks.update).toHaveBeenCalledOnce();
+
+    const exclusive = await unlinkExclusive;
+    exclusive.release();
   });
 
   it("accepts only an installed planner model's exact local id", async () => {
