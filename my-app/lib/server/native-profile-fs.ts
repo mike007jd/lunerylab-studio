@@ -24,6 +24,9 @@ export type NativeWorkspaceRestoreOriginalIdentities = Record<
   NativeWorkspaceRestoreRoot,
   { device: string; inode: string }
 >;
+export type NativeWorkspaceRestoreStagedIdentities =
+  | Record<NativeWorkspaceRestoreRoot, { device: string; inode: string }>
+  | null;
 
 const WORKSPACE_RESTORE_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/;
 
@@ -66,16 +69,24 @@ type ProfileFsRequest =
       source_path: string;
     }
   | { operation: "seal-workspace-restore-root"; token: string; root: NativeWorkspaceRestoreRoot }
+  | ({ operation: "attest-workspace-restore-stages"; token: string } & RestoreStagedIdentityRequest)
   | { operation: "promote-workspace-restore-roots"; token: string }
-  | ({ operation: "rollback-workspace-restore-roots"; token: string } & RestoreIdentityRequest)
-  | ({ operation: "cleanup-workspace-restore"; token: string } & RestoreIdentityRequest)
-  | { operation: "refresh-workspace-restore-roots"; token: string };
+  | ({ operation: "rollback-workspace-restore-roots"; token: string } & RestoreIdentityRequest & RestoreStagedIdentityRequest)
+  | ({ operation: "cleanup-workspace-restore"; token: string } & RestoreIdentityRequest & RestoreStagedIdentityRequest)
+  | ({ operation: "refresh-workspace-restore-roots"; token: string } & RestoreStagedIdentityRequest);
 
 type RestoreIdentityRequest = {
   config_original_device: string;
   config_original_inode: string;
   media_original_device: string;
   media_original_inode: string;
+};
+
+type RestoreStagedIdentityRequest = {
+  config_staged_device: string | null;
+  config_staged_inode: string | null;
+  media_staged_device: string | null;
+  media_staged_inode: string | null;
 };
 
 export const __nativeProfileFsTestHooks = {
@@ -158,6 +169,55 @@ function identitiesFromRequest(request: RestoreIdentityRequest): NativeWorkspace
   };
 }
 
+function stagedIdentityRequest(
+  identities: NativeWorkspaceRestoreStagedIdentities,
+): RestoreStagedIdentityRequest {
+  if (!identities) {
+    return {
+      config_staged_device: null,
+      config_staged_inode: null,
+      media_staged_device: null,
+      media_staged_inode: null,
+    };
+  }
+  for (const root of ["media", "config"] as const) {
+    if (!/^\d+$/.test(identities[root].device) || !/^\d+$/.test(identities[root].inode)) {
+      throw new Error("Invalid workspace restore staged identity.");
+    }
+  }
+  return {
+    config_staged_device: identities.config.device,
+    config_staged_inode: identities.config.inode,
+    media_staged_device: identities.media.device,
+    media_staged_inode: identities.media.inode,
+  };
+}
+
+function stagedIdentitiesFromRequest(
+  request: RestoreStagedIdentityRequest,
+): NativeWorkspaceRestoreStagedIdentities {
+  const values = [
+    request.config_staged_device,
+    request.config_staged_inode,
+    request.media_staged_device,
+    request.media_staged_inode,
+  ];
+  if (values.every((value) => value === null)) return null;
+  if (values.some((value) => value === null)) {
+    throw new Error("Incomplete workspace restore staged identity.");
+  }
+  return {
+    config: {
+      device: request.config_staged_device!,
+      inode: request.config_staged_inode!,
+    },
+    media: {
+      device: request.media_staged_device!,
+      inode: request.media_staged_inode!,
+    },
+  };
+}
+
 function fallbackRestorePaths(root: NativeWorkspaceRestoreRoot, token: string) {
   const live = path.resolve(/* turbopackIgnore: true */ rootPath(root));
   const prefix = path.join(path.dirname(live), `.${path.basename(live)}.restore`);
@@ -198,6 +258,18 @@ async function fallbackDirectoryExists(target: string): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+function sameFallbackIdentity(
+  metadata: import("node:fs").BigIntStats,
+  expected: FallbackDirectoryIdentity,
+): boolean {
+  return metadata.dev.toString() === expected.device && metadata.ino.toString() === expected.inode;
+}
+
+async function fallbackDirectoryIsEmpty(target: string): Promise<boolean> {
+  await fallbackRealDirectory(target);
+  return (await fs.readdir(target)).length === 0;
 }
 
 async function assertFallbackRestoreAuthority(
@@ -431,6 +503,19 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
       }
       return;
     }
+    case "attest-workspace-restore-stages": {
+      const token = validateWorkspaceRestoreToken(request.token);
+      const staged = stagedIdentitiesFromRequest(request);
+      if (!staged) throw new Error("Workspace restore staged identity is required.");
+      for (const root of ["media", "config"] as const) {
+        await assertFallbackRestoreAuthority(token, root);
+        const metadata = await fallbackRealDirectory(fallbackRestorePaths(root, token).staged);
+        if (!sameFallbackIdentity(metadata, staged[root])) {
+          throw new Error("Workspace restore staging root identity changed.");
+        }
+      }
+      return;
+    }
     case "promote-workspace-restore-roots": {
       const token = validateWorkspaceRestoreToken(request.token);
       for (const root of ["media", "config"] as const) {
@@ -454,28 +539,56 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
     case "rollback-workspace-restore-roots": {
       const token = validateWorkspaceRestoreToken(request.token);
       const expectedIdentities = identitiesFromRequest(request);
+      const stagedIdentities = stagedIdentitiesFromRequest(request);
       for (const root of ["config", "media"] as const) {
         const paths = fallbackRestorePaths(root, token);
-        if (await fallbackDirectoryExists(paths.previous)) {
+        const previousExists = await fallbackDirectoryExists(paths.previous);
+        const liveExists = await fallbackDirectoryExists(paths.live);
+        const stagedExists = await fallbackDirectoryExists(paths.staged);
+        const discardedExists = await fallbackDirectoryExists(paths.discarded);
+        if (!stagedIdentities) {
+          if (previousExists || discardedExists || !liveExists) {
+            throw new Error("Durable workspace restore staged identity is unavailable.");
+          }
+          const liveMetadata = await fallbackRealDirectory(paths.live);
+          if (!sameFallbackIdentity(liveMetadata, expectedIdentities[root])) {
+            throw new Error("Workspace restore live root identity changed during rollback.");
+          }
+          if (stagedExists && !(await fallbackDirectoryIsEmpty(paths.staged))) {
+            throw new Error("Unattested workspace restore staging root is not empty.");
+          }
+          continue;
+        }
+        if (stagedExists) {
+          const stagedMetadata = await fallbackRealDirectory(paths.staged);
+          if (!sameFallbackIdentity(stagedMetadata, stagedIdentities[root])) {
+            throw new Error("Workspace restore staging root identity changed during rollback.");
+          }
+        }
+        if (previousExists) {
           const previousMetadata = await fallbackRealDirectory(paths.previous);
-          if (
-            previousMetadata.dev.toString() !== expectedIdentities[root].device
-            || previousMetadata.ino.toString() !== expectedIdentities[root].inode
-          ) {
+          if (!sameFallbackIdentity(previousMetadata, expectedIdentities[root])) {
             throw new Error("Workspace restore previous root identity changed during rollback.");
           }
-          if (
-            await fallbackDirectoryExists(paths.live)
-            && await fallbackDirectoryExists(paths.staged)
-            && await fallbackDirectoryExists(paths.discarded)
-          ) {
-            throw new Error("Workspace restore rollback destination already exists.");
+          if (discardedExists && !(await fallbackDirectoryIsEmpty(paths.discarded))) {
+            throw new Error("Workspace restore discarded placeholder is not empty.");
           }
-        } else if (!(await fallbackDirectoryExists(paths.live))) {
+          if (liveExists) {
+            const liveMetadata = await fallbackRealDirectory(paths.live);
+            const promoted = sameFallbackIdentity(liveMetadata, stagedIdentities[root]);
+            const placeholder = stagedExists && await fallbackDirectoryIsEmpty(paths.live);
+            if (!promoted && !placeholder) {
+              throw new Error("Workspace restore live root identity changed during rollback.");
+            }
+          }
+        } else if (!liveExists) {
           throw new Error("Workspace restore root is missing during rollback.");
+        } else {
+          const liveMetadata = await fallbackRealDirectory(paths.live);
+          if (!sameFallbackIdentity(liveMetadata, expectedIdentities[root])) {
+            throw new Error("Workspace restore live root identity changed during rollback.");
+          }
         }
-        await fallbackDirectoryExists(paths.staged);
-        await fallbackDirectoryExists(paths.discarded);
       }
       for (const root of ["config", "media"] as const) {
         const paths = fallbackRestorePaths(root, token);
@@ -484,18 +597,24 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
         const stagedExists = await fallbackDirectoryExists(paths.staged);
         if (previousExists) {
           const previousMetadata = await fallbackRealDirectory(paths.previous);
-          if (
-            previousMetadata.dev.toString() !== expectedIdentities[root].device
-            || previousMetadata.ino.toString() !== expectedIdentities[root].inode
-          ) {
+          if (!sameFallbackIdentity(previousMetadata, expectedIdentities[root])) {
             throw new Error("Workspace restore previous root identity changed during rollback.");
           }
           if (liveExists) {
-            const destination = stagedExists ? paths.discarded : paths.staged;
-            if (await fallbackDirectoryExists(destination)) {
-              throw new Error("Workspace restore rollback destination already exists.");
+            const liveMetadata = await fallbackRealDirectory(paths.live);
+            if (sameFallbackIdentity(liveMetadata, stagedIdentities![root])) {
+              if (stagedExists) {
+                throw new Error("Workspace restore rollback staging destination already exists.");
+              }
+              await fs.rename(paths.live, paths.staged);
+            } else if (await fallbackDirectoryExists(paths.discarded)) {
+              if (!(await fallbackDirectoryIsEmpty(paths.live))) {
+                throw new Error("Workspace restore live root identity changed during rollback.");
+              }
+              await fs.rmdir(paths.live);
+            } else {
+              await fs.rename(paths.live, paths.discarded);
             }
-            await fs.rename(paths.live, destination);
           }
           await fs.rename(paths.previous, paths.live);
         }
@@ -509,8 +628,28 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
     case "cleanup-workspace-restore": {
       const token = validateWorkspaceRestoreToken(request.token);
       const expectedIdentities = identitiesFromRequest(request);
+      const stagedIdentities = stagedIdentitiesFromRequest(request);
+      if (!stagedIdentities) {
+        throw new Error("Durable workspace restore staged identity is unavailable.");
+      }
       for (const root of ["media", "config"] as const) {
         const paths = fallbackRestorePaths(root, token);
+        const liveMetadata = await fallbackRealDirectory(paths.live);
+        if (!sameFallbackIdentity(liveMetadata, stagedIdentities[root])) {
+          throw new Error("Workspace restore promoted root identity changed during cleanup.");
+        }
+        if (await fallbackDirectoryExists(paths.staged)) {
+          const stagedMetadata = await fallbackRealDirectory(paths.staged);
+          if (!sameFallbackIdentity(stagedMetadata, stagedIdentities[root])) {
+            throw new Error("Workspace restore staging root identity changed during cleanup.");
+          }
+        }
+        if (
+          await fallbackDirectoryExists(paths.discarded)
+          && !(await fallbackDirectoryIsEmpty(paths.discarded))
+        ) {
+          throw new Error("Workspace restore discarded placeholder is not empty.");
+        }
         if (await fallbackDirectoryExists(paths.previous)) {
           const previousMetadata = await fallbackRealDirectory(paths.previous);
           if (
@@ -541,8 +680,16 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
     }
     case "refresh-workspace-restore-roots": {
       validateWorkspaceRestoreToken(request.token);
-      await fallbackRealDirectory(rootPath("media"));
-      await fallbackRealDirectory(rootPath("config"));
+      const stagedIdentities = stagedIdentitiesFromRequest(request);
+      if (!stagedIdentities) {
+        throw new Error("Durable workspace restore staged identity is unavailable.");
+      }
+      for (const root of ["media", "config"] as const) {
+        const metadata = await fallbackRealDirectory(rootPath(root));
+        if (!sameFallbackIdentity(metadata, stagedIdentities[root])) {
+          throw new Error("Workspace restore promoted root identity changed during refresh.");
+        }
+      }
       return;
     }
   }
@@ -694,6 +841,17 @@ export async function nativeSealWorkspaceRestoreRoot(
   });
 }
 
+export async function nativeAttestWorkspaceRestoreStages(
+  token: string,
+  identities: Exclude<NativeWorkspaceRestoreStagedIdentities, null>,
+): Promise<void> {
+  await execute({
+    operation: "attest-workspace-restore-stages",
+    token: validateWorkspaceRestoreToken(token),
+    ...stagedIdentityRequest(identities),
+  });
+}
+
 export async function nativePromoteWorkspaceRestoreRoots(token: string): Promise<void> {
   await execute({
     operation: "promote-workspace-restore-roots",
@@ -704,29 +862,37 @@ export async function nativePromoteWorkspaceRestoreRoots(token: string): Promise
 export async function nativeRollbackWorkspaceRestoreRoots(
   token: string,
   identities: NativeWorkspaceRestoreOriginalIdentities,
+  staged: NativeWorkspaceRestoreStagedIdentities,
 ): Promise<void> {
   await execute({
     operation: "rollback-workspace-restore-roots",
     token: validateWorkspaceRestoreToken(token),
     ...restoreIdentityRequest(identities),
+    ...stagedIdentityRequest(staged),
   });
 }
 
 export async function nativeCleanupWorkspaceRestore(
   token: string,
   identities: NativeWorkspaceRestoreOriginalIdentities,
+  staged: NativeWorkspaceRestoreStagedIdentities,
 ): Promise<void> {
   await execute({
     operation: "cleanup-workspace-restore",
     token: validateWorkspaceRestoreToken(token),
     ...restoreIdentityRequest(identities),
+    ...stagedIdentityRequest(staged),
   });
 }
 
-export async function nativeRefreshWorkspaceRestoreRoots(token: string): Promise<void> {
+export async function nativeRefreshWorkspaceRestoreRoots(
+  token: string,
+  staged: NativeWorkspaceRestoreStagedIdentities,
+): Promise<void> {
   await execute({
     operation: "refresh-workspace-restore-roots",
     token: validateWorkspaceRestoreToken(token),
+    ...stagedIdentityRequest(staged),
   });
 }
 

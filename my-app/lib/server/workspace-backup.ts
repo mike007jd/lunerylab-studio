@@ -12,11 +12,13 @@ import {
 import { ApiError } from "@/lib/server/errors";
 import { luneryConfigDir } from "@/lib/server/lunery-profile";
 import {
+  nativeAttestWorkspaceRestoreStages,
   nativeCleanupWorkspaceRestore,
   nativePrepareWorkspaceRestore,
   nativePromoteWorkspaceRestoreRoots,
   nativeSealWorkspaceRestoreRoot,
   nativeWriteWorkspaceRestoreFile,
+  type NativeWorkspaceRestoreStagedIdentities,
 } from "@/lib/server/native-profile-fs";
 import { WORKSPACE_RESTORE_LIMITS } from "@/lib/workspace-backup-limits";
 import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
@@ -571,6 +573,8 @@ export async function restoreWorkspaceBackup(
         previousExisted: true,
         originalDevice: metadata.dev.toString(),
         originalInode: metadata.ino.toString(),
+        stagedDevice: null,
+        stagedInode: null,
       });
     }
     const originalIdentities = {
@@ -583,6 +587,7 @@ export async function restoreWorkspaceBackup(
         inode: swaps[1]!.originalInode,
       },
     };
+    let stagedIdentities: Exclude<NativeWorkspaceRestoreStagedIdentities, null> | null = null;
 
     let journalWritten = false;
     try {
@@ -598,6 +603,32 @@ export async function restoreWorkspaceBackup(
       await hitRestoreBoundary("after-journal-before-staging");
 
       await nativePrepareWorkspaceRestore(token, originalIdentities);
+
+      const stagedMetadata = await Promise.all(swaps.map(async (swap) => {
+        const metadata = await fs.lstat(swap.staged, { bigint: true });
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          throw new Error("Workspace restore staging root must be a real directory.");
+        }
+        return { device: metadata.dev.toString(), inode: metadata.ino.toString() };
+      }));
+      stagedIdentities = {
+        media: stagedMetadata[0]!,
+        config: stagedMetadata[1]!,
+      };
+      await nativeAttestWorkspaceRestoreStages(token, stagedIdentities);
+      for (let index = 0; index < swaps.length; index += 1) {
+        swaps[index]!.stagedDevice = stagedMetadata[index]!.device;
+        swaps[index]!.stagedInode = stagedMetadata[index]!.inode;
+      }
+      // The attested empty staging identities are durable before any payload
+      // byte is written, so cold-start recovery can distinguish the promoted
+      // restore tree from an unrelated real-directory replacement.
+      await writeRestoreJournal({
+        format: RESTORE_JOURNAL_FORMAT,
+        version: RESTORE_JOURNAL_VERSION,
+        token,
+        swaps,
+      });
 
       await stageDirectory(
         backup.media,
@@ -702,7 +733,7 @@ export async function restoreWorkspaceBackup(
       }
     }
     try {
-      await nativeCleanupWorkspaceRestore(token, originalIdentities);
+      await nativeCleanupWorkspaceRestore(token, originalIdentities, stagedIdentities);
     } catch {
       warnings.push("Previous workspace directories cleanup is pending and will retry on restart.");
     }

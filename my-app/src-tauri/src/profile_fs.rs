@@ -76,6 +76,13 @@ pub(crate) enum ProfileFsRequest {
         token: String,
         root: WorkspaceRestoreRoot,
     },
+    AttestWorkspaceRestoreStages {
+        token: String,
+        config_staged_device: String,
+        config_staged_inode: String,
+        media_staged_device: String,
+        media_staged_inode: String,
+    },
     PromoteWorkspaceRestoreRoots {
         token: String,
     },
@@ -85,6 +92,10 @@ pub(crate) enum ProfileFsRequest {
         config_original_inode: String,
         media_original_device: String,
         media_original_inode: String,
+        config_staged_device: Option<String>,
+        config_staged_inode: Option<String>,
+        media_staged_device: Option<String>,
+        media_staged_inode: Option<String>,
     },
     CleanupWorkspaceRestore {
         token: String,
@@ -92,9 +103,17 @@ pub(crate) enum ProfileFsRequest {
         config_original_inode: String,
         media_original_device: String,
         media_original_inode: String,
+        config_staged_device: Option<String>,
+        config_staged_inode: Option<String>,
+        media_staged_device: Option<String>,
+        media_staged_inode: Option<String>,
     },
     RefreshWorkspaceRestoreRoots {
         token: String,
+        config_staged_device: Option<String>,
+        config_staged_inode: Option<String>,
+        media_staged_device: Option<String>,
+        media_staged_inode: Option<String>,
     },
 }
 
@@ -225,6 +244,12 @@ mod unix {
 
     #[derive(Clone, Copy, Debug)]
     struct RestoreOriginalIdentities {
+        config: DirectoryIdentity,
+        media: DirectoryIdentity,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RestoreStagedIdentities {
         config: DirectoryIdentity,
         media: DirectoryIdentity,
     }
@@ -505,6 +530,34 @@ mod unix {
 
     fn expected_original_identity(
         identities: &RestoreOriginalIdentities,
+        root: WorkspaceRestoreRoot,
+    ) -> DirectoryIdentity {
+        match root {
+            WorkspaceRestoreRoot::Config => identities.config,
+            WorkspaceRestoreRoot::Media => identities.media,
+        }
+    }
+
+    fn restore_staged_identities(
+        config_device: Option<&str>,
+        config_inode: Option<&str>,
+        media_device: Option<&str>,
+        media_inode: Option<&str>,
+    ) -> Result<Option<RestoreStagedIdentities>, String> {
+        match (config_device, config_inode, media_device, media_inode) {
+            (None, None, None, None) => Ok(None),
+            (Some(config_device), Some(config_inode), Some(media_device), Some(media_inode)) => {
+                Ok(Some(RestoreStagedIdentities {
+                    config: parse_restore_identity(config_device, config_inode)?,
+                    media: parse_restore_identity(media_device, media_inode)?,
+                }))
+            }
+            _ => Err("Incomplete workspace restore staged identity".to_string()),
+        }
+    }
+
+    fn expected_staged_identity(
+        identities: &RestoreStagedIdentities,
         root: WorkspaceRestoreRoot,
     ) -> DirectoryIdentity {
         match root {
@@ -1085,6 +1138,32 @@ mod unix {
         Ok(())
     }
 
+    fn attest_workspace_restore_stages(
+        token: &str,
+        staged: RestoreStagedIdentities,
+    ) -> Result<(), String> {
+        checked_restore_token(token)?;
+        let roots = current_roots()?;
+        let authority = restore_authority(token)?;
+        for root in [WorkspaceRestoreRoot::Media, WorkspaceRestoreRoot::Config] {
+            let paths = restore_root_paths(root, token, &roots)?;
+            let parent = open_restore_parent(&paths, &roots)?;
+            let durable = expected_staged_identity(&staged, root);
+            if durable != stage_identity(&authority, root) {
+                return Err(
+                    "Workspace restore staged identity changed before attestation".to_string(),
+                );
+            }
+            require_directory_identity(
+                parent.as_raw_fd(),
+                &paths.staged,
+                durable,
+                "Workspace restore staging root",
+            )?;
+        }
+        Ok(())
+    }
+
     fn open_authorized_stage(
         token: &str,
         root: WorkspaceRestoreRoot,
@@ -1307,6 +1386,44 @@ mod unix {
         Ok(names)
     }
 
+    fn directory_entry_is_empty(
+        parent: &OwnedFd,
+        leaf: &CStr,
+        expected: Option<DirectoryIdentity>,
+    ) -> Result<bool, String> {
+        let directory = match open_child_dir(parent.as_raw_fd(), leaf) {
+            Ok(directory) => directory,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+            Err(error) => return Err(errno(error, "Restore placeholder is not a real directory")),
+        };
+        let identity = descriptor_identity(directory.as_raw_fd())?;
+        if expected.is_some_and(|value| value != identity) {
+            return Err("Restore placeholder identity changed; preserving replacement".to_string());
+        }
+        Ok(directory_names(&directory)?.is_empty())
+    }
+
+    fn remove_empty_directory_at(parent: &OwnedFd, leaf: &CStr) -> Result<(), String> {
+        let directory = match open_child_dir(parent.as_raw_fd(), leaf) {
+            Ok(directory) => directory,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+            Err(error) => return Err(errno(error, "Restore placeholder is not a real directory")),
+        };
+        let identity = descriptor_identity(directory.as_raw_fd())?;
+        if !directory_names(&directory)?.is_empty() {
+            return Err("Restore placeholder is not empty; preserving replacement".to_string());
+        }
+        drop(directory);
+        require_directory_identity(parent.as_raw_fd(), leaf, identity, "Restore placeholder")?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+            return Err(errno(
+                io::Error::last_os_error(),
+                "Could not remove restore placeholder",
+            ));
+        }
+        sync_directory(parent)
+    }
+
     fn remove_tree_at(
         parent: &OwnedFd,
         leaf: &CStr,
@@ -1375,17 +1492,21 @@ mod unix {
         token: &str,
         roots: &ProfileFsRoots,
         include_previous: bool,
-        authority: Option<&RestoreStageAuthority>,
+        staged: Option<&RestoreStagedIdentities>,
         originals: Option<&RestoreOriginalIdentities>,
     ) -> Result<(), String> {
         for root in [WorkspaceRestoreRoot::Media, WorkspaceRestoreRoot::Config] {
             let item = prepared_restore_root(root, token, roots)?;
-            remove_tree_at(
-                &item.parent,
-                &item.staged,
-                authority.map(|value| stage_identity(value, root)),
-            )?;
-            remove_tree_at(&item.parent, &item.discarded, None)?;
+            if let Some(staged) = staged {
+                remove_tree_at(
+                    &item.parent,
+                    &item.staged,
+                    Some(expected_staged_identity(staged, root)),
+                )?;
+            } else {
+                remove_empty_directory_at(&item.parent, &item.staged)?;
+            }
+            remove_empty_directory_at(&item.parent, &item.discarded)?;
             if include_previous {
                 remove_tree_at(
                     &item.parent,
@@ -1402,11 +1523,17 @@ mod unix {
         roots: &mut ProfileFsRoots,
         authority: Option<&RestoreStageAuthority>,
         originals: &RestoreOriginalIdentities,
+        staged: Option<&RestoreStagedIdentities>,
     ) -> Result<(), String> {
         if authority.is_some_and(|value| {
             value.config_original != originals.config || value.media_original != originals.media
         }) {
             return Err("Workspace restore durable root identity changed".to_string());
+        }
+        if let (Some(authority), Some(staged)) = (authority, staged) {
+            if authority.config != staged.config || authority.media != staged.media {
+                return Err("Workspace restore durable staged identity changed".to_string());
+            }
         }
         // Validate both roots and all token-derived leaves before the first
         // rename. A statically corrupt media previous tree must not partially
@@ -1415,41 +1542,83 @@ mod unix {
             let item = prepared_restore_root(root, token, roots)?;
             let previous = directory_entry_identity(item.parent.as_raw_fd(), &item.previous)?;
             let live = directory_entry_identity(item.parent.as_raw_fd(), &item.live)?;
-            let staged = directory_entry_identity(item.parent.as_raw_fd(), &item.staged)?;
+            let stage_entry = directory_entry_identity(item.parent.as_raw_fd(), &item.staged)?;
             let discarded = directory_entry_identity(item.parent.as_raw_fd(), &item.discarded)?;
-            if let Some(previous_identity) = previous {
-                if previous_identity != expected_original_identity(originals, root) {
+            if let Some(durable_staged) = staged {
+                let expected_stage = expected_staged_identity(durable_staged, root);
+                if stage_entry.is_some_and(|identity| identity != expected_stage) {
                     return Err(
-                        "Workspace restore previous root identity changed during rollback"
+                        "Workspace restore staged root identity changed during rollback"
                             .to_string(),
                     );
                 }
-                if let Some(live_identity) = live {
-                    if staged.is_some() && discarded.is_some() {
+                if discarded.is_some()
+                    && !directory_entry_is_empty(&item.parent, &item.discarded, discarded)?
+                {
+                    return Err(
+                        "Workspace restore discarded root is not empty during rollback".to_string(),
+                    );
+                }
+                if let Some(previous_identity) = previous {
+                    if previous_identity != expected_original_identity(originals, root) {
                         return Err(
-                            "Workspace restore rollback destination already exists".to_string()
+                            "Workspace restore previous root identity changed during rollback"
+                                .to_string(),
                         );
                     }
-                    let promoted_identity = authority.map(|value| stage_identity(value, root));
-                    if live_identity != item.selected_identity
-                        && Some(live_identity) != promoted_identity
-                    {
+                    if let Some(live_identity) = live {
+                        let is_promoted = live_identity == expected_stage;
+                        let is_empty_restart_placeholder = stage_entry == Some(expected_stage)
+                            && directory_entry_is_empty(
+                                &item.parent,
+                                &item.live,
+                                Some(live_identity),
+                            )?;
+                        if !is_promoted && !is_empty_restart_placeholder {
+                            return Err(
+                                "Workspace restore live root identity changed during rollback"
+                                    .to_string(),
+                            );
+                        }
+                        if is_promoted && stage_entry.is_some() {
+                            return Err(
+                                "Workspace restore rollback staging destination already exists"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                } else {
+                    if live != Some(expected_original_identity(originals, root)) {
                         return Err(
                             "Workspace restore live root identity changed during rollback"
                                 .to_string(),
                         );
                     }
                 }
-            } else if live.is_none() {
-                return Err("Workspace restore root is missing during rollback".to_string());
+            } else {
+                if previous.is_some() || discarded.is_some() {
+                    return Err("Unattested workspace restore has promoted residue".to_string());
+                }
+                if live != Some(expected_original_identity(originals, root)) {
+                    return Err(
+                        "Unattested workspace restore live root identity changed".to_string()
+                    );
+                }
+                if stage_entry.is_some()
+                    && !directory_entry_is_empty(&item.parent, &item.staged, stage_entry)?
+                {
+                    return Err(
+                        "Unattested workspace restore stage is not empty; preserving it"
+                            .to_string(),
+                    );
+                }
             }
         }
         for root in [WorkspaceRestoreRoot::Config, WorkspaceRestoreRoot::Media] {
             let item = prepared_restore_root(root, token, roots)?;
             let previous = directory_entry_identity(item.parent.as_raw_fd(), &item.previous)?;
             let live = directory_entry_identity(item.parent.as_raw_fd(), &item.live)?;
-            let staged = directory_entry_identity(item.parent.as_raw_fd(), &item.staged)?;
-            let discarded = directory_entry_identity(item.parent.as_raw_fd(), &item.discarded)?;
+            let stage_entry = directory_entry_identity(item.parent.as_raw_fd(), &item.staged)?;
             if let Some(previous_identity) = previous {
                 if previous_identity != expected_original_identity(originals, root) {
                     return Err(
@@ -1458,32 +1627,50 @@ mod unix {
                     );
                 }
                 if let Some(live_identity) = live {
-                    let promoted_identity = authority.map(|value| stage_identity(value, root));
-                    if live_identity != item.selected_identity
-                        && Some(live_identity) != promoted_identity
-                    {
-                        return Err(
-                            "Workspace restore live root identity changed during rollback"
-                                .to_string(),
-                        );
-                    }
-                    let destination = if staged.is_some() {
-                        if discarded.is_some() {
+                    let expected_stage = staged
+                        .map(|value| expected_staged_identity(value, root))
+                        .ok_or_else(|| {
+                            "Unattested workspace restore cannot have previous roots".to_string()
+                        })?;
+                    if live_identity == expected_stage {
+                        rename_restore_entry(&item.parent, &item.live, &item.staged)?;
+                        require_directory_identity(
+                            item.parent.as_raw_fd(),
+                            &item.staged,
+                            live_identity,
+                            "Workspace restore displaced root",
+                        )?;
+                    } else {
+                        if stage_entry != Some(expected_stage)
+                            || !directory_entry_is_empty(
+                                &item.parent,
+                                &item.live,
+                                Some(live_identity),
+                            )?
+                        {
                             return Err(
-                                "Workspace restore rollback destination already exists".to_string()
+                                "Workspace restore live root identity changed during rollback"
+                                    .to_string(),
                             );
                         }
-                        &item.discarded
-                    } else {
-                        &item.staged
-                    };
-                    rename_restore_entry(&item.parent, &item.live, destination)?;
-                    require_directory_identity(
-                        item.parent.as_raw_fd(),
-                        destination,
-                        live_identity,
-                        "Workspace restore displaced root",
-                    )?;
+                        if directory_entry_identity(item.parent.as_raw_fd(), &item.discarded)?
+                            .is_some()
+                        {
+                            // A prior rollback attempt may already have moved
+                            // the first startup placeholder aside before
+                            // crashing. Never overwrite it; remove only the
+                            // newly recreated, still-empty live placeholder.
+                            remove_empty_directory_at(&item.parent, &item.live)?;
+                        } else {
+                            rename_restore_entry(&item.parent, &item.live, &item.discarded)?;
+                            require_directory_identity(
+                                item.parent.as_raw_fd(),
+                                &item.discarded,
+                                live_identity,
+                                "Workspace restore displaced root",
+                            )?;
+                        }
+                    }
                 }
                 rename_restore_entry(&item.parent, &item.previous, &item.live)?;
                 require_directory_identity(
@@ -1497,17 +1684,24 @@ mod unix {
             }
         }
         refresh_restore_roots(roots)?;
-        cleanup_restore_residue(token, roots, true, authority, Some(originals))
+        cleanup_restore_residue(token, roots, true, staged, Some(originals))
     }
 
     fn rollback_workspace_restore_roots(
         token: &str,
         originals: RestoreOriginalIdentities,
+        staged: Option<RestoreStagedIdentities>,
     ) -> Result<(), String> {
         checked_restore_token(token)?;
         let mut roots = current_roots()?;
         let authority = restore_authority(token).ok();
-        rollback_workspace_restore_roots_with(token, &mut roots, authority.as_ref(), &originals)?;
+        rollback_workspace_restore_roots_with(
+            token,
+            &mut roots,
+            authority.as_ref(),
+            &originals,
+            staged.as_ref(),
+        )?;
         publish_roots(roots)?;
         clear_restore_authority(token)
     }
@@ -1515,17 +1709,34 @@ mod unix {
     fn cleanup_workspace_restore(
         token: &str,
         originals: RestoreOriginalIdentities,
+        staged: Option<RestoreStagedIdentities>,
     ) -> Result<(), String> {
         checked_restore_token(token)?;
+        let staged = staged.ok_or_else(|| {
+            "Committed workspace restore is missing staged identities".to_string()
+        })?;
         let roots = current_roots()?;
+        validate_promoted_restore_roots(token, &roots, &staged)?;
         for root in [WorkspaceRestoreRoot::Media, WorkspaceRestoreRoot::Config] {
             let item = prepared_restore_root(root, token, &roots)?;
-            require_directory_identity(
-                item.parent.as_raw_fd(),
-                &item.live,
-                item.selected_identity,
-                "Workspace restore live root",
-            )?;
+            if let Some(stage_entry) =
+                directory_entry_identity(item.parent.as_raw_fd(), &item.staged)?
+            {
+                if stage_entry != expected_staged_identity(&staged, root) {
+                    return Err(
+                        "Workspace restore staged root identity changed during cleanup".to_string(),
+                    );
+                }
+            }
+            if let Some(discarded) =
+                directory_entry_identity(item.parent.as_raw_fd(), &item.discarded)?
+            {
+                if !directory_entry_is_empty(&item.parent, &item.discarded, Some(discarded))? {
+                    return Err(
+                        "Workspace restore discarded root is not empty during cleanup".to_string(),
+                    );
+                }
+            }
             if let Some(previous) =
                 directory_entry_identity(item.parent.as_raw_fd(), &item.previous)?
             {
@@ -1537,23 +1748,37 @@ mod unix {
                 }
             }
         }
-        let authority = restore_authority(token).ok();
-        cleanup_restore_residue(token, &roots, true, authority.as_ref(), Some(&originals))?;
+        cleanup_restore_residue(token, &roots, true, Some(&staged), Some(&originals))?;
         clear_restore_authority(token)
     }
 
-    fn refresh_workspace_restore_roots(token: &str) -> Result<(), String> {
-        checked_restore_token(token)?;
-        let mut roots = current_roots()?;
+    fn validate_promoted_restore_roots(
+        token: &str,
+        roots: &ProfileFsRoots,
+        staged: &RestoreStagedIdentities,
+    ) -> Result<(), String> {
         for root in [WorkspaceRestoreRoot::Media, WorkspaceRestoreRoot::Config] {
-            let item = prepared_restore_root(root, token, &roots)?;
+            let item = prepared_restore_root(root, token, roots)?;
             require_directory_identity(
                 item.parent.as_raw_fd(),
                 &item.live,
-                item.selected_identity,
+                expected_staged_identity(staged, root),
                 "Workspace restore live root",
             )?;
         }
+        Ok(())
+    }
+
+    fn refresh_workspace_restore_roots(
+        token: &str,
+        staged: Option<RestoreStagedIdentities>,
+    ) -> Result<(), String> {
+        checked_restore_token(token)?;
+        let staged = staged.ok_or_else(|| {
+            "Committed workspace restore is missing staged identities".to_string()
+        })?;
+        let mut roots = current_roots()?;
+        validate_promoted_restore_roots(token, &roots, &staged)?;
         refresh_restore_roots(&mut roots)?;
         publish_roots(roots)
     }
@@ -1744,6 +1969,22 @@ mod unix {
             ProfileFsRequest::SealWorkspaceRestoreRoot { token, root } => {
                 seal_workspace_restore_root(&token, root)
             }
+            ProfileFsRequest::AttestWorkspaceRestoreStages {
+                token,
+                config_staged_device,
+                config_staged_inode,
+                media_staged_device,
+                media_staged_inode,
+            } => attest_workspace_restore_stages(
+                &token,
+                restore_staged_identities(
+                    Some(&config_staged_device),
+                    Some(&config_staged_inode),
+                    Some(&media_staged_device),
+                    Some(&media_staged_inode),
+                )?
+                .expect("all staged restore identities were provided"),
+            ),
             ProfileFsRequest::PromoteWorkspaceRestoreRoots { token } => {
                 promote_workspace_restore_roots(&token)
             }
@@ -1753,6 +1994,10 @@ mod unix {
                 config_original_inode,
                 media_original_device,
                 media_original_inode,
+                config_staged_device,
+                config_staged_inode,
+                media_staged_device,
+                media_staged_inode,
             } => rollback_workspace_restore_roots(
                 &token,
                 restore_original_identities(
@@ -1761,6 +2006,12 @@ mod unix {
                     &media_original_device,
                     &media_original_inode,
                 )?,
+                restore_staged_identities(
+                    config_staged_device.as_deref(),
+                    config_staged_inode.as_deref(),
+                    media_staged_device.as_deref(),
+                    media_staged_inode.as_deref(),
+                )?,
             ),
             ProfileFsRequest::CleanupWorkspaceRestore {
                 token,
@@ -1768,6 +2019,10 @@ mod unix {
                 config_original_inode,
                 media_original_device,
                 media_original_inode,
+                config_staged_device,
+                config_staged_inode,
+                media_staged_device,
+                media_staged_inode,
             } => cleanup_workspace_restore(
                 &token,
                 restore_original_identities(
@@ -1776,10 +2031,28 @@ mod unix {
                     &media_original_device,
                     &media_original_inode,
                 )?,
+                restore_staged_identities(
+                    config_staged_device.as_deref(),
+                    config_staged_inode.as_deref(),
+                    media_staged_device.as_deref(),
+                    media_staged_inode.as_deref(),
+                )?,
             ),
-            ProfileFsRequest::RefreshWorkspaceRestoreRoots { token } => {
-                refresh_workspace_restore_roots(&token)
-            }
+            ProfileFsRequest::RefreshWorkspaceRestoreRoots {
+                token,
+                config_staged_device,
+                config_staged_inode,
+                media_staged_device,
+                media_staged_inode,
+            } => refresh_workspace_restore_roots(
+                &token,
+                restore_staged_identities(
+                    config_staged_device.as_deref(),
+                    config_staged_inode.as_deref(),
+                    media_staged_device.as_deref(),
+                    media_staged_inode.as_deref(),
+                )?,
+            ),
         }
     }
 
@@ -1789,9 +2062,10 @@ mod unix {
             capture_roots, execute, open_relative_parent_from_directory, open_root_with_roots,
             open_target, prepare_workspace_restore_with_roots,
             promote_workspace_restore_roots_with, rollback_workspace_restore_roots_with,
-            write_workspace_restore_file_with, ProfileFsRequest, ProfileFsRoot,
-            RestoreOriginalIdentities, WorkspaceRestoreRoot, BEFORE_RENAME_HOOK,
-            BEFORE_RESTORE_PROMOTE_HOOK, BEFORE_RESTORE_RENAME_HOOK,
+            validate_promoted_restore_roots, write_workspace_restore_file_with, ProfileFsRequest,
+            ProfileFsRoot, RestoreOriginalIdentities, RestoreStagedIdentities,
+            WorkspaceRestoreRoot, BEFORE_RENAME_HOOK, BEFORE_RESTORE_PROMOTE_HOOK,
+            BEFORE_RESTORE_RENAME_HOOK,
         };
         use crate::{profile::ProfileDirs, test_global_lock};
         use std::ffi::CString;
@@ -1990,6 +2264,10 @@ mod unix {
                     config: authority.config_original,
                     media: authority.media_original,
                 },
+                Some(&RestoreStagedIdentities {
+                    config: authority.config,
+                    media: authority.media,
+                }),
             )
             .expect_err("rollback must not adopt the moved replacement");
             assert!(rollback.contains("previous root identity changed"));
@@ -2197,6 +2475,10 @@ mod unix {
                         config: authority.config_original,
                         media: authority.media_original,
                     },
+                    Some(&RestoreStagedIdentities {
+                        config: authority.config,
+                        media: authority.media,
+                    }),
                 )
                 .expect("native rollback");
                 assert_eq!(
@@ -2236,6 +2518,240 @@ mod unix {
         }
 
         #[test]
+        fn cold_committed_validation_rejects_a_replaced_promoted_root() {
+            let fixture = temp_root("restore-cold-committed-replacement");
+            let dirs = profile_dirs(fixture.join("profile"));
+            create_profile(&dirs);
+            fs::write(dirs.media.join("old.txt"), b"old media").expect("old media");
+            fs::write(dirs.config.join("old.json"), b"old config").expect("old config");
+            let mut roots = capture_roots(&dirs).expect("capture original roots");
+            let token = "restore-cold-committed-replacement-token";
+            let authority = prepare_workspace_restore_with_roots(token, &roots)
+                .expect("prepare restore stages");
+            let staged = RestoreStagedIdentities {
+                config: authority.config,
+                media: authority.media,
+            };
+            promote_workspace_restore_roots_with(token, &mut roots, &authority)
+                .expect("promote roots");
+
+            fs::remove_dir_all(&dirs.media).expect("remove promoted media");
+            fs::create_dir(&dirs.media).expect("install replacement media");
+            fs::write(dirs.media.join("replacement.txt"), b"replacement")
+                .expect("replacement marker");
+            let cold_roots = capture_roots(&dirs).expect("capture cold-start replacement roots");
+
+            let error = validate_promoted_restore_roots(token, &cold_roots, &staged)
+                .expect_err("committed replacement must fail closed");
+            assert!(error.contains("identity changed"));
+            assert_eq!(
+                fs::read(dirs.media.join("replacement.txt")).expect("replacement preserved"),
+                b"replacement"
+            );
+            assert!(dirs
+                .data
+                .join(format!(".media.restore-previous-{token}"))
+                .is_dir());
+            assert!(dirs
+                .root
+                .join(format!(".config.restore-previous-{token}"))
+                .is_dir());
+            let _ = fs::remove_dir_all(fixture);
+        }
+
+        #[test]
+        fn cold_uncommitted_rollback_rejects_replacement_before_mutating_other_root() {
+            let fixture = temp_root("restore-cold-uncommitted-replacement");
+            let dirs = profile_dirs(fixture.join("profile"));
+            create_profile(&dirs);
+            fs::write(dirs.media.join("old.txt"), b"old media").expect("old media");
+            fs::write(dirs.config.join("old.json"), b"old config").expect("old config");
+            let mut roots = capture_roots(&dirs).expect("capture original roots");
+            let token = "restore-cold-uncommitted-replacement-token";
+            let authority = prepare_workspace_restore_with_roots(token, &roots)
+                .expect("prepare restore stages");
+            fs::write(
+                dirs.data
+                    .join(format!(".media.restore-stage-{token}/new.txt")),
+                b"new media",
+            )
+            .expect("stage media");
+            fs::write(
+                dirs.root
+                    .join(format!(".config.restore-stage-{token}/new.json")),
+                b"new config",
+            )
+            .expect("stage config");
+            promote_workspace_restore_roots_with(token, &mut roots, &authority)
+                .expect("promote roots");
+            let staged = RestoreStagedIdentities {
+                config: authority.config,
+                media: authority.media,
+            };
+            let originals = RestoreOriginalIdentities {
+                config: authority.config_original,
+                media: authority.media_original,
+            };
+
+            fs::remove_dir_all(&dirs.media).expect("remove promoted media");
+            fs::create_dir(&dirs.media).expect("install replacement media");
+            fs::write(dirs.media.join("replacement.txt"), b"replacement")
+                .expect("replacement marker");
+            let mut cold_roots =
+                capture_roots(&dirs).expect("capture cold-start replacement roots");
+
+            let error = rollback_workspace_restore_roots_with(
+                token,
+                &mut cold_roots,
+                None,
+                &originals,
+                Some(&staged),
+            )
+            .expect_err("uncommitted replacement must fail before rollback mutation");
+            assert!(error.contains("live root identity changed"));
+            assert_eq!(
+                fs::read(dirs.config.join("new.json")).expect("config remains promoted"),
+                b"new config"
+            );
+            assert_eq!(
+                fs::read(dirs.media.join("replacement.txt")).expect("replacement preserved"),
+                b"replacement"
+            );
+            assert!(dirs
+                .root
+                .join(format!(".config.restore-previous-{token}/old.json"))
+                .is_file());
+            assert!(dirs
+                .data
+                .join(format!(".media.restore-previous-{token}/old.txt"))
+                .is_file());
+            let _ = fs::remove_dir_all(fixture);
+        }
+
+        #[test]
+        fn cold_rollback_accepts_only_an_empty_startup_placeholder() {
+            let fixture = temp_root("restore-cold-empty-placeholder");
+            let dirs = profile_dirs(fixture.join("profile"));
+            create_profile(&dirs);
+            fs::write(dirs.media.join("old.txt"), b"old media").expect("old media");
+            let roots = capture_roots(&dirs).expect("capture original roots");
+            let token = "restore-cold-empty-placeholder-token";
+            let authority = prepare_workspace_restore_with_roots(token, &roots)
+                .expect("prepare restore stages");
+            let previous = dirs.data.join(format!(".media.restore-previous-{token}"));
+            fs::rename(&dirs.media, &previous).expect("move media to previous");
+            fs::create_dir(&dirs.media).expect("startup creates empty live placeholder");
+            let mut cold_roots = capture_roots(&dirs).expect("capture startup placeholder roots");
+
+            rollback_workspace_restore_roots_with(
+                token,
+                &mut cold_roots,
+                None,
+                &RestoreOriginalIdentities {
+                    config: authority.config_original,
+                    media: authority.media_original,
+                },
+                Some(&RestoreStagedIdentities {
+                    config: authority.config,
+                    media: authority.media,
+                }),
+            )
+            .expect("empty startup placeholder is recoverable");
+
+            assert_eq!(
+                fs::read(dirs.media.join("old.txt")).expect("old media restored"),
+                b"old media"
+            );
+            assert!(!previous.exists());
+            assert!(!dirs
+                .data
+                .join(format!(".media.restore-stage-{token}"))
+                .exists());
+            let _ = fs::remove_dir_all(fixture);
+        }
+
+        #[test]
+        fn cold_rollback_resumes_after_placeholder_was_already_discarded() {
+            let fixture = temp_root("restore-cold-discarded-placeholder");
+            let dirs = profile_dirs(fixture.join("profile"));
+            create_profile(&dirs);
+            fs::write(dirs.media.join("old.txt"), b"old media").expect("old media");
+            let roots = capture_roots(&dirs).expect("capture original roots");
+            let token = "restore-cold-discarded-placeholder-token";
+            let authority = prepare_workspace_restore_with_roots(token, &roots)
+                .expect("prepare restore stages");
+            let previous = dirs.data.join(format!(".media.restore-previous-{token}"));
+            let discarded = dirs.data.join(format!(".media.restore-discarded-{token}"));
+            fs::rename(&dirs.media, &previous).expect("move media to previous");
+            fs::create_dir(&dirs.media).expect("first startup placeholder");
+            fs::rename(&dirs.media, &discarded).expect("first rollback discards placeholder");
+            fs::create_dir(&dirs.media).expect("second startup placeholder");
+            let mut cold_roots = capture_roots(&dirs).expect("capture second startup roots");
+
+            rollback_workspace_restore_roots_with(
+                token,
+                &mut cold_roots,
+                None,
+                &RestoreOriginalIdentities {
+                    config: authority.config_original,
+                    media: authority.media_original,
+                },
+                Some(&RestoreStagedIdentities {
+                    config: authority.config,
+                    media: authority.media,
+                }),
+            )
+            .expect("rollback resumes from discarded placeholder");
+
+            assert_eq!(
+                fs::read(dirs.media.join("old.txt")).expect("old media restored"),
+                b"old media"
+            );
+            for residue in [
+                previous,
+                discarded,
+                dirs.data.join(format!(".media.restore-stage-{token}")),
+                dirs.root.join(format!(".config.restore-stage-{token}")),
+            ] {
+                assert!(!residue.exists(), "rollback residue: {}", residue.display());
+            }
+            let _ = fs::remove_dir_all(fixture);
+        }
+
+        #[test]
+        fn cold_rollback_cleans_only_empty_unattested_stages() {
+            let fixture = temp_root("restore-cold-unattested-stage");
+            let dirs = profile_dirs(fixture.join("profile"));
+            create_profile(&dirs);
+            let mut roots = capture_roots(&dirs).expect("capture original roots");
+            let token = "restore-cold-unattested-stage-token";
+            let authority = prepare_workspace_restore_with_roots(token, &roots)
+                .expect("prepare empty restore stages");
+
+            rollback_workspace_restore_roots_with(
+                token,
+                &mut roots,
+                None,
+                &RestoreOriginalIdentities {
+                    config: authority.config_original,
+                    media: authority.media_original,
+                },
+                None,
+            )
+            .expect("empty unattested stages are safe to remove");
+
+            assert!(!dirs
+                .data
+                .join(format!(".media.restore-stage-{token}"))
+                .exists());
+            assert!(!dirs
+                .root
+                .join(format!(".config.restore-stage-{token}"))
+                .exists());
+            let _ = fs::remove_dir_all(fixture);
+        }
+
+        #[test]
         fn rollback_preflights_second_root_collisions_before_mutating_config() {
             let fixture = temp_root("restore-rollback-collision");
             let dirs = profile_dirs(fixture.join("profile"));
@@ -2264,9 +2780,16 @@ mod unix {
                     config: authority.config_original,
                     media: authority.media_original,
                 },
+                Some(&RestoreStagedIdentities {
+                    config: authority.config,
+                    media: authority.media,
+                }),
             )
             .expect_err("second-root collision must fail before config rollback");
-            assert!(error.contains("destination already exists"));
+            assert!(
+                error.contains("destination already exists")
+                    || error.contains("staged root identity changed")
+            );
             assert_eq!(
                 fs::read(dirs.config.join("new.json")).expect("config remains promoted"),
                 b"new config"

@@ -77,7 +77,10 @@ import {
   writeRestoreJournal,
 } from "@/lib/server/workspace-restore-journal";
 import { createHash } from "node:crypto";
-import { resetNativeProfileFsRestoreForTests } from "@/lib/server/native-profile-fs";
+import {
+  nativePrepareWorkspaceRestore,
+  resetNativeProfileFsRestoreForTests,
+} from "@/lib/server/native-profile-fs";
 
 let testRoot = "";
 
@@ -513,9 +516,11 @@ describe("restore crash reconciliation", () => {
     await fs.writeFile(path.join(config.root, "new.json"), "new-config");
     await fs.writeFile(path.join(media.previous, "generated/old.png"), "old-media");
     await fs.writeFile(path.join(config.previous, "old.json"), "old-config");
-    const [mediaOriginal, configOriginal] = await Promise.all([
+    const [mediaOriginal, configOriginal, mediaStaged, configStaged] = await Promise.all([
       fs.lstat(media.previous, { bigint: true }),
       fs.lstat(config.previous, { bigint: true }),
+      fs.lstat(media.root, { bigint: true }),
+      fs.lstat(config.root, { bigint: true }),
     ]);
     return {
       swaps: [
@@ -524,12 +529,16 @@ describe("restore crash reconciliation", () => {
           previousExisted: true,
           originalDevice: mediaOriginal.dev.toString(),
           originalInode: mediaOriginal.ino.toString(),
+          stagedDevice: mediaStaged.dev.toString(),
+          stagedInode: mediaStaged.ino.toString(),
         },
         {
           ...config,
           previousExisted: true,
           originalDevice: configOriginal.dev.toString(),
           originalInode: configOriginal.ino.toString(),
+          stagedDevice: configStaged.dev.toString(),
+          stagedInode: configStaged.ino.toString(),
         },
       ],
     };
@@ -650,6 +659,113 @@ describe("restore crash reconciliation", () => {
     expect(mocks.models.workspaceRestoreCommit.deleteMany).toHaveBeenCalled();
   });
 
+  it("preserves a replacement of a committed promoted root across cold reconciliation", async () => {
+    const token = "crash-committed-live-replaced";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await fs.rm(swaps[0]!.root, { recursive: true, force: true });
+    await fs.mkdir(path.join(swaps[0]!.root, "replacement"), { recursive: true });
+    await fs.writeFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "replacement");
+    resetNativeProfileFsRestoreForTests();
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue({ token });
+
+    await expect(reconcileWorkspaceRestoreState()).rejects.toThrow(
+      "promoted root identity changed",
+    );
+
+    expect(await fs.readFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "utf8"))
+      .toBe("replacement");
+    expect(await fs.readFile(path.join(swaps[1]!.root, "new.json"), "utf8"))
+      .toBe("new-config");
+    await expect(fs.access(swaps[0]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(swaps[1]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(restoreJournalPath())).resolves.toBeUndefined();
+    expect(mocks.models.workspaceRestoreCommit.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("preserves both roots and recovery material on an uncommitted cold live replacement", async () => {
+    const token = "crash-uncommitted-live-replaced";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await fs.rm(swaps[0]!.root, { recursive: true, force: true });
+    await fs.mkdir(path.join(swaps[0]!.root, "replacement"), { recursive: true });
+    await fs.writeFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "replacement");
+    resetNativeProfileFsRestoreForTests();
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
+
+    await expect(reconcileWorkspaceRestoreState()).rejects.toThrow(
+      "live root identity changed during rollback",
+    );
+
+    expect(await fs.readFile(path.join(swaps[0]!.root, "replacement/keep.txt"), "utf8"))
+      .toBe("replacement");
+    expect(await fs.readFile(path.join(swaps[1]!.root, "new.json"), "utf8"))
+      .toBe("new-config");
+    await expect(fs.access(swaps[0]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(swaps[1]!.previous)).resolves.toBeUndefined();
+    await expect(fs.access(restoreJournalPath())).resolves.toBeUndefined();
+  });
+
+  it("cleans only empty unattested stages after a cold prepare-window crash", async () => {
+    const token = "crash-before-stage-attestation";
+    const expected = buildExpectedRestoreSwaps(token);
+    const [mediaOriginal, configOriginal] = await Promise.all([
+      fs.lstat(expected[0]!.root, { bigint: true }),
+      fs.lstat(expected[1]!.root, { bigint: true }),
+    ]);
+    const swaps = [
+      {
+        ...expected[0]!,
+        previousExisted: true,
+        originalDevice: mediaOriginal.dev.toString(),
+        originalInode: mediaOriginal.ino.toString(),
+        stagedDevice: null,
+        stagedInode: null,
+      },
+      {
+        ...expected[1]!,
+        previousExisted: true,
+        originalDevice: configOriginal.dev.toString(),
+        originalInode: configOriginal.ino.toString(),
+        stagedDevice: null,
+        stagedInode: null,
+      },
+    ];
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    await nativePrepareWorkspaceRestore(token, {
+      media: { device: swaps[0]!.originalDevice, inode: swaps[0]!.originalInode },
+      config: { device: swaps[1]!.originalDevice, inode: swaps[1]!.originalInode },
+    });
+    resetNativeProfileFsRestoreForTests();
+    mocks.models.workspaceRestoreCommit = makeModel();
+    mocks.models.workspaceRestoreCommit.findUnique.mockResolvedValue(null);
+
+    await reconcileWorkspaceRestoreState();
+
+    await expect(fs.access(swaps[0]!.staged)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(swaps[1]!.staged)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(restoreJournalPath())).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(swaps[0]!.root)).resolves.toBeUndefined();
+    await expect(fs.access(swaps[1]!.root)).resolves.toBeUndefined();
+  });
+
   it("fails closed and preserves recovery material when a committed root is missing", async () => {
     const token = "crash-missing-root";
     const { swaps } = await seedPromotedTrees(token);
@@ -687,9 +803,11 @@ describe("restore crash reconciliation", () => {
     await fs.writeFile(path.join(media.previous, "generated/old.png"), "old-media");
     await fs.writeFile(path.join(config.root, "old.json"), "old-config");
     await fs.writeFile(path.join(config.staged, "new.json"), "new-config");
-    const [mediaOriginal, configOriginal] = await Promise.all([
+    const [mediaOriginal, configOriginal, mediaStaged, configStaged] = await Promise.all([
       fs.lstat(media.previous, { bigint: true }),
       fs.lstat(config.root, { bigint: true }),
+      fs.lstat(media.root, { bigint: true }),
+      fs.lstat(config.staged, { bigint: true }),
     ]);
 
     await writeRestoreJournal({
@@ -702,12 +820,16 @@ describe("restore crash reconciliation", () => {
           previousExisted: true,
           originalDevice: mediaOriginal.dev.toString(),
           originalInode: mediaOriginal.ino.toString(),
+          stagedDevice: mediaStaged.dev.toString(),
+          stagedInode: mediaStaged.ino.toString(),
         },
         {
           ...config,
           previousExisted: true,
           originalDevice: configOriginal.dev.toString(),
           originalInode: configOriginal.ino.toString(),
+          stagedDevice: configStaged.dev.toString(),
+          stagedInode: configStaged.ino.toString(),
         },
       ],
     });

@@ -292,6 +292,11 @@ describe("native profile filesystem restore test fallback", () => {
     const native = await import("@/lib/server/native-profile-fs");
     const originals = await restoreIdentities(media, config);
     await native.nativePrepareWorkspaceRestore("restore-authority-one", originals);
+    const staged = await restoreIdentities(
+      path.join(root, ".media.restore-stage-restore-authority-one"),
+      path.join(root, ".config.restore-stage-restore-authority-one"),
+    );
+    await native.nativeAttestWorkspaceRestoreStages("restore-authority-one", staged);
     await native.nativePromoteWorkspaceRestoreRoots("restore-authority-one");
 
     await expect(native.nativePrepareWorkspaceRestore(
@@ -299,10 +304,46 @@ describe("native profile filesystem restore test fallback", () => {
       await restoreIdentities(media, config),
     )).rejects.toThrow("Another workspace restore staging authority is active");
 
-    await native.nativeCleanupWorkspaceRestore("restore-authority-one", originals);
+    await native.nativeCleanupWorkspaceRestore("restore-authority-one", originals, staged);
     const current = await restoreIdentities(media, config);
     await native.nativePrepareWorkspaceRestore("restore-authority-two", current);
-    await native.nativeRollbackWorkspaceRestoreRoots("restore-authority-two", current);
+    await native.nativeRollbackWorkspaceRestoreRoots("restore-authority-two", current, null);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("resumes cold rollback after a placeholder was already moved to discarded", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const root = await fs.mkdtemp(path.join(tmpdir(), "lunery-native-rollback-resume-test-"));
+    const media = path.join(root, "media");
+    const config = path.join(root, "config");
+    await fs.mkdir(media);
+    await fs.mkdir(config);
+    await fs.writeFile(path.join(media, "old.txt"), "old-media");
+    vi.stubEnv("LUNERY_MEDIA_DIR", media);
+    vi.stubEnv("LUNERY_CONFIG_DIR", config);
+    vi.resetModules();
+    const native = await import("@/lib/server/native-profile-fs");
+    const token = "restore-placeholder-resume";
+    const originals = await restoreIdentities(media, config);
+    await native.nativePrepareWorkspaceRestore(token, originals);
+    const mediaStage = path.join(root, `.media.restore-stage-${token}`);
+    const configStage = path.join(root, `.config.restore-stage-${token}`);
+    const previous = path.join(root, `.media.restore-previous-${token}`);
+    const discarded = path.join(root, `.media.restore-discarded-${token}`);
+    const staged = await restoreIdentities(mediaStage, configStage);
+    await native.nativeAttestWorkspaceRestoreStages(token, staged);
+    await fs.rename(media, previous);
+    await fs.mkdir(media);
+    await fs.rename(media, discarded);
+    await fs.mkdir(media);
+    native.resetNativeProfileFsRestoreForTests();
+
+    await native.nativeRollbackWorkspaceRestoreRoots(token, originals, staged);
+
+    expect(await fs.readFile(path.join(media, "old.txt"), "utf8")).toBe("old-media");
+    for (const residue of [mediaStage, configStage, previous, discarded]) {
+      await expect(fs.access(residue)).rejects.toMatchObject({ code: "ENOENT" });
+    }
     await fs.rm(root, { recursive: true, force: true });
   });
 });

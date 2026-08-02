@@ -9,6 +9,7 @@ import {
   nativeRefreshWorkspaceRestoreRoots,
   nativeRollbackWorkspaceRestoreRoots,
   type NativeWorkspaceRestoreOriginalIdentities,
+  type NativeWorkspaceRestoreStagedIdentities,
 } from "@/lib/server/native-profile-fs";
 import {
   getWorkspaceExclusiveCapability,
@@ -30,6 +31,8 @@ export interface RestoreJournalSwap {
   previousExisted: boolean;
   originalDevice: string;
   originalInode: string;
+  stagedDevice: string | null;
+  stagedInode: string | null;
 }
 
 export interface RestoreJournal {
@@ -138,7 +141,10 @@ function siblingRestorePath(root: string, kind: "stage" | "previous", token: str
  */
 export function buildExpectedRestoreSwaps(
   token: string,
-): Omit<RestoreJournalSwap, "previousExisted" | "originalDevice" | "originalInode">[] {
+): Omit<
+  RestoreJournalSwap,
+  "previousExisted" | "originalDevice" | "originalInode" | "stagedDevice" | "stagedInode"
+>[] {
   assertRestoreToken(token);
   const mediaRoot = path.resolve(luneryMediaDir());
   const configRoot = path.resolve(luneryConfigDir());
@@ -194,6 +200,15 @@ export function validateRestoreJournal(journal: RestoreJournal): RestoreJournal 
       typeof actual.originalInode !== "string" ||
       !/^\d+$/.test(actual.originalDevice) ||
       !/^\d+$/.test(actual.originalInode) ||
+      !(
+        (actual.stagedDevice === null && actual.stagedInode === null)
+        || (
+          typeof actual.stagedDevice === "string"
+          && typeof actual.stagedInode === "string"
+          && /^\d+$/.test(actual.stagedDevice)
+          && /^\d+$/.test(actual.stagedInode)
+        )
+      ) ||
       !samePath(actual.root, want.root) ||
       !samePath(actual.staged, want.staged) ||
       !samePath(actual.previous, want.previous)
@@ -207,13 +222,29 @@ export function validateRestoreJournal(journal: RestoreJournal): RestoreJournal 
       previousExisted: actual.previousExisted,
       originalDevice: actual.originalDevice,
       originalInode: actual.originalInode,
+      stagedDevice: actual.stagedDevice,
+      stagedInode: actual.stagedInode,
     });
+  }
+  const stagedIdentityCount = swaps.filter((swap) => swap.stagedDevice !== null).length;
+  if (stagedIdentityCount !== 0 && stagedIdentityCount !== swaps.length) {
+    throw new Error("Corrupt workspace restore staged identities.");
   }
   return {
     format: RESTORE_JOURNAL_FORMAT,
     version: RESTORE_JOURNAL_VERSION,
     token,
     swaps,
+  };
+}
+
+function journalStagedIdentities(journal: RestoreJournal): NativeWorkspaceRestoreStagedIdentities {
+  const media = journal.swaps[0]!;
+  const config = journal.swaps[1]!;
+  if (media.stagedDevice === null || config.stagedDevice === null) return null;
+  return {
+    media: { device: media.stagedDevice, inode: media.stagedInode! },
+    config: { device: config.stagedDevice, inode: config.stagedInode! },
   };
 }
 
@@ -367,10 +398,19 @@ async function reconcileWorkspaceRestoreStateWithAuthority(): Promise<void> {
     // Startup may have freshly pinned these roots; an in-process recovery may
     // still hold the pre-swap identities. The native boundary validates the
     // live roots before publishing both identities together.
-    await nativeRefreshWorkspaceRestoreRoots(journal.token);
-    await nativeCleanupWorkspaceRestore(journal.token, journalOriginalIdentities(journal));
+    const stagedIdentities = journalStagedIdentities(journal);
+    await nativeRefreshWorkspaceRestoreRoots(journal.token, stagedIdentities);
+    await nativeCleanupWorkspaceRestore(
+      journal.token,
+      journalOriginalIdentities(journal),
+      stagedIdentities,
+    );
   } else {
-    await nativeRollbackWorkspaceRestoreRoots(journal.token, journalOriginalIdentities(journal));
+    await nativeRollbackWorkspaceRestoreRoots(
+      journal.token,
+      journalOriginalIdentities(journal),
+      journalStagedIdentities(journal),
+    );
   }
 
   await removeRestoreJournal();
