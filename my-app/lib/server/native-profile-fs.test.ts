@@ -73,4 +73,36 @@ describe("native profile filesystem bridge admission", () => {
     expect(mocks.bridgeFetch).toHaveBeenCalledTimes(1);
     expect(native.__nativeProfileFsTestHooks.sleep).not.toHaveBeenCalled();
   });
+
+  it("forwards modification time in the external staged-file identity", async () => {
+    mocks.bridgeFetch.mockResolvedValue(Response.json({ ok: true }));
+    const native = await import("@/lib/server/native-profile-fs");
+
+    await native.nativeUnlinkExternalIdentity("/tmp/.model.lunery-delete-token", {
+      device: "11",
+      inode: "22",
+      sizeBytes: "33",
+      modifiedAtNs: "44",
+    });
+
+    const request = mocks.bridgeFetch.mock.calls[0]?.[2] as RequestInit;
+    expect(JSON.parse(String(request.body))).toMatchObject({
+      operation: "unlink-external-identity",
+      expected_device: "11",
+      expected_inode: "22",
+      expected_size: "33",
+      expected_modified_at_ns: "44",
+    });
+  });
+
+  it("maps a native no-replace collision to EEXIST", async () => {
+    mocks.bridgeFetch.mockResolvedValue(
+      Response.json({ error: "Profile destination already exists" }, { status: 409 }),
+    );
+    const native = await import("@/lib/server/native-profile-fs");
+
+    await expect(native.nativeProfileRename("models", "a.tmp", "a.json")).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+  });
 });

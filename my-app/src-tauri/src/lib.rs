@@ -28,6 +28,9 @@ use crate::profile::{
     acquire_profile_advisory_lock, ensure_profile_dirs, profile_dirs, ProfileAdvisoryLock,
     ProfileDirs, ProfileStorageDirs,
 };
+use crate::profile_fs::initialize_profile_fs_roots;
+#[cfg(not(debug_assertions))]
+use crate::profile_fs::refresh_profile_fs_roots;
 use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
 use crate::security::bridge_token;
@@ -1810,7 +1813,9 @@ fn request_desktop_workspace_reset(
                 if !state.lifecycle_is_current(epoch) {
                     return Err("Desktop workspace reset was superseded".to_string());
                 }
-                reset_workspace_data(&profile_dirs()?)?;
+                let reset_profile = profile_dirs()?;
+                reset_workspace_data(&reset_profile)?;
+                refresh_profile_fs_roots(&reset_profile)?;
                 if !state.lifecycle_is_current(epoch) {
                     return Err("Desktop workspace reset was superseded".to_string());
                 }
@@ -1935,6 +1940,10 @@ pub fn run() {
                 &profile,
             ) {
                 eprintln!("desktop profile lock unavailable: {err}");
+                return Err(Box::<dyn std::error::Error>::from(err));
+            }
+            if let Err(err) = initialize_profile_fs_roots(&profile) {
+                eprintln!("desktop safe profile filesystem unavailable: {err}");
                 return Err(Box::<dyn std::error::Error>::from(err));
             }
 

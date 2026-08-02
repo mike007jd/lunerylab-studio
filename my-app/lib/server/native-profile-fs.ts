@@ -6,10 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { bridgeFetch, requireDesktopBridge } from "@/lib/server/desktop-bridge";
-import { luneryMediaDir, luneryModelsDir } from "@/lib/server/lunery-profile";
+import {
+  luneryConfigDir,
+  luneryMediaDir,
+  luneryModelsDir,
+  luneryRuntimeDir,
+} from "@/lib/server/lunery-profile";
 import { ApiError } from "@/lib/server/errors";
 
-export type NativeProfileRoot = "media" | "models";
+export type NativeProfileRoot = "config" | "media" | "models" | "runtime";
 
 type ProfileFsRequest =
   | { operation: "mkdir"; root: NativeProfileRoot; relative_path: string }
@@ -25,6 +30,7 @@ type ProfileFsRequest =
       root: NativeProfileRoot;
       source_relative_path: string;
       destination_relative_path: string;
+      replace: boolean;
     }
   | {
       operation: "unlink";
@@ -38,6 +44,7 @@ type ProfileFsRequest =
       expected_device: string;
       expected_inode: string;
       expected_size: string;
+      expected_modified_at_ns: string;
     };
 
 export const __nativeProfileFsTestHooks = {
@@ -75,7 +82,12 @@ function validateRelativePath(relativePath: string): string {
 }
 
 function rootPath(root: NativeProfileRoot): string {
-  return root === "media" ? luneryMediaDir() : luneryModelsDir();
+  switch (root) {
+    case "config": return luneryConfigDir();
+    case "media": return luneryMediaDir();
+    case "models": return luneryModelsDir();
+    case "runtime": return luneryRuntimeDir();
+  }
 }
 
 async function assertTestProfileParents(
@@ -88,7 +100,7 @@ async function assertTestProfileParents(
     throw new Error(
       rootKind === "media"
         ? "Storage root must be a real directory."
-        : "Managed model cache root must be a real directory.",
+        : "Profile resource root must be a real directory.",
     );
   }
   let current = root;
@@ -101,7 +113,7 @@ async function assertTestProfileParents(
         throw new Error(
           rootKind === "media"
             ? "Storage path component is a symlink."
-            : "Managed model cache path contains a symlink.",
+            : "Profile resource path contains a symlink.",
         );
       }
     } catch (error) {
@@ -139,10 +151,14 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
       const root = rootPath(request.root);
       await assertTestProfileParents(request.root, root, request.source_relative_path);
       await assertTestProfileParents(request.root, root, request.destination_relative_path);
-      await fs.rename(
-        path.join(root, request.source_relative_path),
-        path.join(root, request.destination_relative_path),
-      );
+      const source = path.join(root, request.source_relative_path);
+      const destination = path.join(root, request.destination_relative_path);
+      if (request.replace) {
+        await fs.rename(source, destination);
+      } else {
+        await fs.link(source, destination);
+        await fs.unlink(source);
+      }
       return;
     }
     case "unlink": {
@@ -160,6 +176,7 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
         || metadata.dev.toString() !== request.expected_device
         || metadata.ino.toString() !== request.expected_inode
         || metadata.size.toString() !== request.expected_size
+        || metadata.mtimeNs.toString() !== request.expected_modified_at_ns
       ) {
         throw new Error("Staged external file identity changed; replacement preserved.");
       }
@@ -191,6 +208,18 @@ async function execute(request: ProfileFsRequest): Promise<void> {
       signal: AbortSignal.timeout(30_000),
     }).catch(() => null);
     if (response?.ok) return;
+    if (
+      response?.status === 409
+      && request.operation === "rename"
+      && !request.replace
+    ) {
+      const payload = await response.json().catch(() => null) as { error?: unknown } | null;
+      if (payload?.error === "Profile destination already exists") {
+        const conflict = new Error("Profile destination already exists.") as NodeJS.ErrnoException;
+        conflict.code = "EEXIST";
+        throw conflict;
+      }
+    }
     if (response?.status !== 429 || attempt >= CAPACITY_RETRY_DELAYS_MS.length) {
       throw new ApiError({
         status: 503,
@@ -252,12 +281,14 @@ export async function nativeProfileRename(
   root: NativeProfileRoot,
   sourceRelativePath: string,
   destinationRelativePath: string,
+  options: { replace: boolean } = { replace: false },
 ): Promise<void> {
   await execute({
     operation: "rename",
     root,
     source_relative_path: validateRelativePath(sourceRelativePath),
     destination_relative_path: validateRelativePath(destinationRelativePath),
+    replace: options.replace,
   });
 }
 
@@ -276,7 +307,7 @@ export async function nativeProfileUnlink(
 
 export async function nativeUnlinkExternalIdentity(
   absolutePath: string,
-  expected: { device: string; inode: string; sizeBytes: string },
+  expected: { device: string; inode: string; sizeBytes: string; modifiedAtNs: string },
 ): Promise<void> {
   if (!path.isAbsolute(absolutePath)) throw new Error("External unlink path must be absolute.");
   await execute({
@@ -285,5 +316,6 @@ export async function nativeUnlinkExternalIdentity(
     expected_device: expected.device,
     expected_inode: expected.inode,
     expected_size: expected.sizeBytes,
+    expected_modified_at_ns: expected.modifiedAtNs,
   });
 }

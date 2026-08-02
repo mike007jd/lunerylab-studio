@@ -1,13 +1,15 @@
 use serde::Deserialize;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
-use crate::profile::profile_dirs;
+use crate::profile::ProfileDirs;
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ProfileFsRoot {
+    Config,
     Media,
     Models,
+    Runtime,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +29,7 @@ pub(crate) enum ProfileFsRequest {
         root: ProfileFsRoot,
         source_relative_path: String,
         destination_relative_path: String,
+        replace: bool,
     },
     Unlink {
         root: ProfileFsRoot,
@@ -38,15 +41,8 @@ pub(crate) enum ProfileFsRequest {
         expected_device: String,
         expected_inode: String,
         expected_size: String,
+        expected_modified_at_ns: String,
     },
-}
-
-fn root_path(root: ProfileFsRoot) -> Result<PathBuf, String> {
-    let profile = profile_dirs()?;
-    Ok(match root {
-        ProfileFsRoot::Media => profile.media,
-        ProfileFsRoot::Models => profile.models,
-    })
 }
 
 fn relative_components(value: &str) -> Result<Vec<String>, String> {
@@ -93,14 +89,68 @@ pub(crate) fn execute_profile_fs(request: ProfileFsRequest) -> Result<(), String
     }
 }
 
+pub(crate) fn initialize_profile_fs_roots(dirs: &ProfileDirs) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        unix::initialize_roots(dirs)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dirs;
+        Ok(())
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn refresh_profile_fs_roots(dirs: &ProfileDirs) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        unix::refresh_roots(dirs)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dirs;
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 mod unix {
-    use super::{relative_components, root_path, ProfileFsRequest, ProfileFsRoot};
+    use super::{relative_components, ProfileDirs, ProfileFsRequest, ProfileFsRoot};
     use std::ffi::{CStr, CString};
     use std::fs::File;
     use std::io::{self, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-    use std::path::Path;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path, PathBuf};
+    use std::sync::{OnceLock, RwLock};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct DirectoryIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedDirectory {
+        canonical_path: PathBuf,
+        identity: DirectoryIdentity,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProfileFsRoots {
+        profile: CapturedDirectory,
+        config: CapturedDirectory,
+        media: CapturedDirectory,
+        models: CapturedDirectory,
+        runtime: CapturedDirectory,
+    }
+
+    static PROFILE_FS_ROOTS: OnceLock<RwLock<Option<ProfileFsRoots>>> = OnceLock::new();
+
+    fn roots_slot() -> &'static RwLock<Option<ProfileFsRoots>> {
+        PROFILE_FS_ROOTS.get_or_init(|| RwLock::new(None))
+    }
 
     fn c_name(value: &str) -> Result<CString, String> {
         CString::new(value).map_err(|_| "Invalid profile-relative path".to_string())
@@ -110,10 +160,8 @@ mod unix {
         format!("{action}: {error}")
     }
 
-    fn open_root(root: ProfileFsRoot) -> Result<OwnedFd, String> {
-        let root = root_path(root)?;
-        let root = CString::new(root.as_os_str().as_encoded_bytes())
-            .map_err(|_| "Profile root contains a NUL byte".to_string())?;
+    fn open_filesystem_root() -> Result<OwnedFd, String> {
+        let root = CString::new("/").expect("filesystem root CString");
         let fd = unsafe {
             libc::open(
                 root.as_ptr(),
@@ -123,7 +171,7 @@ mod unix {
         if fd < 0 {
             return Err(errno(
                 io::Error::last_os_error(),
-                "Could not open profile root",
+                "Could not open filesystem root",
             ));
         }
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -141,6 +189,144 @@ mod unix {
             return Err(io::Error::last_os_error());
         }
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn descriptor_identity(descriptor: RawFd) -> Result<DirectoryIdentity, String> {
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(descriptor, &mut metadata) } < 0 {
+            return Err(errno(
+                io::Error::last_os_error(),
+                "Could not inspect profile directory",
+            ));
+        }
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err("Profile root must be a real directory".to_string());
+        }
+        Ok(DirectoryIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+        })
+    }
+
+    /// Walk a startup-canonicalized absolute path from the filesystem root.
+    /// Every component is descriptor-opened with O_NOFOLLOW, so a later
+    /// pathname swap can only fail or reach an identity that we reject.
+    fn open_absolute_directory(path: &Path) -> Result<OwnedFd, String> {
+        if !path.is_absolute() {
+            return Err("Profile root must be absolute".to_string());
+        }
+        let mut current = open_filesystem_root()?;
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    let name = CString::new(name.as_bytes())
+                        .map_err(|_| "Profile root contains a NUL byte".to_string())?;
+                    current = open_child_dir(current.as_raw_fd(), &name)
+                        .map_err(|error| errno(error, "Could not open profile root component"))?;
+                }
+                _ => return Err("Profile root is not a normalized absolute path".to_string()),
+            }
+        }
+        Ok(current)
+    }
+
+    fn capture_directory(path: &Path) -> Result<CapturedDirectory, String> {
+        let canonical_path = path.canonicalize().map_err(|error| {
+            errno(
+                error,
+                &format!("Could not resolve profile root {}", path.display()),
+            )
+        })?;
+        let descriptor = open_absolute_directory(&canonical_path)?;
+        let identity = descriptor_identity(descriptor.as_raw_fd())?;
+        Ok(CapturedDirectory {
+            canonical_path,
+            identity,
+        })
+    }
+
+    fn capture_roots(dirs: &ProfileDirs) -> Result<ProfileFsRoots, String> {
+        Ok(ProfileFsRoots {
+            profile: capture_directory(&dirs.root)?,
+            config: capture_directory(&dirs.config)?,
+            media: capture_directory(&dirs.media)?,
+            models: capture_directory(&dirs.models)?,
+            runtime: capture_directory(&dirs.runtime)?,
+        })
+    }
+
+    pub(super) fn initialize_roots(dirs: &ProfileDirs) -> Result<(), String> {
+        let roots = capture_roots(dirs)?;
+        let mut guard = roots_slot()
+            .write()
+            .map_err(|_| "Safe profile filesystem root lock is poisoned".to_string())?;
+        if guard.is_some() {
+            return Err("Safe profile filesystem roots were already initialized".to_string());
+        }
+        *guard = Some(roots);
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(super) fn refresh_roots(dirs: &ProfileDirs) -> Result<(), String> {
+        // Capture every new identity before publishing any of them. Reset
+        // revokes and drains the old bridge first, so this single write-lock
+        // swap is the authority handoff to the replacement media tree.
+        let roots = capture_roots(dirs)?;
+        let mut guard = roots_slot()
+            .write()
+            .map_err(|_| "Safe profile filesystem root lock is poisoned".to_string())?;
+        if guard.is_none() {
+            return Err("Safe profile filesystem roots are not initialized".to_string());
+        }
+        *guard = Some(roots);
+        Ok(())
+    }
+
+    fn open_captured_directory(directory: &CapturedDirectory) -> Result<OwnedFd, String> {
+        let descriptor = open_absolute_directory(&directory.canonical_path)?;
+        if descriptor_identity(descriptor.as_raw_fd())? != directory.identity {
+            return Err(format!(
+                "Profile root identity changed; refusing mutation under {}",
+                directory.canonical_path.display()
+            ));
+        }
+        Ok(descriptor)
+    }
+
+    fn open_root_with_roots(
+        root: ProfileFsRoot,
+        roots: &ProfileFsRoots,
+    ) -> Result<OwnedFd, String> {
+        // The resolved profile root is part of every mutation authority even
+        // when a specific resource is overridden outside it.
+        let profile = open_captured_directory(&roots.profile)?;
+        let selected = match root {
+            ProfileFsRoot::Config => &roots.config,
+            ProfileFsRoot::Media => &roots.media,
+            ProfileFsRoot::Models => &roots.models,
+            ProfileFsRoot::Runtime => &roots.runtime,
+        };
+        if selected.identity == roots.profile.identity {
+            return Ok(profile);
+        }
+        drop(profile);
+        open_captured_directory(selected)
+    }
+
+    fn open_root(root: ProfileFsRoot) -> Result<OwnedFd, String> {
+        #[cfg(not(test))]
+        let roots = roots_slot()
+            .read()
+            .map_err(|_| "Safe profile filesystem root lock is poisoned".to_string())?;
+        #[cfg(not(test))]
+        let roots = roots
+            .as_ref()
+            .ok_or_else(|| "Safe profile filesystem roots are not initialized".to_string())?;
+        #[cfg(test)]
+        let roots = &capture_roots(&crate::profile::profile_dirs()?)?;
+        open_root_with_roots(root, roots)
     }
 
     fn open_parent(
@@ -348,24 +534,35 @@ mod unix {
         root: ProfileFsRoot,
         source_relative_path: &str,
         destination_relative_path: &str,
+        replace: bool,
     ) -> Result<(), String> {
         let (source_parent, source) = open_parent(root, source_relative_path, false)?;
         let (destination_parent, destination) =
             open_parent(root, destination_relative_path, false)?;
         run_before_rename_test_hook();
         let result = unsafe {
-            rename_no_replace(
-                source_parent.as_raw_fd(),
-                &source,
-                destination_parent.as_raw_fd(),
-                &destination,
-            )
+            if replace {
+                libc::renameat(
+                    source_parent.as_raw_fd(),
+                    source.as_ptr(),
+                    destination_parent.as_raw_fd(),
+                    destination.as_ptr(),
+                )
+            } else {
+                rename_no_replace(
+                    source_parent.as_raw_fd(),
+                    &source,
+                    destination_parent.as_raw_fd(),
+                    &destination,
+                )
+            }
         };
         if result < 0 {
-            return Err(errno(
-                io::Error::last_os_error(),
-                "Could not rename profile file",
-            ));
+            let error = io::Error::last_os_error();
+            if !replace && error.raw_os_error() == Some(libc::EEXIST) {
+                return Err("Profile destination already exists".to_string());
+            }
+            return Err(errno(error, "Could not rename profile file"));
         }
         sync_directory(&source_parent)?;
         if source_parent.as_raw_fd() != destination_parent.as_raw_fd() {
@@ -391,6 +588,7 @@ mod unix {
         expected_device: &str,
         expected_inode: &str,
         expected_size: &str,
+        expected_modified_at_ns: &str,
     ) -> Result<(), String> {
         let absolute = Path::new(absolute_path);
         if !absolute.is_absolute() {
@@ -468,9 +666,15 @@ mod unix {
         let expected_size = expected_size
             .parse::<u64>()
             .map_err(|_| "Invalid expected external size".to_string())?;
+        let expected_modified_at_ns = expected_modified_at_ns
+            .parse::<i128>()
+            .map_err(|_| "Invalid expected external modification time".to_string())?;
+        let modified_at_ns =
+            i128::from(metadata.st_mtime) * 1_000_000_000 + i128::from(metadata.st_mtime_nsec);
         if metadata.st_dev as u64 != expected_device
             || metadata.st_ino as u64 != expected_inode
             || metadata.st_size as u64 != expected_size
+            || modified_at_ns != expected_modified_at_ns
             || metadata.st_mode & libc::S_IFMT != libc::S_IFREG
         {
             return Err(format!(
@@ -504,7 +708,13 @@ mod unix {
                 root,
                 source_relative_path,
                 destination_relative_path,
-            } => rename(root, &source_relative_path, &destination_relative_path),
+                replace,
+            } => rename(
+                root,
+                &source_relative_path,
+                &destination_relative_path,
+                replace,
+            ),
             ProfileFsRequest::Unlink {
                 root,
                 relative_path,
@@ -515,19 +725,26 @@ mod unix {
                 expected_device,
                 expected_inode,
                 expected_size,
+                expected_modified_at_ns,
             } => unlink_external_identity(
                 &absolute_path,
                 &expected_device,
                 &expected_inode,
                 &expected_size,
+                &expected_modified_at_ns,
             ),
         }
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{execute, ProfileFsRequest, ProfileFsRoot, BEFORE_RENAME_HOOK};
+        use super::{
+            capture_roots, execute, open_root_with_roots, ProfileFsRequest, ProfileFsRoot,
+            BEFORE_RENAME_HOOK,
+        };
+        use crate::profile::ProfileDirs;
         use std::fs;
+        use std::io::{Seek, SeekFrom, Write};
         use std::os::unix::fs::symlink;
         use std::os::unix::fs::MetadataExt;
         use std::path::PathBuf;
@@ -545,6 +762,92 @@ mod unix {
             path
         }
 
+        fn profile_dirs(root: PathBuf) -> ProfileDirs {
+            let data = root.join("data");
+            ProfileDirs {
+                root: root.clone(),
+                config: root.join("config"),
+                data: data.clone(),
+                pglite: data.join("pglite"),
+                media: data.join("media"),
+                models: root.join("models"),
+                logs: root.join("logs"),
+                runtime: root.join("runtime"),
+            }
+        }
+
+        fn create_profile(dirs: &ProfileDirs) {
+            for directory in [
+                &dirs.root,
+                &dirs.config,
+                &dirs.data,
+                &dirs.pglite,
+                &dirs.media,
+                &dirs.models,
+                &dirs.logs,
+                &dirs.runtime,
+            ] {
+                fs::create_dir_all(directory).expect("profile directory");
+            }
+        }
+
+        fn modified_at_ns(metadata: &fs::Metadata) -> String {
+            (i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()))
+                .to_string()
+        }
+
+        #[test]
+        fn captured_profile_root_rejects_an_intermediate_parent_replacement() {
+            let fixture = temp_root("parent-replacement");
+            let container = fixture.join("container");
+            let dirs = profile_dirs(container.join("profile"));
+            create_profile(&dirs);
+            let roots = capture_roots(&dirs).expect("capture startup roots");
+
+            fs::rename(&container, fixture.join("held")).expect("displace parent");
+            let replacement = profile_dirs(container.join("profile"));
+            create_profile(&replacement);
+
+            let error = open_root_with_roots(ProfileFsRoot::Models, &roots)
+                .expect_err("replaced intermediate parent must fail closed");
+            assert!(error.contains("identity changed"));
+            let _ = fs::remove_dir_all(fixture);
+        }
+
+        #[test]
+        fn captured_profile_root_rejects_an_intermediate_parent_symlink() {
+            let fixture = temp_root("parent-symlink");
+            let container = fixture.join("container");
+            let dirs = profile_dirs(container.join("profile"));
+            create_profile(&dirs);
+            let roots = capture_roots(&dirs).expect("capture startup roots");
+
+            let held = fixture.join("held");
+            fs::rename(&container, &held).expect("displace parent");
+            symlink(&held, &container).expect("install parent symlink");
+
+            assert!(open_root_with_roots(ProfileFsRoot::Models, &roots).is_err());
+            let _ = fs::remove_file(container);
+            let _ = fs::remove_dir_all(fixture);
+        }
+
+        #[test]
+        fn reset_requires_an_atomic_root_identity_recapture() {
+            let fixture = temp_root("reset-recapture");
+            let dirs = profile_dirs(fixture.join("profile"));
+            create_profile(&dirs);
+            let before_reset = capture_roots(&dirs).expect("capture startup roots");
+
+            fs::remove_dir_all(&dirs.data).expect("remove reset data");
+            fs::create_dir_all(&dirs.pglite).expect("recreate pglite");
+            fs::create_dir_all(&dirs.media).expect("recreate media");
+
+            assert!(open_root_with_roots(ProfileFsRoot::Media, &before_reset).is_err());
+            let after_reset = capture_roots(&dirs).expect("capture replacement roots");
+            assert!(open_root_with_roots(ProfileFsRoot::Media, &after_reset).is_ok());
+            let _ = fs::remove_dir_all(fixture);
+        }
+
         #[test]
         fn rename_uses_captured_directory_descriptors_across_final_seam_swap() {
             let profile = temp_root("seam");
@@ -552,6 +855,9 @@ mod unix {
             let inside = models.join("runtime");
             let outside = temp_root("outside");
             fs::create_dir_all(&inside).expect("inside");
+            fs::create_dir_all(profile.join("config")).expect("config");
+            fs::create_dir_all(profile.join("data/media")).expect("media");
+            fs::create_dir_all(profile.join("runtime")).expect("runtime");
             fs::write(inside.join("model.gguf"), b"inside").expect("model");
             std::env::set_var("LUNERY_HOME", &profile);
             std::env::set_var("LUNERY_MODELS_DIR", &models);
@@ -572,6 +878,7 @@ mod unix {
                 root: ProfileFsRoot::Models,
                 source_relative_path: "runtime/model.gguf".to_string(),
                 destination_relative_path: "runtime/model.gguf.staged".to_string(),
+                replace: false,
             })
             .expect("descriptor-relative rename");
 
@@ -598,6 +905,7 @@ mod unix {
                 expected_device: expected.dev().to_string(),
                 expected_inode: expected.ino().to_string(),
                 expected_size: expected.size().to_string(),
+                expected_modified_at_ns: modified_at_ns(&expected),
             });
 
             assert!(result.is_err());
@@ -605,6 +913,39 @@ mod unix {
                 fs::read(&staged).expect("preserved replacement"),
                 b"replacement"
             );
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn external_unlink_preserves_same_inode_same_size_modified_content() {
+            let root = temp_root("external-in-place-rewrite");
+            let staged = root.join(".model.gguf.lunery-delete-deadbeef-token");
+            fs::write(&staged, b"original").expect("original stage");
+            let expected = fs::metadata(&staged).expect("original metadata");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&staged)
+                .expect("open in-place replacement");
+            file.seek(SeekFrom::Start(0)).expect("rewind");
+            file.write_all(b"changed!").expect("same-size rewrite");
+            file.sync_all().expect("sync replacement");
+            drop(file);
+            let changed = fs::metadata(&staged).expect("changed metadata");
+            assert_eq!(expected.ino(), changed.ino());
+            assert_eq!(expected.size(), changed.size());
+            assert_ne!(modified_at_ns(&expected), modified_at_ns(&changed));
+
+            let result = execute(ProfileFsRequest::UnlinkExternalIdentity {
+                absolute_path: staged.display().to_string(),
+                expected_device: expected.dev().to_string(),
+                expected_inode: expected.ino().to_string(),
+                expected_size: expected.size().to_string(),
+                expected_modified_at_ns: modified_at_ns(&expected),
+            });
+
+            assert!(result.is_err());
+            assert_eq!(fs::read(&staged).expect("preserved rewrite"), b"changed!");
             let _ = fs::remove_dir_all(root);
         }
     }
