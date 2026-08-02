@@ -1,14 +1,10 @@
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { PGlite } from "@electric-sql/pglite";
 import { PGLiteSocketServer } from "@electric-sql/pglite-socket";
+import { openDesktopDatabase } from "./desktop-pglite-migrations.mjs";
 
 const appRoot = process.cwd();
-
-class IncompatibleDesktopDatabaseError extends Error {}
 
 function resolvePath(value, fallback) {
   if (!value?.trim()) return fallback;
@@ -25,121 +21,6 @@ function splitCommand(argv) {
     throw new Error("Missing command after --");
   }
   return command;
-}
-
-async function applyMigrations(db, migrationsDir) {
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS "_prisma_migrations" (
-      "id" TEXT PRIMARY KEY,
-      "checksum" TEXT NOT NULL,
-      "finished_at" TIMESTAMPTZ,
-      "migration_name" TEXT NOT NULL,
-      "logs" TEXT,
-      "rolled_back_at" TIMESTAMPTZ,
-      "started_at" TIMESTAMPTZ NOT NULL DEFAULT now(),
-      "applied_steps_count" INTEGER NOT NULL DEFAULT 0
-    );
-  `);
-
-  const entries = (await readdir(migrationsDir, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort();
-
-  for (const name of entries) {
-    const migrationSql = await readFile(path.join(migrationsDir, name, "migration.sql"), "utf8");
-    const checksum = createHash("sha256").update(migrationSql).digest("hex");
-
-    const existing = await db.query(
-      `SELECT "checksum", "finished_at", "logs", "rolled_back_at"
-         FROM "_prisma_migrations"
-        WHERE "migration_name" = $1
-        ORDER BY "started_at" DESC
-        LIMIT 1`,
-      [name],
-    );
-    if (existing.rows.length > 0) {
-      const row = existing.rows[0];
-      if (row.rolled_back_at) {
-        throw new IncompatibleDesktopDatabaseError(`Migration ${name} was rolled back.`);
-      }
-      if (!row.finished_at) {
-        throw new IncompatibleDesktopDatabaseError(
-          `Migration ${name} previously failed: ${row.logs || "no detail"}`,
-        );
-      }
-      if (row.checksum !== checksum) {
-        throw new IncompatibleDesktopDatabaseError(
-          `Migration ${name} no longer matches the current desktop baseline.`,
-        );
-      }
-      continue;
-    }
-
-    const migrationId = randomUUID();
-    await db.query(
-      `INSERT INTO "_prisma_migrations"
-        ("id", "checksum", "migration_name", "started_at", "applied_steps_count")
-       VALUES ($1, $2, $3, now(), 0)`,
-      [migrationId, checksum, name],
-    );
-    try {
-      await db.exec("BEGIN");
-      await db.exec(migrationSql);
-      await db.exec("COMMIT");
-      await db.query(
-        `UPDATE "_prisma_migrations"
-            SET "finished_at" = now(), "applied_steps_count" = 1
-          WHERE "id" = $1`,
-        [migrationId],
-      );
-    } catch (error) {
-      await db.exec("ROLLBACK").catch(() => undefined);
-      await db.query(
-        `UPDATE "_prisma_migrations"
-            SET "logs" = $2
-          WHERE "id" = $1`,
-        [migrationId, error instanceof Error ? error.message : String(error)],
-      );
-      throw error;
-    }
-  }
-}
-
-function recoveryStamp(now = new Date()) {
-  return now.toISOString().replaceAll(":", "-").replaceAll(".", "-");
-}
-
-async function archiveIncompatibleDatabase(dataRoot) {
-  const recoveryRoot = path.join(path.dirname(dataRoot), "recovery");
-  const recoveryPath = path.join(recoveryRoot, `pglite-${recoveryStamp()}`);
-  await mkdir(recoveryRoot, { recursive: true });
-  await rename(dataRoot, recoveryPath);
-  await mkdir(dataRoot, { recursive: true });
-  return recoveryPath;
-}
-
-async function openDesktopDatabase(dataRoot, migrationsDir) {
-  await mkdir(dataRoot, { recursive: true });
-  let db = new PGlite(dataRoot);
-  try {
-    await db.waitReady;
-    await applyMigrations(db, migrationsDir);
-    return db;
-  } catch (error) {
-    await db.close().catch(() => undefined);
-    if (!(error instanceof IncompatibleDesktopDatabaseError)) throw error;
-
-    const recoveryPath = await archiveIncompatibleDatabase(dataRoot);
-    console.warn(
-      `[desktop-runtime] Archived an incompatible prelaunch database at ${recoveryPath}. Starting from the current baseline.`,
-    );
-
-    db = new PGlite(dataRoot);
-    await db.waitReady;
-    await applyMigrations(db, migrationsDir);
-    return db;
-  }
 }
 
 // Crash recovery: this desktop runtime is single-process, so any GenerationJob

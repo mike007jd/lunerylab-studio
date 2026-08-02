@@ -143,7 +143,12 @@ export function SettingsPage({
   const pathname = usePathname();
   const t = useT();
   const reduced = useMotionReducedPreference();
-  const { imageModels, videoModels, loading: modelsLoading } = useModelCatalog();
+  const {
+    imageModels,
+    videoModels,
+    loading: modelsLoading,
+    error: modelsError,
+  } = useModelCatalog();
   const [bootstrap, setBootstrap] = useState(initialData);
   const [defaultImageModelDraft, setDefaultImageModelDraft] = useState<string | null>(null);
   const [defaultTextModelDraft, setDefaultTextModelDraft] = useState<string | null>(null);
@@ -301,6 +306,28 @@ export function SettingsPage({
     }
   }
 
+  async function handleClearDefault(capability: "text" | "image" | "video") {
+    setSaving(true);
+    setFeedback(null);
+    try {
+      await patchSettings(
+        capability === "text"
+          ? { defaultTextModel: "" }
+          : capability === "image"
+            ? { defaultImageModel: "" }
+            : { defaultVideoModel: "" },
+      );
+      if (capability === "text") setDefaultTextModelDraft(null);
+      else if (capability === "image") setDefaultImageModelDraft(null);
+      else setDefaultVideoModelDraft(null);
+      setFeedback({ tone: "success", text: t("settings.saved") });
+    } catch (error) {
+      setFeedback({ tone: "error", text: toErrorMessage(error, t("settings.saveError")) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
   const tabs = useMemo(
     () => TAB_ORDER.map((tab) => ({ ...tab, label: t(`settings.tabs.${tab.id}`) })),
     [t],
@@ -355,11 +382,14 @@ export function SettingsPage({
                   capability="text"
                   value={defaultTextModel}
                   options={textOptions}
+                  loading={false}
+                  catalogError={false}
                   saving={saving}
                   changed={defaultTextModel !== bootstrap.app.defaultTextModel}
                   feedback={feedback}
                   onChange={setDefaultTextModelDraft}
                   onSave={() => void handleSaveCapabilityDefault("text")}
+                  onClear={() => void handleClearDefault("text")}
                 />
                 <LocalModelsPanel capability="text" />
                 <DesktopRuntimeCard capability="text" />
@@ -383,8 +413,11 @@ export function SettingsPage({
                   feedback={feedback}
                   locale={selectedLocale}
                   models={imageModels}
+                  loading={modelsLoading}
+                  catalogError={modelsError}
                   onModelChange={setDefaultImageModelDraft}
                   onSave={() => void handleSaveModel()}
+                  onClear={() => void handleClearDefault("image")}
                   saving={saving}
                 />
                 <LocalModelsPanel capability="image" />
@@ -407,11 +440,14 @@ export function SettingsPage({
                   capability="video"
                   value={defaultVideoModel}
                   options={videoOptions}
+                  loading={modelsLoading}
+                  catalogError={modelsError}
                   saving={saving}
                   changed={defaultVideoModel !== bootstrap.app.defaultVideoModel}
                   feedback={feedback}
                   onChange={setDefaultVideoModelDraft}
                   onSave={() => void handleSaveCapabilityDefault("video")}
+                  onClear={() => void handleClearDefault("video")}
                 />
                 <DesktopRuntimeCard capability="video" />
               </div>

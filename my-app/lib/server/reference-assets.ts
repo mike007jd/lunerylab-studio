@@ -13,6 +13,7 @@ import {
   writeFilesOrCleanup,
   writeReferenceFile,
 } from "@/lib/server/storage";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export interface ImageReferenceAsset {
   id: string;
@@ -150,6 +151,7 @@ export async function persistUploadedImageReferenceFiles({
   files: PreparedImage[];
   userId: string;
 }): Promise<Array<{ mimeType: string; bytes: Buffer }>> {
+  return withSharedMutationLease(async () => {
   // All-or-nothing writes: if the 2nd of N reference files fails to write, the
   // already-written ones are deleted instead of orphaned on disk. Prepared
   // images reuse the already-read Buffer (no second arrayBuffer()).
@@ -187,4 +189,5 @@ export async function persistUploadedImageReferenceFiles({
     mimeType: file.mimeType,
     bytes: file.buffer,
   }));
+  });
 }

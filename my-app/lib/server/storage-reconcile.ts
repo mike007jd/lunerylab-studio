@@ -1,12 +1,12 @@
 import "server-only";
 
-import fs from "node:fs/promises";
 import { prisma } from "@/lib/server/prisma";
 import {
   deleteStoredFile,
+  getStoredFileMetadata,
   listStoredRelativePaths,
-  resolveStoragePath,
 } from "@/lib/server/storage";
+import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
 
 /**
  * Reconcile the asset database against the files on disk.
@@ -29,16 +29,18 @@ export interface StorageReconcileResult {
 
 async function fileExists(storagePath: string): Promise<boolean> {
   try {
-    await fs.access(resolveStoragePath(storagePath));
+    // Use the same canonical, final-component no-follow path as media reads.
+    // fs.access(resolveStoragePath(...)) would follow a raced symlink.
+    await getStoredFileMetadata(storagePath);
     return true;
   } catch {
     return false;
   }
 }
 
-export async function reconcileStorage(
+async function reconcileStorageSnapshot(
   userId: string,
-  options: { deleteOrphans?: boolean } = {},
+  options: { deleteOrphans?: boolean },
 ): Promise<StorageReconcileResult> {
   // Referenced paths span ALL asset rows (active + trashed) so a trashed asset's
   // file is never mistaken for an orphan. Missing-file detection is scoped to the
@@ -64,17 +66,35 @@ export async function reconcileStorage(
 
   let orphansDeleted = 0;
   if (options.deleteOrphans) {
-    await Promise.all(
-      orphanFiles.map(async (p) => {
-        try {
-          await deleteStoredFile(p);
-          orphansDeleted += 1;
-        } catch {
-          // Leave undeletable orphans for the next run.
-        }
-      }),
-    );
+    for (const orphanPath of orphanFiles) {
+      try {
+        // Re-check ownership under exclusive admission before unlink so a
+        // writer that committed between the snapshot and deletion cannot lose
+        // its file.
+        const owned = await prisma.asset.findFirst({
+          where: { storagePath: orphanPath },
+          select: { id: true },
+        });
+        if (owned) continue;
+        await deleteStoredFile(orphanPath);
+        orphansDeleted += 1;
+      } catch {
+        // Leave undeletable orphans for the next run.
+      }
+    }
   }
 
   return { supported: true, missingFiles, orphanFiles, orphansDeleted };
+}
+
+export async function reconcileStorage(
+  userId: string,
+  options: { deleteOrphans?: boolean } = {},
+): Promise<StorageReconcileResult> {
+  if (options.deleteOrphans) {
+    return withWorkspaceExclusive("destructive-reconcile", () =>
+      reconcileStorageSnapshot(userId, { deleteOrphans: true }),
+    );
+  }
+  return reconcileStorageSnapshot(userId, { deleteOrphans: false });
 }

@@ -4,24 +4,20 @@ vi.mock("server-only", () => ({}));
 
 const mocks = vi.hoisted(() => ({
   findMany: vi.fn(),
+  findFirst: vi.fn(),
   listStoredRelativePaths: vi.fn(),
-  resolveStoragePath: vi.fn((p: string) => `/root/${p}`),
+  getStoredFileMetadata: vi.fn(),
   deleteStoredFile: vi.fn(),
-  access: vi.fn(),
 }));
 
 vi.mock("@/lib/server/prisma", () => ({
-  prisma: { asset: { findMany: mocks.findMany } },
+  prisma: { asset: { findMany: mocks.findMany, findFirst: mocks.findFirst } },
 }));
 
 vi.mock("@/lib/server/storage", () => ({
   listStoredRelativePaths: mocks.listStoredRelativePaths,
-  resolveStoragePath: mocks.resolveStoragePath,
+  getStoredFileMetadata: mocks.getStoredFileMetadata,
   deleteStoredFile: mocks.deleteStoredFile,
-}));
-
-vi.mock("node:fs/promises", () => ({
-  default: { access: mocks.access },
 }));
 
 import { reconcileStorage } from "@/lib/server/storage-reconcile";
@@ -29,6 +25,7 @@ import { reconcileStorage } from "@/lib/server/storage-reconcile";
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.deleteStoredFile.mockResolvedValue(undefined);
+  mocks.findFirst.mockResolvedValue(null);
 });
 
 describe("reconcileStorage", () => {
@@ -50,8 +47,10 @@ describe("reconcileStorage", () => {
       "generated/orphan.png", // no owning row
     ]);
     // a1 exists, a2 does not
-    mocks.access.mockImplementation(async (p: string) =>
-      p === "/root/generated/a1.png" ? undefined : Promise.reject(new Error("ENOENT")),
+    mocks.getStoredFileMetadata.mockImplementation(async (storagePath: string) =>
+      storagePath === "generated/a1.png"
+        ? { byteSize: 1, mimeType: "image/png" }
+        : Promise.reject(new Error("ENOENT")),
     );
 
     const result = await reconcileStorage("user-1");
@@ -61,8 +60,8 @@ describe("reconcileStorage", () => {
     expect(result.orphanFiles).toEqual(["generated/orphan.png"]);
     expect(result.orphansDeleted).toBe(0);
     expect(mocks.deleteStoredFile).not.toHaveBeenCalled();
-    expect(mocks.resolveStoragePath).toHaveBeenCalledWith("generated/a1.png");
-    expect(mocks.resolveStoragePath).toHaveBeenCalledWith("generated/a2.png");
+    expect(mocks.getStoredFileMetadata).toHaveBeenCalledWith("generated/a1.png");
+    expect(mocks.getStoredFileMetadata).toHaveBeenCalledWith("generated/a2.png");
   });
 
   it("does not treat trashed-asset files as orphans", async () => {

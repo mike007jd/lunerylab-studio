@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ModelCapability, ModelFormat, ModelRuntimeTarget } from "@/lib/hf-model-catalog";
 import { ApiError } from "@/lib/server/errors";
 import { luneryModelsDir } from "@/lib/server/lunery-profile";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export type ImportedModelSource = "local-path" | "huggingface-url";
 export type ImportedModelStatus = "ready" | "queued";
@@ -551,6 +552,7 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
   }
   if (journalNames.length === 0) return;
 
+  return withImportedModelRegistryMutation(async () => {
   const records = (await readImportedModelsFrom(importedModelsRegistryPath())) ?? [];
   let registryChanged = false;
   const completed: string[] = [];
@@ -695,6 +697,40 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
 
   if (registryChanged) await writeImportedModels(records);
   await Promise.all(completed.map((journalPath) => fs.unlink(journalPath).catch(() => undefined)));
+  });
+}
+
+const REGISTRY_LOCK = "__luneryImportedModelRegistryLockV1" as const;
+const registryGlobal = globalThis as typeof globalThis & {
+  [REGISTRY_LOCK]?: Promise<void>;
+};
+
+async function withImportedModelRegistryLock<T>(work: () => Promise<T>): Promise<T> {
+  const previous = registryGlobal[REGISTRY_LOCK] ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  registryGlobal[REGISTRY_LOCK] = previous.then(() => current, () => current);
+  await previous.catch(() => undefined);
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+async function withImportedModelRegistryMutation<T>(work: () => Promise<T>): Promise<T> {
+  return withSharedMutationLease(() => withImportedModelRegistryLock(work));
+}
+
+function importedModelRegistryCorrupt(): ApiError {
+  return new ApiError({
+    status: 500,
+    code: "imported_model_registry_corrupt",
+    message: "The imported model registry is corrupted and cannot be read.",
+    retryable: false,
+  });
 }
 
 export async function readImportedModels(): Promise<ImportedModelRecord[]> {
@@ -706,11 +742,19 @@ export async function readImportedModels(): Promise<ImportedModelRecord[]> {
 async function readImportedModelsFrom(registryPath: string): Promise<ImportedModelRecord[] | null> {
   try {
     const raw = await fs.readFile(registryPath, "utf8");
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? parsed.filter(isImportedModelRecord) : [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      throw importedModelRegistryCorrupt();
+    }
+    if (!Array.isArray(parsed) || !parsed.every(isImportedModelRecord)) {
+      throw importedModelRegistryCorrupt();
+    }
+    return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    return [];
+    throw error;
   }
 }
 
@@ -720,28 +764,198 @@ export async function findImportedModel(id: string): Promise<ImportedModelRecord
 }
 
 export async function upsertImportedModel(record: ImportedModelRecord): Promise<ImportedModelRecord> {
-  const records = await readImportedModels();
-  const next = records.filter((item) => item.id !== record.id);
-  next.push(record);
-  next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  await writeImportedModels(next);
-  return record;
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const next = records.filter((item) => item.id !== record.id);
+    next.push(record);
+    next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(next);
+    return record;
+  });
 }
 
 export async function removeImportedModel(id: string): Promise<ImportedModelRecord | undefined> {
-  const records = await readImportedModels();
-  const removed = records.find((record) => record.id === id);
-  if (!removed) return undefined;
-  await writeImportedModels(records.filter((record) => record.id !== id));
-  return removed;
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const removed = records.find((record) => record.id === id);
+    if (!removed) return undefined;
+    await writeImportedModels(records.filter((record) => record.id !== id));
+    return removed;
+  });
 }
 
+export async function removeImportedModelIfUnchanged(
+  expected: ImportedModelRecord,
+): Promise<ImportedModelRecord> {
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const current = records.find((record) => record.id === expected.id);
+    if (!sameImportedModelRecord(current, expected)) {
+      throw new ApiError({
+        status: 409,
+        code: "model_import_in_progress",
+        message: "This model changed while deletion was being prepared. Try again.",
+        retryable: true,
+      });
+    }
+    await writeImportedModels(records.filter((record) => record.id !== expected.id));
+    return expected;
+  });
+}
+
+export interface QueuedImportedModelMutation {
+  record: ImportedModelRecord;
+  previous?: ImportedModelRecord;
+}
+
+/**
+ * Bridge start may have been accepted even though its HTTP response was lost.
+ * This marker tells the registry reservation to retain queued ownership; only
+ * a definitive rejection is safe to compensate.
+ */
+export class QueuedImportedModelStartUncertainError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "QueuedImportedModelStartUncertainError";
+  }
+}
+
+function sameImportedModelRecord(
+  left: ImportedModelRecord | undefined,
+  right: ImportedModelRecord | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/**
+ * Keep the registry mutex and workspace shared lease from the queued write
+ * through bridge start acknowledgement. This prevents same-id imports or
+ * deletes from creating an unowned native download between those phases.
+ */
+export async function withQueuedImportedModelReservation<T>({
+  record,
+  expectedPrevious,
+  start,
+}: {
+  record: ImportedModelRecord;
+  expectedPrevious?: ImportedModelRecord;
+  start: () => Promise<T>;
+}): Promise<{ record: ImportedModelRecord; result: T }> {
+  if (record.source !== "huggingface-url" || record.status !== "queued" || !record.jobId) {
+    throw new Error("Only a queued Hugging Face import can reserve bridge start.");
+  }
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const current = records.find((item) => item.id === record.id);
+    if (!sameImportedModelRecord(current, expectedPrevious)) {
+      throw new ApiError({
+        status: 409,
+        code: "model_import_in_progress",
+        message: "This model import changed while another download was starting. Try again.",
+        retryable: true,
+      });
+    }
+
+    const queuedRecords = records.filter((item) => item.id !== record.id);
+    queuedRecords.push(record);
+    queuedRecords.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(queuedRecords);
+
+    try {
+      return { record, result: await start() };
+    } catch (startError) {
+      if (startError instanceof QueuedImportedModelStartUncertainError) {
+        throw startError;
+      }
+      const restored = records.filter((item) => item.id !== record.id);
+      if (expectedPrevious) restored.push(expectedPrevious);
+      restored.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      try {
+        await writeImportedModels(restored);
+      } catch (compensationError) {
+        console.error("[model-import] queued registry compensation failed", {
+          compensationError,
+          jobId: record.jobId,
+          modelId: record.id,
+          startError,
+        });
+        throw new ApiError({
+          status: 500,
+          code: "imported_model_registry_compensation_failed",
+          message: "Bridge start failed and the queued model registry state could not be rolled back.",
+          retryable: false,
+        });
+      }
+      throw startError;
+    }
+  });
+}
+
+export async function queueImportedModel(
+  record: ImportedModelRecord,
+): Promise<QueuedImportedModelMutation> {
+  if (record.source !== "huggingface-url" || record.status !== "queued" || !record.jobId) {
+    throw new Error("Only a queued Hugging Face import can be registered before bridge start.");
+  }
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const previous = records.find((item) => item.id === record.id);
+    const next = records.filter((item) => item.id !== record.id);
+    next.push(record);
+    next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(next);
+    return { record, ...(previous ? { previous } : {}) };
+  });
+}
+
+/**
+ * Compensate a bridge launch failure without deleting a prior import or a
+ * newer concurrent queue. Returns false when this failed job no longer owns
+ * the registry slot, in which case the newer state is intentionally kept.
+ */
+export async function restoreImportedModelAfterFailedQueue(
+  mutation: QueuedImportedModelMutation,
+): Promise<boolean> {
+  return withImportedModelRegistryMutation(async () => {
+    const records = await readImportedModels();
+    const current = records.find((item) => item.id === mutation.record.id);
+    if (current?.jobId !== mutation.record.jobId || current?.status !== "queued") {
+      return false;
+    }
+    const next = records.filter((item) => item.id !== mutation.record.id);
+    if (mutation.previous) next.push(mutation.previous);
+    next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    await writeImportedModels(next);
+    return true;
+  });
+}
+
+/** Test-only hook to inject write failures after the lock is held. */
+export const __importedModelRegistryTestHooks = {
+  beforeWrite: null as null | (() => Promise<void> | void),
+};
+
 async function writeImportedModels(records: ImportedModelRecord[]): Promise<void> {
+  if (__importedModelRegistryTestHooks.beforeWrite) {
+    await __importedModelRegistryTestHooks.beforeWrite();
+  }
   const registryPath = importedModelsRegistryPath();
   await fs.mkdir(path.dirname(registryPath), { recursive: true });
   const tmpPath = `${registryPath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(tmpPath, JSON.stringify(records, null, 2), "utf8");
-  await fs.rename(tmpPath, registryPath);
+  try {
+    const handle = await fs.open(tmpPath, "wx");
+    try {
+      await handle.writeFile(JSON.stringify(records, null, 2), "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(tmpPath, registryPath);
+    await syncDirectory(path.dirname(registryPath));
+  } finally {
+    await fs.unlink(tmpPath).catch(() => undefined);
+  }
 }
 
 export async function resolveLocalModelPath(input: string): Promise<{

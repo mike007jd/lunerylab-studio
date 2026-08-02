@@ -16,6 +16,7 @@ import { prisma } from "@/lib/server/prisma";
 import { withAssetWriteTransaction } from "@/lib/server/file-validation";
 import { deleteStoredFile, writeGeneratedImage } from "@/lib/server/storage";
 import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export interface ReplacementSourceLayer {
   id: string;
@@ -31,6 +32,7 @@ export async function saveResultAsReplacementLayer(
   finalBytes: Buffer,
   jobId: string,
 ): Promise<{ assetId: string; layerId: string }> {
+  return withSharedMutationLease(async () => {
   const stored = await writeGeneratedImage({
     bytes: finalBytes,
     projectId: ctx.projectId ?? undefined,
@@ -91,4 +93,5 @@ export async function saveResultAsReplacementLayer(
     throw error;
   }
   return { assetId: createdAsset.id, layerId: createdLayer.id };
+  });
 }

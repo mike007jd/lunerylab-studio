@@ -13,6 +13,7 @@ import {
   type ByokModelRole,
 } from "@/lib/byok-providers";
 import { luneryConfigDir } from "@/lib/server/lunery-profile";
+import { withSharedMutationLeaseSync } from "@/lib/server/workspace-operation-gate";
 
 export interface ByokConnectionMeta {
   endpoint: string;
@@ -92,21 +93,23 @@ export function getByokConnectionMeta(providerId: string): ByokConnectionMeta | 
 }
 
 export function setByokConnectionMeta(providerId: string, meta: ByokConnectionMeta): void {
-  const provider = findByokProvider(providerId);
-  if (!provider) return;
-  // Canonicalize on write: keep only known/non-blank slots. Never persist
-  // unknown model fields.
-  const models = resolveByokConnectionModels(meta);
-  const nextMeta: ByokConnectionMeta = {
-    endpoint: provider.requiresEndpoint ? meta.endpoint : provider.defaultEndpoint,
-    ...(models ? { models } : {}),
-    updatedAt: meta.updatedAt,
-  };
-  // Always merge against the latest disk state. Next app routes are compiled as
-  // independent bundles, so a module-level Map can remain stale forever after a
-  // sibling route writes the profile file.
-  const next = loadConnectionStore().set(providerId, nextMeta);
-  writeConnectionStore(next);
+  withSharedMutationLeaseSync(() => {
+    const provider = findByokProvider(providerId);
+    if (!provider) return;
+    // Canonicalize on write: keep only known/non-blank slots. Never persist
+    // unknown model fields.
+    const models = resolveByokConnectionModels(meta);
+    const nextMeta: ByokConnectionMeta = {
+      endpoint: provider.requiresEndpoint ? meta.endpoint : provider.defaultEndpoint,
+      ...(models ? { models } : {}),
+      updatedAt: meta.updatedAt,
+    };
+    // Always merge against the latest disk state. Next app routes are compiled as
+    // independent bundles, so a module-level Map can remain stale forever after a
+    // sibling route writes the profile file.
+    const next = loadConnectionStore().set(providerId, nextMeta);
+    writeConnectionStore(next);
+  });
 }
 
 /** Read the model id a provider has configured for a specific capability. */
@@ -118,10 +121,12 @@ export function getByokConnectionModelId(
 }
 
 export function deleteByokConnectionMeta(providerId: string): void {
-  const next = loadConnectionStore();
-  if (!next.has(providerId)) return;
-  next.delete(providerId);
-  writeConnectionStore(next);
+  withSharedMutationLeaseSync(() => {
+    const next = loadConnectionStore();
+    if (!next.has(providerId)) return;
+    next.delete(providerId);
+    writeConnectionStore(next);
+  });
 }
 
 export function listByokConnectionMeta(): Record<string, ByokConnectionMeta> {

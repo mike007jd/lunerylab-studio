@@ -8,6 +8,7 @@ import {
 } from "@/lib/server/storage";
 import { normalizeLocale } from "@/lib/i18n/locale";
 import { getPlainT } from "@/lib/i18n/plain";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 import {
   SAMPLE_PROJECTS,
   SAMPLE_SOURCE_MIME_TYPE,
@@ -94,6 +95,7 @@ export async function restoreBundledSampleAssetStorage(
 }
 
 async function seedOneSample(userId: string, def: SampleProjectDef, t: SampleTranslator) {
+  return withSharedMutationLease(async () => {
   const projectName = t(`samples.${def.id}.projectName`);
   const jobPrompt = t(`samples.${def.id}.jobPrompt`);
   const sessionTitle = t(`samples.${def.id}.sessionTitle`);
@@ -194,6 +196,7 @@ async function seedOneSample(userId: string, def: SampleProjectDef, t: SampleTra
     );
     throw error;
   }
+  });
 }
 
 /**

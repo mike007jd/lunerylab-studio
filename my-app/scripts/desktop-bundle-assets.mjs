@@ -257,12 +257,16 @@ async function copySharpRuntime(nodeModulesDir) {
 async function copyDesktopDatabaseRuntime(nodeModulesDir) {
   const prismaMigrationsSource = path.join(root, "prisma", "migrations");
   const runtimeServerSource = path.join(root, "scripts", "desktop-runtime-server.mjs");
+  const migrationRuntimeSource = path.join(root, "scripts", "desktop-pglite-migrations.mjs");
 
   if (!(await exists(prismaMigrationsSource))) {
     throw new Error("[desktop:prepare] prisma migrations are missing");
   }
   if (!(await exists(runtimeServerSource))) {
     throw new Error("[desktop:prepare] desktop runtime wrapper is missing");
+  }
+  if (!(await exists(migrationRuntimeSource))) {
+    throw new Error("[desktop:prepare] desktop migration runtime is missing");
   }
 
   await mkdir(path.join(appOut, "prisma"), { recursive: true });
@@ -272,6 +276,7 @@ async function copyDesktopDatabaseRuntime(nodeModulesDir) {
     dereference: true,
   });
   await cp(runtimeServerSource, path.join(appOut, "desktop-runtime-server.mjs"));
+  await cp(migrationRuntimeSource, path.join(appOut, "desktop-pglite-migrations.mjs"));
 
   await copyNodePackage(nodeModulesDir, "@electric-sql/pglite");
   await copyNodePackage(nodeModulesDir, "@electric-sql/pglite-socket");

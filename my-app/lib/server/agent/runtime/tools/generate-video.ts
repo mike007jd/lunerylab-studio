@@ -19,6 +19,7 @@ import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
 import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
 import {
   beginDetachedVideoWork,
+  runWithDetachedVideoAdmission,
   type DetachedVideoAdmission,
 } from "@/lib/server/workspace-operation-gate";
 
@@ -85,19 +86,22 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
 
         // Acquire admission before any generation-job mutation.
         videoAdmission = beginDetachedVideoWork();
+        const submissionAdmission = videoAdmission;
 
-        const job = await createGenerationJob({
-          userId: ctx.userId,
-          projectId: ctx.projectId,
-          source: "STUDIO",
-          prompt,
-          referenceCount: referenceBuffer ? 1 : 0,
-          requestedCount: 1,
-          provider: "pending",
-          model: model.providerModelId,
-          type: "video",
-          videoDuration: duration,
-        });
+        const job = await runWithDetachedVideoAdmission(submissionAdmission, () =>
+          createGenerationJob({
+            userId: ctx.userId,
+            projectId: ctx.projectId,
+            source: "STUDIO",
+            prompt,
+            referenceCount: referenceBuffer ? 1 : 0,
+            requestedCount: 1,
+            provider: "pending",
+            model: model.providerModelId,
+            type: "video",
+            videoDuration: duration,
+          }),
+        );
         jobId = job.id;
 
         const admission = videoAdmission;
@@ -143,12 +147,23 @@ export function buildGenerateVideoTool(ctx: AgentToolContext): Tool {
           note: "Video runs async. The user can keep working; result lands in Library when done.",
         };
       } catch (error) {
-        videoAdmission?.release();
-        videoAdmission = null;
-        // If a job was already created before the failure, mark it FAILED so it
-        // never lingers as a permanently RUNNING job.
-        if (jobId) {
-          await failRunningGenerationJob({ jobId, error, fallbackCode: "video_submit_failed" });
+        const heldAdmission = videoAdmission;
+        try {
+          // If a job was already created before the failure, mark it FAILED so
+          // it never lingers as a permanently RUNNING job. Keep the admission
+          // authority until this terminal mutation has settled.
+          if (jobId) {
+            const fail = () =>
+              failRunningGenerationJob({ jobId: jobId!, error, fallbackCode: "video_submit_failed" });
+            if (heldAdmission) {
+              await runWithDetachedVideoAdmission(heldAdmission, fail);
+            } else {
+              await fail();
+            }
+          }
+        } finally {
+          heldAdmission?.release();
+          videoAdmission = null;
         }
         const message = error instanceof Error ? error.message : String(error);
         ctx.recordStep({

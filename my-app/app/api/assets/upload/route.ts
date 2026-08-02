@@ -11,8 +11,10 @@ import { toAssetDTO } from "@/lib/server/dto";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 import { resolveOwnedProjectId } from "@/lib/server/project-ownership";
 import { parseFormData } from "@/lib/server/http-validation";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export async function POST(request: NextRequest) {
+  return withSharedMutationLease(async () => {
   try {
     const user = await requireLocalWorkspaceOwner();
 
@@ -43,49 +45,54 @@ export async function POST(request: NextRequest) {
         retryable: false,
       });
     }
-    const stored = await writeReferenceFile(prepared);
 
-    const asset = await withAssetWriteTransaction(async (tx) => {
-      // Every asset is attached to a generation job by schema contract.
-      // For direct uploads, we persist a local IMPORT job record.
-      // so uploaded references remain fully traceable in production audit logs.
-      const importJob = await tx.generationJob.create({
-        data: {
-          userId: user.id,
-          projectId: projectId || undefined,
-          source: "TOOL",
-          toolType: "IMPORT",
-          prompt: "",
-          referenceCount: 1,
-          requestedCount: 1,
-          successCount: 1,
-          status: "SUCCEEDED",
-          provider: "local",
-          model: "upload",
-          completedAt: new Date(),
-        },
-      });
+    // One shared lease covers file write + Asset commit so destructive
+    // reconcile/restore cannot delete an in-flight upload.
+    const asset = await withSharedMutationLease(async () => {
+      const stored = await writeReferenceFile(prepared);
+      return withAssetWriteTransaction(async (tx) => {
+        // Every asset is attached to a generation job by schema contract.
+        // For direct uploads, we persist a local IMPORT job record.
+        // so uploaded references remain fully traceable in production audit logs.
+        const importJob = await tx.generationJob.create({
+          data: {
+            userId: user.id,
+            projectId: projectId || undefined,
+            source: "TOOL",
+            toolType: "IMPORT",
+            prompt: "",
+            referenceCount: 1,
+            requestedCount: 1,
+            successCount: 1,
+            status: "SUCCEEDED",
+            provider: "local",
+            model: "upload",
+            completedAt: new Date(),
+          },
+        });
 
-      return tx.asset.create({
-        data: {
-          userId: user.id,
-          projectId: projectId || undefined,
-          jobId: importJob.id,
-          kind: "REFERENCE",
-          storagePath: stored.storagePath,
-          mimeType: stored.mimeType,
-          byteSize: stored.byteSize,
-          width: stored.width,
-          height: stored.height,
-        },
+        return tx.asset.create({
+          data: {
+            userId: user.id,
+            projectId: projectId || undefined,
+            jobId: importJob.id,
+            kind: "REFERENCE",
+            storagePath: stored.storagePath,
+            mimeType: stored.mimeType,
+            byteSize: stored.byteSize,
+            width: stored.width,
+            height: stored.height,
+          },
+        });
+      }).catch(async (error) => {
+        await deleteStoredFile(stored.storagePath);
+        throw error;
       });
-    }).catch(async (error) => {
-      await deleteStoredFile(stored.storagePath);
-      throw error;
     });
 
     return NextResponse.json({ asset: toAssetDTO(asset) });
   } catch (error) {
     return jsonError(error);
   }
+  });
 }

@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImportedModelRecord } from "@/lib/server/imported-model-registry";
 
+vi.mock("server-only", () => ({}));
+
 let tmpDir: string;
 let homeDir: string;
 let modelsDir: string;
@@ -363,5 +365,253 @@ describe("imported-model-registry profile paths", () => {
     expect(fs.readFileSync(modelPath, "utf8")).toBe("replacement-model");
     expect(fs.readFileSync(displacedPath, "utf8")).toBe("original-model");
     await expect(registry.findImportedModel(imported.id)).resolves.toBeUndefined();
+  });
+
+  it("fails closed on malformed registry JSON instead of treating it as empty", async () => {
+    const registryPath = path.join(modelsDir, "imported-models.json");
+    fs.mkdirSync(modelsDir, { recursive: true });
+    fs.writeFileSync(registryPath, "{not-json", "utf8");
+    const registry = await import("@/lib/server/imported-model-registry");
+
+    await expect(registry.readImportedModels()).rejects.toMatchObject({
+      code: "imported_model_registry_corrupt",
+    });
+    expect(fs.readFileSync(registryPath, "utf8")).toBe("{not-json");
+  });
+
+  it("fails closed when any array record is invalid", async () => {
+    const registryPath = path.join(modelsDir, "imported-models.json");
+    fs.mkdirSync(modelsDir, { recursive: true });
+    fs.writeFileSync(registryPath, JSON.stringify([record(), { id: "truncated" }]), "utf8");
+    const registry = await import("@/lib/server/imported-model-registry");
+
+    await expect(registry.readImportedModels()).rejects.toMatchObject({
+      code: "imported_model_registry_corrupt",
+    });
+    expect(JSON.parse(fs.readFileSync(registryPath, "utf8"))).toHaveLength(2);
+  });
+
+  it("serializes concurrent upserts so no accepted record is lost", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const first = record({ id: "imported-llama-cpp-a-11111111", fileName: "a.gguf" });
+    const second = record({
+      id: "imported-llama-cpp-b-22222222",
+      fileName: "b.gguf",
+      modelPath: path.join(modelsDir, "llama-cpp", "b.gguf"),
+      createdAt: "2026-07-01T00:00:01.000Z",
+    });
+
+    await Promise.all([
+      registry.upsertImportedModel(first),
+      registry.upsertImportedModel(second),
+    ]);
+
+    const records = await registry.readImportedModels();
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: first.id }),
+        expect.objectContaining({ id: second.id }),
+      ]),
+    );
+    expect(records).toHaveLength(2);
+  });
+
+  it("surfaces injected write failures without publishing a partial registry", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    await registry.upsertImportedModel(record());
+    registry.__importedModelRegistryTestHooks.beforeWrite = () => {
+      throw new Error("injected registry write failure");
+    };
+
+    await expect(
+      registry.upsertImportedModel(record({
+        id: "imported-llama-cpp-fail-99999999",
+        fileName: "fail.gguf",
+      })),
+    ).rejects.toThrow("injected registry write failure");
+
+    registry.__importedModelRegistryTestHooks.beforeWrite = null;
+    await expect(registry.readImportedModels()).resolves.toEqual([
+      expect.objectContaining({ id: record().id }),
+    ]);
+  });
+
+  it("restores the prior record after a failed queued bridge start", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const previous = record({ status: "ready", jobId: undefined });
+    await registry.upsertImportedModel(previous);
+    const queued = record({
+      status: "queued",
+      jobId: "job-new",
+      createdAt: "2026-07-01T00:01:00.000Z",
+    });
+
+    const mutation = await registry.queueImportedModel(queued);
+    expect(mutation.previous).toEqual(previous);
+    await expect(registry.restoreImportedModelAfterFailedQueue(mutation)).resolves.toBe(true);
+    await expect(registry.findImportedModel(previous.id)).resolves.toEqual(previous);
+  });
+
+  it("retains queued ownership when bridge start may have succeeded before transport failure", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const queued = record({
+      status: "queued",
+      jobId: "job-response-lost",
+      createdAt: "2026-08-03T00:00:00.000Z",
+    });
+
+    await expect(
+      registry.withQueuedImportedModelReservation({
+        record: queued,
+        start: async () => {
+          throw new registry.QueuedImportedModelStartUncertainError("response lost");
+        },
+      }),
+    ).rejects.toBeInstanceOf(registry.QueuedImportedModelStartUncertainError);
+
+    await expect(registry.findImportedModel(queued.id)).resolves.toEqual(queued);
+  });
+
+  it("does not roll back a newer queued owner during compensation", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const failed = await registry.queueImportedModel(record({
+      status: "queued",
+      jobId: "job-failed",
+    }));
+    const newer = record({
+      status: "queued",
+      jobId: "job-newer",
+      createdAt: "2026-07-01T00:02:00.000Z",
+    });
+    await registry.queueImportedModel(newer);
+
+    await expect(registry.restoreImportedModelAfterFailedQueue(failed)).resolves.toBe(false);
+    await expect(registry.findImportedModel(newer.id)).resolves.toEqual(newer);
+  });
+
+  it("holds workspace shared admission across the registry write", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const gate = await import("@/lib/server/workspace-operation-gate");
+    gate.resetWorkspaceOperationGateForTests();
+    let allowWrite!: () => void;
+    let writeStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      writeStarted = resolve;
+    });
+    registry.__importedModelRegistryTestHooks.beforeWrite = async () => {
+      writeStarted();
+      await new Promise<void>((resolve) => {
+        allowWrite = resolve;
+      });
+    };
+    const mutation = registry.upsertImportedModel(record());
+    await started;
+
+    let exclusiveEntered = false;
+    const exclusive = gate.withWorkspaceExclusive("restore", async () => {
+      exclusiveEntered = true;
+    });
+    await vi.waitFor(() => {
+      expect(gate.getWorkspaceOperationGateStateForTests().exclusivePending).toBe(true);
+    });
+    expect(exclusiveEntered).toBe(false);
+
+    allowWrite();
+    await mutation;
+    await exclusive;
+    expect(exclusiveEntered).toBe(true);
+    registry.__importedModelRegistryTestHooks.beforeWrite = null;
+  });
+
+  it("removes a temporary registry file when publication fails", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    await registry.upsertImportedModel(record());
+    vi.spyOn(fs.promises, "rename").mockRejectedValueOnce(
+      Object.assign(new Error("publish failed"), { code: "EIO" }),
+    );
+
+    await expect(registry.upsertImportedModel(record({
+      id: "imported-llama-cpp-temp-10101010",
+      fileName: "temp.gguf",
+    }))).rejects.toThrow("publish failed");
+
+    expect(fs.readdirSync(modelsDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    vi.restoreAllMocks();
+    await expect(registry.readImportedModels()).resolves.toEqual([
+      expect.objectContaining({ id: record().id }),
+    ]);
+  });
+
+  it("starts only one bridge reservation for concurrent same-id imports", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const first = record({ status: "queued", jobId: "job-first" });
+    const second = record({ status: "queued", jobId: "job-second" });
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    let bridgeStarts = 0;
+    const firstReservation = registry.withQueuedImportedModelReservation({
+      record: first,
+      start: async () => {
+        bridgeStarts += 1;
+        firstStarted();
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        return "started";
+      },
+    });
+    await started;
+    const secondReservation = registry.withQueuedImportedModelReservation({
+      record: second,
+      start: async () => {
+        bridgeStarts += 1;
+        return "must-not-start";
+      },
+    });
+
+    releaseFirst();
+    await expect(firstReservation).resolves.toMatchObject({ result: "started" });
+    await expect(secondReservation).rejects.toMatchObject({
+      status: 409,
+      code: "model_import_in_progress",
+    });
+    expect(bridgeStarts).toBe(1);
+    await expect(registry.findImportedModel(first.id)).resolves.toEqual(first);
+  });
+
+  it("prevents delete prepared from an old record from removing a newly started job", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const previous = record({ status: "ready", jobId: undefined });
+    await registry.upsertImportedModel(previous);
+    const queued = record({ status: "queued", jobId: "job-new" });
+    let releaseStart!: () => void;
+    let bridgeStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      bridgeStarted = resolve;
+    });
+    const reservation = registry.withQueuedImportedModelReservation({
+      record: queued,
+      expectedPrevious: previous,
+      start: async () => {
+        bridgeStarted();
+        await new Promise<void>((resolve) => {
+          releaseStart = resolve;
+        });
+        return "started";
+      },
+    });
+    await started;
+    const deletion = registry.removeImportedModelIfUnchanged(previous);
+
+    releaseStart();
+    await reservation;
+    await expect(deletion).rejects.toMatchObject({
+      status: 409,
+      code: "model_import_in_progress",
+    });
+    await expect(registry.findImportedModel(queued.id)).resolves.toEqual(queued);
   });
 });

@@ -118,10 +118,16 @@ describe("desktop installer packaging", () => {
 
   it("recovers an incompatible prelaunch database without blocking the window", () => {
     const runtime = source("scripts/desktop-runtime-server.mjs");
+    const migrations = source("scripts/desktop-pglite-migrations.mjs");
 
-    expect(runtime).toContain("class IncompatibleDesktopDatabaseError extends Error");
-    expect(runtime).toContain("archiveIncompatibleDatabase(dataRoot)");
-    expect(runtime).toContain('path.join(path.dirname(dataRoot), "recovery")');
+    expect(migrations).toContain("class IncompatibleDesktopDatabaseError extends Error");
+    expect(migrations).toContain("archiveIncompatibleDatabase(dataRoot)");
+    expect(migrations).toContain('path.join(path.dirname(dataRoot), "recovery")');
+    expect(migrations).toContain("await db.transaction(async (tx) =>");
+    expect(runtime).toContain('from "./desktop-pglite-migrations.mjs"');
+    const bundleAssets = source("scripts/desktop-bundle-assets.mjs");
+    expect(bundleAssets).toContain('path.join(root, "scripts", "desktop-pglite-migrations.mjs")');
+    expect(bundleAssets).toContain('path.join(appOut, "desktop-pglite-migrations.mjs")');
     expect(runtime).toContain("const db = await openDesktopDatabase(dataRoot, migrationsDir)");
     expect(runtime).toContain('process.env.LUNERY_PARENT_PID || "0"');
     expect(runtime).not.toContain("idleTimeout:");

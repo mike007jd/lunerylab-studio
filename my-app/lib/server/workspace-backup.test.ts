@@ -436,33 +436,45 @@ describe("restoreWorkspaceBackup", () => {
 });
 
 describe("workspace operation gate", () => {
-  it("rejects backup while a detached video job holds admission", async () => {
+  it("drains detached video admission before backup starts", async () => {
     const admission = beginDetachedVideoWork();
-    await expect(exportWorkspaceBackup("2026-07-15T00:00:00.000Z")).rejects.toMatchObject({
-      status: 409,
-      code: "workspace_busy",
+    let backupStarted = false;
+    const backupPromise = exportWorkspaceBackup("2026-07-15T00:00:00.000Z").then((result) => {
+      backupStarted = true;
+      return result;
     });
+    await Promise.resolve();
+    expect(backupStarted).toBe(false);
     expect(mocks.transaction).not.toHaveBeenCalled();
     admission.release();
+    await expect(backupPromise).resolves.toBeTruthy();
+    expect(mocks.transaction).toHaveBeenCalled();
   });
 
-  it("rejects restore while a detached video job holds admission", async () => {
+  it("drains detached video admission before restore starts", async () => {
     const admission = beginDetachedVideoWork();
-    await expect(restoreWorkspaceBackup(goodBackup(), { confirm: true })).rejects.toMatchObject({
-      status: 409,
-      code: "workspace_busy",
+    let restoreStarted = false;
+    const restorePromise = restoreWorkspaceBackup(goodBackup(), { confirm: true }).then((result) => {
+      restoreStarted = true;
+      return result;
     });
+    await Promise.resolve();
+    expect(restoreStarted).toBe(false);
     expect(mocks.transaction).not.toHaveBeenCalled();
     admission.release();
+    await expect(restorePromise).resolves.toBeTruthy();
+    expect(mocks.transaction).toHaveBeenCalled();
   });
 
   it("rejects new video admission while backup owns exclusivity", async () => {
-    const release = acquireWorkspaceExclusive("backup");
+    const { release } = await acquireWorkspaceExclusive("backup");
     expect(() => beginDetachedVideoWork()).toThrow(
       expect.objectContaining({ status: 409, code: "workspace_busy" }),
     );
     expect(getWorkspaceOperationGateStateForTests()).toEqual({
       exclusive: "backup",
+      exclusivePending: true,
+      sharedCount: 0,
       activeVideoCount: 0,
     });
     release();
@@ -473,6 +485,8 @@ describe("workspace operation gate", () => {
     await expect(exportWorkspaceBackup("2026-07-15T00:00:00.000Z")).rejects.toThrow("export failed");
     expect(getWorkspaceOperationGateStateForTests()).toEqual({
       exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
       activeVideoCount: 0,
     });
     await expect(exportWorkspaceBackup("2026-07-15T00:00:00.000Z")).resolves.toBeTruthy();

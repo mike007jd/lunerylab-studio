@@ -18,7 +18,7 @@ import {
   finishImportedExternalModelRollback,
   commitImportedExternalModelFile,
   modelCachePath,
-  removeImportedModel,
+  removeImportedModelIfUnchanged,
   rollbackImportedExternalModelFile,
   stageImportedExternalModelFile,
   upsertImportedModel,
@@ -32,6 +32,7 @@ import {
 import { invalidateLocalModelInstallStatusCache } from "@/lib/server/local-model-inventory";
 import { prisma } from "@/lib/server/prisma";
 import { getLocalWorkspacePreferences, requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export const dynamic = "force-dynamic";
 
@@ -404,6 +405,7 @@ export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ modelId: string }> },
 ) {
+  return withSharedMutationLease(async () => {
   try {
     if (!isDesktopRuntime()) {
       return NextResponse.json(
@@ -524,7 +526,7 @@ export async function DELETE(
       }
       removedFiles = await removeManagedModelFiles(paths);
       clearedDefaults = await clearDeletedModelDefaults(owner.id, modelId);
-      if (imported) await removeImportedModel(modelId);
+      if (imported) await removeImportedModelIfUnchanged(imported);
       if (stagedExternal) {
         removedFiles += await commitImportedExternalModelFile(stagedExternal);
       }
@@ -566,4 +568,5 @@ export async function DELETE(
   } catch (error) {
     return jsonError(error);
   }
+  });
 }

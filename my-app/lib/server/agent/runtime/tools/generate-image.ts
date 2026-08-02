@@ -30,6 +30,7 @@ import { loadImageReferenceFiles } from "@/lib/server/reference-assets";
 import { assertReferenceLimit } from "@/lib/server/generate-request";
 import { parseRequestedAspectRatio } from "@/lib/server/byok-shared";
 import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 const GRID_GAP = 24;
 const GRID_ORIGIN = { x: 48, y: 48 };
@@ -55,6 +56,7 @@ export function buildGenerateImageTool(ctx: AgentToolContext): Tool {
         .describe("Set false to skip auto-attaching canvas reference layers."),
     }),
     async execute({ prompt, count, aspectRatio, modelId, useReferences }) {
+      return withSharedMutationLease(async () => {
       const startedAt = new Date().toISOString();
       const stepId = randomUUID();
       const finalCount = count ?? ctx.uiContext.selectedCount ?? 1;
@@ -245,6 +247,7 @@ export function buildGenerateImageTool(ctx: AgentToolContext): Tool {
         });
         return { ok: false, error: message.slice(0, 400) };
       }
+      });
     },
   });
 }

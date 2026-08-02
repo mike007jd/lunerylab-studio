@@ -22,6 +22,7 @@ import {
   failRunningGenerationJob,
 } from "@/lib/server/generation-job";
 import { toAssetDTO } from "@/lib/server/dto";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 interface Params {
   params: Promise<{ id: string }>;
@@ -31,6 +32,7 @@ const PNG_ONLY = new Set(["image/png"]);
 const MAX_PLATFORM_EXPORTS = 12;
 
 export async function POST(request: NextRequest, { params }: Params) {
+  return withSharedMutationLease(async () => {
   let jobId: string | null = null;
   try {
     const user = await requireLocalWorkspaceOwner();
@@ -169,4 +171,5 @@ export async function POST(request: NextRequest, { params }: Params) {
     }
     return jsonError(error);
   }
+  });
 }

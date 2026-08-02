@@ -26,6 +26,7 @@ import {
 } from "@/lib/constants/platform-sizes";
 import { loadAgentLayer } from "@/lib/server/agent/runtime/layer-access";
 import type { AgentToolContext } from "@/lib/server/agent/runtime/tool-registry";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export function buildExportPlatformsTool(ctx: AgentToolContext): Tool {
   return tool({
@@ -44,6 +45,7 @@ export function buildExportPlatformsTool(ctx: AgentToolContext): Tool {
         .describe("cover = crop to fill (default), contain = letterbox to fit."),
     }),
     async execute({ layerId, presetIds, fit }) {
+      return withSharedMutationLease(async () => {
       const startedAt = new Date().toISOString();
       const stepId = randomUUID();
       let jobId: string | null = null;
@@ -182,6 +184,7 @@ export function buildExportPlatformsTool(ctx: AgentToolContext): Tool {
         });
         return { ok: false, error: message.slice(0, 400) };
       }
+      });
     },
   });
 }

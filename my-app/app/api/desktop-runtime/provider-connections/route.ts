@@ -25,6 +25,9 @@ import {
   listByokConnectionMeta,
   setByokConnectionMeta,
 } from "@/lib/server/byok-connection-store";
+import { clearDefaultsOwnedByProvider } from "@/lib/server/clear-provider-defaults";
+import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
+import { withWorkspaceExclusive } from "@/lib/server/workspace-operation-gate";
 
 export const dynamic = "force-dynamic";
 
@@ -126,8 +129,16 @@ export async function DELETE(request: NextRequest) {
       );
     }
     const { providerId } = await parseJsonBody(request, providerConnectionDeleteSchema);
-    deleteByokConnectionMeta(providerId);
-    return NextResponse.json({ ok: true });
+    const user = await requireLocalWorkspaceOwner();
+    // Provider unlink is rare and must drain every in-flight settings/config
+    // writer. Exclusive ownership prevents a validated settings PATCH from
+    // reviving this provider's default after the unlink returns.
+    const clearedDefaults = await withWorkspaceExclusive("provider-unlink", async () => {
+      const cleared = await clearDefaultsOwnedByProvider(user.id, providerId);
+      deleteByokConnectionMeta(providerId);
+      return cleared;
+    });
+    return NextResponse.json({ ok: true, clearedDefaults: clearedDefaults.cleared });
   } catch (error) {
     return jsonError(error);
   }

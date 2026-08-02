@@ -7,7 +7,7 @@ import {
   startBridgeDownloadJob,
 } from "@/lib/server/desktop-bridge";
 import { parseJsonBody } from "@/lib/server/http-validation";
-import { jsonError } from "@/lib/server/errors";
+import { ApiError, jsonError } from "@/lib/server/errors";
 import { resolveHuggingFaceModelFileUrl } from "@/lib/server/hf-import-url";
 import {
   findImportedModel,
@@ -15,8 +15,10 @@ import {
   importedModelId,
   normalizeImportableRuntimeTarget,
   resolveLocalModelPath,
+  QueuedImportedModelStartUncertainError,
   upsertImportedModel,
   validateImportedRuntimeFormat,
+  withQueuedImportedModelReservation,
 } from "@/lib/server/imported-model-registry";
 
 export const dynamic = "force-dynamic";
@@ -56,6 +58,15 @@ async function fetchHuggingFaceSha256(url: string): Promise<string | { error: st
     return { error: "Could not verify the Hugging Face model artifact checksum." };
   } catch {
     return { error: "Could not verify the Hugging Face model artifact." };
+  }
+}
+
+class BridgeStartError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
   }
 }
 
@@ -141,6 +152,19 @@ export async function POST(request: NextRequest) {
         model: existing,
       });
     }
+    if (!existingStatus || typeof existingStatus.status !== "string") {
+      return NextResponse.json(
+        {
+          error: "Existing model import status is unknown; queued ownership was retained.",
+          code: "bridge_start_unknown",
+          partialState: true,
+          queued: true,
+          retryable: true,
+          jobId: existing.jobId,
+        },
+        { status: 503 },
+      );
+    }
   }
 
   const jobId = crypto.randomUUID();
@@ -148,24 +172,14 @@ export async function POST(request: NextRequest) {
   if (typeof sha256 !== "string") {
     return NextResponse.json({ error: sha256.error }, { status: 400 });
   }
-  const bridgeRes = await startBridgeDownloadJob(bridge, {
-    url: resolved.url,
-    dest,
-    sha256,
-    jobId,
-  });
 
-  if (!bridgeRes.ok) {
-    return NextResponse.json(
-      { error: `Bridge start failed: ${await bridgeErrorText(bridgeRes)}` },
-      { status: bridgeRes.status },
-    );
-  }
-
-  const record = await upsertImportedModel({
+  // Persist queued ownership before invoking the desktop bridge so a crash or
+  // launch failure cannot leave an untracked download. Compensate on start
+  // failure so no false importing/queued record remains.
+  const queuedRecord = {
     id: modelId,
     label: body.label?.trim() || resolved.fileName,
-    source: "huggingface-url",
+    source: "huggingface-url" as const,
     runtimeTarget,
     capability: runnable.capability,
     format: runnable.format,
@@ -173,11 +187,88 @@ export async function POST(request: NextRequest) {
     modelPath: dest,
     sizeBytes: 0,
     sha256,
-    status: "queued",
+    status: "queued" as const,
     createdAt: new Date().toISOString(),
     url: resolved.url,
     jobId,
-  });
+  };
+
+  let record;
+  try {
+    const reservation = await withQueuedImportedModelReservation({
+      record: queuedRecord,
+      expectedPrevious: existing,
+      start: async () => {
+        let bridgeRes: Response;
+        try {
+          bridgeRes = await startBridgeDownloadJob(bridge, {
+            url: resolved.url,
+            dest,
+            sha256,
+            jobId,
+          });
+        } catch (error) {
+          // The local bridge can accept/start the job and then lose the HTTP
+          // response. Probe by jobId before deciding whether queued ownership
+          // is safe to remove.
+          const observed = await getBridgeDownloadStatus(bridge, jobId);
+          if (typeof observed?.status === "string" && observed.status !== "unknown") {
+            return new Response(null, { status: 202 });
+          }
+          if (observed?.status !== "unknown") {
+            throw new QueuedImportedModelStartUncertainError(
+              "Desktop bridge start outcome is unknown; queued ownership was retained.",
+              { cause: error },
+            );
+          }
+          throw new BridgeStartError(
+            error instanceof Error ? error.message : "Desktop bridge request failed.",
+            503,
+          );
+        }
+        if (!bridgeRes.ok) {
+          const message = await bridgeErrorText(bridgeRes).catch(
+            () => `HTTP ${bridgeRes.status}`,
+          );
+          throw new BridgeStartError(message, bridgeRes.status);
+        }
+        return bridgeRes;
+      },
+    });
+    record = reservation.record;
+  } catch (error) {
+    if (error instanceof BridgeStartError) {
+      return NextResponse.json(
+        { error: `Bridge start failed: ${error.message}` },
+        { status: error.status },
+      );
+    }
+    if (error instanceof ApiError && error.code === "imported_model_registry_compensation_failed") {
+      return NextResponse.json(
+        {
+          error: error.message,
+          code: error.code,
+          partialState: true,
+          jobId,
+        },
+        { status: error.status },
+      );
+    }
+    if (error instanceof QueuedImportedModelStartUncertainError) {
+      return NextResponse.json(
+        {
+          error: error.message,
+          code: "bridge_start_unknown",
+          partialState: true,
+          queued: true,
+          retryable: true,
+          jobId,
+        },
+        { status: 503 },
+      );
+    }
+    return jsonError(error);
+  }
 
   return NextResponse.json({
     imported: true,

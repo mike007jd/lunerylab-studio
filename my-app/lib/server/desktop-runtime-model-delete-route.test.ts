@@ -16,6 +16,8 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model-delete";
 
+vi.mock("server-only", () => ({}));
+
 const mocks = vi.hoisted(() => ({
   isDesktopRuntime: vi.fn(),
   findHfModelEntry: vi.fn(),
@@ -55,7 +57,7 @@ vi.mock("@/lib/server/desktop-bridge", () => ({
 vi.mock("@/lib/server/imported-model-registry", () => ({
   findImportedModel: mocks.findImportedModel,
   modelCachePath: mocks.modelCachePath,
-  removeImportedModel: mocks.removeImportedModel,
+  removeImportedModelIfUnchanged: mocks.removeImportedModel,
   upsertImportedModel: mocks.upsertImportedModel,
   stageImportedExternalModelFile: mocks.stageImportedExternalModelFile,
   rollbackImportedExternalModelFile: mocks.rollbackImportedExternalModelFile,
@@ -266,7 +268,9 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
       removedFiles: 0,
     });
     expect(mocks.removeManagedModelFiles).toHaveBeenCalledWith([]);
-    expect(mocks.removeImportedModel).toHaveBeenCalledWith("imported-sd-cpp-original-12345678");
+    expect(mocks.removeImportedModel).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "imported-sd-cpp-original-12345678" }),
+    );
   });
 
   it("deletes an imported external file after explicit confirmation", async () => {

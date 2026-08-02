@@ -8,6 +8,7 @@ import {
   stageStoredFileDeletion,
   type StagedStoredFileDeletion,
 } from "@/lib/server/storage";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 /**
  * Permanently remove assets: delete the database rows and the underlying stored
@@ -36,6 +37,7 @@ export interface AssetPurgeResult {
 type PurgeTarget = "trash" | string[];
 
 export async function purgeAssets(userId: string, target: PurgeTarget): Promise<AssetPurgeResult> {
+  return withSharedMutationLease(async () => {
   const where =
     target === "trash"
       ? { userId, deletedAt: { not: null } }
@@ -123,4 +125,5 @@ export async function purgeAssets(userId: string, target: PurgeTarget): Promise<
   );
 
   return { purgedCount: targets.length, bytesFreed, filesDeleted };
+  });
 }
