@@ -76,6 +76,7 @@ describe("managed local model file deletion", () => {
     fs.mkdirSync(path.dirname(modelPath), { recursive: true });
     fs.writeFileSync(modelPath, "model");
     const staged = await files.stageManagedModelFiles([modelPath]);
+    await files.markManagedModelFilesCommitted(staged);
     files.__localModelFilesTestHooks.beforeMutation = (filePath) => {
       if (filePath.endsWith(".lunery-delete")) throw new Error("unlink failed");
     };
@@ -88,6 +89,66 @@ describe("managed local model file deletion", () => {
     expect(fs.existsSync(staged[0]!.stagedPath)).toBe(true);
 
     files.__localModelFilesTestHooks.beforeMutation = null;
+    await expect(files.reconcileStagedManagedModelFiles()).resolves.toBe(1);
+    expect(fs.existsSync(staged[0]!.stagedPath)).toBe(false);
+  });
+
+  it("does not stage bytes when prepared-journal publication fails", async () => {
+    const files = await import("@/lib/server/local-model-files");
+    const native = await import("@/lib/server/native-profile-fs");
+    const modelPath = path.join(modelsDir, "llama-cpp", "journal-fail.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "model");
+    native.__nativeProfileFsTestHooks.execute = (request) => {
+      if (request.operation === "write" && request.relative_path.includes(".managed-delete-journal")) {
+        throw new Error("journal publish failed");
+      }
+    };
+
+    await expect(files.stageManagedModelFiles([modelPath])).rejects.toThrow("journal publish failed");
+    expect(fs.readFileSync(modelPath, "utf8")).toBe("model");
+    expect(fs.readdirSync(path.dirname(modelPath))).toEqual(["journal-fail.gguf"]);
+    native.__nativeProfileFsTestHooks.execute = null;
+  });
+
+  it("rolls back a prepared journal after a strong crash during staging", async () => {
+    const files = await import("@/lib/server/local-model-files");
+    const first = path.join(modelsDir, "llama-cpp", "first.gguf");
+    const second = path.join(modelsDir, "llama-cpp", "second.gguf");
+    fs.mkdirSync(path.dirname(first), { recursive: true });
+    fs.writeFileSync(first, "first");
+    fs.writeFileSync(second, "second");
+    files.__localModelFilesTestHooks.afterStage = () => {
+      throw new files.SimulatedManagedModelCrashError();
+    };
+
+    await expect(files.stageManagedModelFiles([first, second])).rejects.toBeInstanceOf(
+      files.SimulatedManagedModelCrashError,
+    );
+    expect(fs.existsSync(first)).toBe(false);
+    files.__localModelFilesTestHooks.afterStage = null;
+
+    await expect(files.reconcileStagedManagedModelFiles()).resolves.toBe(0);
+    expect(fs.readFileSync(first, "utf8")).toBe("first");
+    expect(fs.readFileSync(second, "utf8")).toBe("second");
+  });
+
+  it("finishes a committed journal after a post-metadata strong crash", async () => {
+    const files = await import("@/lib/server/local-model-files");
+    const modelPath = path.join(modelsDir, "llama-cpp", "committed.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "model");
+    const staged = await files.stageManagedModelFiles([modelPath]);
+    files.__localModelFilesTestHooks.afterCommittedMarker = () => {
+      throw new files.SimulatedManagedModelCrashError();
+    };
+
+    await expect(files.markManagedModelFilesCommitted(staged)).rejects.toBeInstanceOf(
+      files.SimulatedManagedModelCrashError,
+    );
+    expect(fs.existsSync(staged[0]!.stagedPath)).toBe(true);
+    files.__localModelFilesTestHooks.afterCommittedMarker = null;
+
     await expect(files.reconcileStagedManagedModelFiles()).resolves.toBe(1);
     expect(fs.existsSync(staged[0]!.stagedPath)).toBe(false);
   });

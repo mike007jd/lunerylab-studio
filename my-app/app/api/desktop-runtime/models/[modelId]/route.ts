@@ -28,6 +28,7 @@ import {
 import {
   catalogModelFiles,
   finalizeManagedModelFiles,
+  markManagedModelFilesCommitted,
   rollbackManagedModelFiles,
   stageManagedModelFiles,
   ManagedModelCleanupPendingError,
@@ -309,6 +310,46 @@ async function renewModelDeleteLeases(
   }
 }
 
+const MODEL_DELETE_LEASE_HEARTBEAT_MS = 15_000;
+
+interface ModelDeleteLeaseHeartbeat {
+  assertHealthy(): Promise<void>;
+  stop(): Promise<unknown | null>;
+}
+
+function startModelDeleteLeaseHeartbeat(
+  bridge: DesktopBridge,
+  leases: ModelDeleteLeases,
+): ModelDeleteLeaseHeartbeat {
+  let stopped = false;
+  let failure: unknown | null = null;
+  let inFlight: Promise<void> | null = null;
+  const tick = () => {
+    if (stopped || failure || inFlight) return;
+    inFlight = renewModelDeleteLeases(bridge, leases)
+      .catch((error) => {
+        failure = error;
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+  const timer = setInterval(tick, MODEL_DELETE_LEASE_HEARTBEAT_MS);
+  timer.unref?.();
+  return {
+    async assertHealthy() {
+      await inFlight;
+      if (failure) throw failure;
+    },
+    async stop() {
+      stopped = true;
+      clearInterval(timer);
+      await inFlight;
+      return failure;
+    },
+  };
+}
+
 async function stopActiveLlama(
   bridge: DesktopBridge,
   modelId: string,
@@ -543,6 +584,7 @@ export async function DELETE(
     const isLlamaModel = catalogEntry?.runtimeTarget === "llama-cpp"
       || imported?.runtimeTarget === "llama-cpp";
     let leases: ModelDeleteLeases | null = null;
+    let heartbeat: ModelDeleteLeaseHeartbeat | null = null;
     try {
     leases = await acquireModelDeleteLeases(
       bridge,
@@ -564,6 +606,7 @@ export async function DELETE(
     // acquired lease with the same leaseId immediately before any file stage
     // or metadata commit; an unavailable/expired renewal is a hard stop.
     await renewModelDeleteLeases(bridge, leases);
+    heartbeat = startModelDeleteLeaseHeartbeat(bridge, leases);
 
     const paths = catalogEntry ? catalogModelPaths(catalogEntry) : importedModelPaths(imported!);
     let stagedExternal: StagedExternalModelFile | null = null;
@@ -579,11 +622,15 @@ export async function DELETE(
         }
       }
       stagedManaged = await stageManagedModelFiles(paths);
+      await heartbeat.assertHealthy();
       clearedDefaults = await clearDeletedModelDefaults(owner.id, modelId);
+      await heartbeat.assertHealthy();
       if (imported) {
         await removeImportedModelIfUnchanged(imported);
         registryRemoved = true;
       }
+      await markManagedModelFilesCommitted(stagedManaged);
+      await heartbeat.assertHealthy();
     } catch (error) {
       try {
         await rollbackManagedModelFiles(stagedManaged);
@@ -626,6 +673,12 @@ export async function DELETE(
         warnings.push("external_file_cleanup_pending");
       }
     }
+    const heartbeatFailure = await heartbeat.stop();
+    heartbeat = null;
+    if (heartbeatFailure) {
+      cleanupPending = true;
+      warnings.push("model_delete_lease_expired_after_commit");
+    }
     invalidateLocalModelInstallStatusCache();
 
     return NextResponse.json({
@@ -640,6 +693,7 @@ export async function DELETE(
       warnings,
     });
     } finally {
+      if (heartbeat) await heartbeat.stop();
       if (leases) await releaseModelDeleteLeases(bridge, leases);
     }
     });

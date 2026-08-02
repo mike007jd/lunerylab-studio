@@ -6,6 +6,13 @@ import { promises as fs } from "node:fs";
 import { type HfModelEntry } from "@/lib/hf-model-catalog";
 import { modelCachePath, modelsCacheRoot } from "@/lib/server/imported-model-registry";
 import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
+import {
+  nativeProfileMkdir,
+  nativeProfileRename,
+  nativeProfileUnlink,
+  nativeProfileWrite,
+  profileRelativePath,
+} from "@/lib/server/native-profile-fs";
 
 export interface LocalModelFileStatus {
   fileName: string;
@@ -78,20 +85,10 @@ export function isManagedModelCachePath(filePath: string): boolean {
   return isPathInsideRoot(modelsCacheRoot(), filePath);
 }
 
-interface ModelPathIdentity {
-  device: bigint;
-  inode: bigint;
-}
-
-interface ManagedFileGuard {
-  directories: Array<{ absolutePath: string; identity: ModelPathIdentity }>;
-  fileIdentity: ModelPathIdentity;
-  rootReal: string;
-}
-
 export interface StagedManagedModelFile {
   originalPath: string;
   stagedPath: string;
+  journalPath?: string;
 }
 
 interface ManagedModelCleanupJournal {
@@ -111,93 +108,40 @@ export class ManagedModelCleanupPendingError extends Error {
 
 export const __localModelFilesTestHooks = {
   beforeMutation: null as null | ((filePath: string) => Promise<void> | void),
+  afterPreparedJournal: null as null | ((journalPath: string) => Promise<void> | void),
+  afterStage: null as null | ((stage: StagedManagedModelFile) => Promise<void> | void),
+  afterCommittedMarker: null as null | ((journalPath: string) => Promise<void> | void),
 };
 
-function modelPathIdentity(metadata: import("node:fs").BigIntStats): ModelPathIdentity {
-  return { device: metadata.dev, inode: metadata.ino };
-}
-
-function sameModelPathIdentity(left: ModelPathIdentity, right: ModelPathIdentity): boolean {
-  return left.device === right.device && left.inode === right.inode;
-}
-
-async function captureManagedFileGuard(filePath: string): Promise<ManagedFileGuard | null> {
-  const root = path.resolve(modelsCacheRoot());
-  if (!isPathInsideRoot(root, filePath)) {
-    throw new Error("Model file is outside the managed model cache.");
+export class SimulatedManagedModelCrashError extends Error {
+  constructor() {
+    super("Simulated managed-model process crash.");
+    this.name = "SimulatedManagedModelCrashError";
   }
+}
 
-  let rootMetadata: import("node:fs").BigIntStats;
+function journalPathFor(stagedFiles: readonly StagedManagedModelFile[]): string | null {
+  return stagedFiles.find((stage) => stage.journalPath)?.journalPath ?? null;
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
   try {
-    rootMetadata = await fs.lstat(root, { bigint: true });
+    const metadata = await fs.lstat(filePath);
+    if (metadata.isDirectory()) {
+      throw new Error("Refusing to mutate a model directory as a file.");
+    }
+    return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
-    throw new Error("Managed model cache root must be a real directory.");
-  }
-  const rootReal = await fs.realpath(root);
-  const relativeParent = path.relative(root, path.dirname(filePath));
-  const parentSegments = relativeParent === "" ? [] : relativeParent.split(path.sep);
-  const directoryPaths = [root];
-  let current = root;
-  for (const segment of parentSegments) {
-    current = path.join(current, segment);
-    directoryPaths.push(current);
-  }
-  const directories: ManagedFileGuard["directories"] = [];
-  for (const directoryPath of directoryPaths) {
-    let metadata: import("node:fs").BigIntStats;
-    try {
-      metadata = await fs.lstat(directoryPath, { bigint: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw error;
-    }
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error("Managed model cache path contains a symlink.");
-    }
-    if (!isPathInsideRoot(rootReal, await fs.realpath(directoryPath)) && directoryPath !== root) {
-      throw new Error("Model file parent is outside the managed model cache.");
-    }
-    directories.push({ absolutePath: directoryPath, identity: modelPathIdentity(metadata) });
-  }
-
-  let fileMetadata: import("node:fs").BigIntStats;
-  try {
-    fileMetadata = await fs.lstat(filePath, { bigint: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
-  if (fileMetadata.isDirectory()) {
-    throw new Error("Refusing to remove a model directory as a file.");
-  }
-  return {
-    directories,
-    fileIdentity: modelPathIdentity(fileMetadata),
-    rootReal,
-  };
 }
 
-async function verifyManagedDirectories(guard: ManagedFileGuard): Promise<void> {
-  for (const expected of guard.directories) {
-    const current = await fs.lstat(expected.absolutePath, { bigint: true });
-    if (
-      current.isSymbolicLink()
-      || !current.isDirectory()
-      || !sameModelPathIdentity(expected.identity, modelPathIdentity(current))
-    ) {
-      throw new Error("Managed model cache path changed during deletion.");
-    }
-    if (
-      expected.absolutePath !== guard.directories[0]!.absolutePath
-      && !isPathInsideRoot(guard.rootReal, await fs.realpath(expected.absolutePath))
-    ) {
-      throw new Error("Model file parent is outside the managed model cache.");
-    }
-  }
+function stageWithJournal(
+  stage: StagedManagedModelFile,
+  journalPath: string,
+): StagedManagedModelFile {
+  return { ...stage, journalPath };
 }
 
 async function guardedRenameManagedFile(
@@ -208,29 +152,18 @@ async function guardedRenameManagedFile(
   if (path.dirname(sourcePath) !== path.dirname(destinationPath)) {
     throw new Error("Managed model staging must remain in the source directory.");
   }
-  const guard = await captureManagedFileGuard(sourcePath);
-  if (!guard) return false;
+  if (!isManagedModelCachePath(sourcePath) || !isManagedModelCachePath(destinationPath)) {
+    throw new Error("Model file is outside the managed model cache.");
+  }
+  if (!(await pathExists(sourcePath))) return false;
   if (runTestHook && process.env.NODE_ENV === "test" && __localModelFilesTestHooks.beforeMutation) {
     await __localModelFilesTestHooks.beforeMutation(sourcePath);
   }
-  // Validate after the deterministic race hook and once more immediately
-  // before rename. Node has no renameat(2); this prevents every detected swap
-  // from moving an external file and leaves only the unavoidable external
-  // actor race between the final check and the syscall.
-  await verifyManagedDirectories(guard);
-  try {
-    await fs.lstat(destinationPath);
-    throw new Error("Managed model staging path already exists.");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  await verifyManagedDirectories(guard);
-  await fs.rename(sourcePath, destinationPath);
-  await verifyManagedDirectories(guard);
-  const staged = await fs.lstat(destinationPath, { bigint: true });
-  if (!sameModelPathIdentity(guard.fileIdentity, modelPathIdentity(staged))) {
-    throw new Error("Managed model file changed during staging.");
-  }
+  await nativeProfileRename(
+    "models",
+    profileRelativePath("models", sourcePath),
+    profileRelativePath("models", destinationPath),
+  );
   return true;
 }
 
@@ -239,24 +172,41 @@ export async function stageManagedModelFiles(
   filePaths: readonly string[],
 ): Promise<StagedManagedModelFile[]> {
   const uniquePaths = [...new Set(filePaths)];
-  const staged: StagedManagedModelFile[] = [];
-  try {
-    for (const filePath of uniquePaths) {
-      if (!isManagedModelCachePath(filePath)) {
-        throw new Error("Model file is outside the managed model cache.");
-      }
-      const stage = {
+  const plans: StagedManagedModelFile[] = [];
+  for (const filePath of uniquePaths) {
+    if (!isManagedModelCachePath(filePath)) {
+      throw new Error("Model file is outside the managed model cache.");
+    }
+    if (await pathExists(filePath)) {
+      plans.push({
         originalPath: filePath,
         stagedPath: `${filePath}.${randomUUID()}.lunery-delete`,
-      };
+      });
+    }
+  }
+  if (plans.length === 0) return [];
+  const journalPath = await writeManagedCleanupJournal(plans);
+  const staged: StagedManagedModelFile[] = [];
+  try {
+    if (process.env.NODE_ENV === "test" && __localModelFilesTestHooks.afterPreparedJournal) {
+      await __localModelFilesTestHooks.afterPreparedJournal(journalPath);
+    }
+    for (const plan of plans) {
+      const stage = stageWithJournal(plan, journalPath);
       if (await guardedRenameManagedFile(stage.originalPath, stage.stagedPath, true)) {
         staged.push(stage);
+        if (process.env.NODE_ENV === "test" && __localModelFilesTestHooks.afterStage) {
+          await __localModelFilesTestHooks.afterStage(stage);
+        }
       }
     }
     return staged;
   } catch (error) {
+    if (process.env.NODE_ENV === "test" && error instanceof SimulatedManagedModelCrashError) {
+      throw error;
+    }
     try {
-      await rollbackManagedModelFiles(staged);
+      await rollbackManagedModelFiles(plans.map((stage) => stageWithJournal(stage, journalPath)));
     } catch (rollbackError) {
       throw new AggregateError(
         [error, rollbackError],
@@ -271,7 +221,18 @@ export async function rollbackManagedModelFiles(
   stagedFiles: readonly StagedManagedModelFile[],
 ): Promise<void> {
   for (const stage of [...stagedFiles].reverse()) {
-    await guardedRenameManagedFile(stage.stagedPath, stage.originalPath, false);
+    if (await pathExists(stage.stagedPath)) {
+      await guardedRenameManagedFile(stage.stagedPath, stage.originalPath, false);
+    }
+  }
+  const journalPath = journalPathFor(stagedFiles);
+  if (journalPath) {
+    await nativeProfileUnlink("models", profileRelativePath("models", `${journalPath}.committed`), {
+      missingOk: true,
+    });
+    await nativeProfileUnlink("models", profileRelativePath("models", journalPath), {
+      missingOk: true,
+    });
   }
 }
 
@@ -282,14 +243,13 @@ export async function commitManagedModelFiles(
   const pendingPaths: string[] = [];
   for (const stage of stagedFiles) {
     try {
-      const guard = await captureManagedFileGuard(stage.stagedPath);
-      if (!guard) continue;
+      if (!(await pathExists(stage.stagedPath))) continue;
       if (process.env.NODE_ENV === "test" && __localModelFilesTestHooks.beforeMutation) {
         await __localModelFilesTestHooks.beforeMutation(stage.stagedPath);
       }
-      await verifyManagedDirectories(guard);
-      await fs.unlink(stage.stagedPath);
-      await verifyManagedDirectories(guard);
+      await nativeProfileUnlink("models", profileRelativePath("models", stage.stagedPath), {
+        missingOk: true,
+      });
       removed += 1;
     } catch {
       pendingPaths.push(stage.stagedPath);
@@ -333,21 +293,18 @@ async function writeManagedCleanupJournal(
   stagedFiles: readonly StagedManagedModelFile[],
 ): Promise<string> {
   const directory = managedCleanupJournalDir();
-  await fs.mkdir(directory, { recursive: true });
+  await nativeProfileMkdir("models", profileRelativePath("models", directory));
   const journalPath = path.join(directory, `${randomUUID()}.json`);
-  const tempPath = `${journalPath}.tmp`;
   const payload: ManagedModelCleanupJournal = {
     version: 1,
     stages: validateCleanupStages([...stagedFiles]),
   };
-  const handle = await fs.open(tempPath, "wx");
-  try {
-    await handle.writeFile(JSON.stringify(payload), "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await fs.rename(tempPath, journalPath);
+  await nativeProfileWrite(
+    "models",
+    profileRelativePath("models", journalPath),
+    Buffer.from(JSON.stringify(payload), "utf8"),
+    { replace: false },
+  );
   return journalPath;
 }
 
@@ -365,14 +322,39 @@ async function readManagedCleanupJournal(journalPath: string): Promise<StagedMan
  * durable cleanup plan before unlinking staged bytes so a cleanup error can be
  * reported as successful-with-pending-work and retried on startup.
  */
+export async function markManagedModelFilesCommitted(
+  stagedFiles: readonly StagedManagedModelFile[],
+): Promise<void> {
+  if (stagedFiles.length === 0) return;
+  const journalPath = journalPathFor(stagedFiles);
+  if (!journalPath) throw new Error("Managed model deletion has no prepared journal.");
+  await nativeProfileWrite(
+    "models",
+    profileRelativePath("models", `${journalPath}.committed`),
+    Buffer.from("committed\n", "utf8"),
+    { replace: false },
+  );
+  if (process.env.NODE_ENV === "test" && __localModelFilesTestHooks.afterCommittedMarker) {
+    await __localModelFilesTestHooks.afterCommittedMarker(journalPath);
+  }
+}
+
 export async function finalizeManagedModelFiles(
   stagedFiles: readonly StagedManagedModelFile[],
 ): Promise<number> {
   if (stagedFiles.length === 0) return 0;
-  const journalPath = await writeManagedCleanupJournal(stagedFiles);
+  const journalPath = journalPathFor(stagedFiles);
+  if (!journalPath || !(await pathExists(`${journalPath}.committed`))) {
+    throw new Error("Managed model deletion has no durable committed marker.");
+  }
   try {
     const removed = await commitManagedModelFiles(stagedFiles);
-    await fs.unlink(journalPath);
+    await nativeProfileUnlink("models", profileRelativePath("models", `${journalPath}.committed`), {
+      missingOk: true,
+    });
+    await nativeProfileUnlink("models", profileRelativePath("models", journalPath), {
+      missingOk: true,
+    });
     return removed;
   } catch (error) {
     // Keep the durable plan. Startup reconciliation retries only paths named by
@@ -399,14 +381,24 @@ async function listManagedCleanupJournals(): Promise<string[]> {
     .map((entry) => path.join(directory, entry.name));
 }
 
-/** Retry cleanup left after metadata reached the logical delete commit point. */
+/** Roll prepared work back; finish committed cleanup after a process crash. */
 export async function reconcileStagedManagedModelFiles(): Promise<number> {
   return withSharedMutationLease(async () => {
     let removed = 0;
     for (const journalPath of await listManagedCleanupJournals()) {
-      const stages = await readManagedCleanupJournal(journalPath);
-      removed += await commitManagedModelFiles(stages);
-      await fs.unlink(journalPath);
+      const stages = (await readManagedCleanupJournal(journalPath))
+        .map((stage) => stageWithJournal(stage, journalPath));
+      if (await pathExists(`${journalPath}.committed`)) {
+        removed += await commitManagedModelFiles(stages);
+        await nativeProfileUnlink("models", profileRelativePath("models", `${journalPath}.committed`), {
+          missingOk: true,
+        });
+        await nativeProfileUnlink("models", profileRelativePath("models", journalPath), {
+          missingOk: true,
+        });
+      } else {
+        await rollbackManagedModelFiles(stages);
+      }
     }
     return removed;
   });
@@ -415,5 +407,6 @@ export async function reconcileStagedManagedModelFiles(): Promise<number> {
 /** Compatibility helper for callers that do not have metadata to coordinate. */
 export async function removeManagedModelFiles(filePaths: readonly string[]): Promise<number> {
   const staged = await stageManagedModelFiles(filePaths);
-  return commitManagedModelFiles(staged);
+  await markManagedModelFilesCommitted(staged);
+  return finalizeManagedModelFiles(staged);
 }
