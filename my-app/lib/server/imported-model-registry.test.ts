@@ -14,6 +14,7 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "imported-model-registry-"));
   homeDir = path.join(tmpDir, "home");
   modelsDir = path.join(tmpDir, "profile", "models");
+  fs.mkdirSync(modelsDir, { recursive: true });
   vi.stubEnv("HOME", homeDir);
   vi.stubEnv("LUNERY_MODELS_DIR", modelsDir);
   vi.resetModules();
@@ -222,6 +223,39 @@ describe("imported-model-registry profile paths", () => {
     expect(recoveredFiles.some((name) =>
       fs.readFileSync(path.join(path.dirname(modelPath), name), "utf8") === "replacement-model"
     )).toBe(true);
+  });
+
+  it("preserves a same-inode same-size rewrite before external finalize", async () => {
+    const modelPath = path.join(tmpDir, "external", "finalize-in-place.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "original");
+    const registry = await import("@/lib/server/imported-model-registry");
+    const resolved = await registry.resolveLocalModelPath(modelPath);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const imported = record({
+      id: "imported-llama-cpp-finalize-in-place-12345678",
+      source: "local-path",
+      modelPath,
+      fileName: path.basename(modelPath),
+      sizeBytes: resolved.sizeBytes,
+      fileIdentity: resolved.fileIdentity,
+    });
+    await registry.upsertImportedModel(imported);
+    const staged = await registry.stageImportedExternalModelFile(imported);
+    await registry.removeImportedModel(imported.id);
+    const inodeBefore = fs.statSync(staged.stagedPath, { bigint: true }).ino;
+    registry.__importedModelRegistryTestHooks.beforeExternalFinalize = () => {
+      fs.writeFileSync(staged.stagedPath, "changed!");
+      const future = new Date(Date.now() + 5_000);
+      fs.utimesSync(staged.stagedPath, future, future);
+    };
+
+    await expect(registry.commitImportedExternalModelFile(staged)).rejects.toThrow(
+      /identity changed|safe-file service rejected/,
+    );
+    expect(fs.statSync(staged.stagedPath, { bigint: true }).ino).toBe(inodeBefore);
+    expect(fs.readFileSync(staged.stagedPath, "utf8")).toBe("changed!");
+    expect(fs.existsSync(staged.journalPath)).toBe(true);
   });
 
   it("unregisters a changed external file without staging or deleting it", async () => {

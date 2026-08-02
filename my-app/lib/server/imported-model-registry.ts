@@ -5,7 +5,14 @@ import type { ModelCapability, ModelFormat, ModelRuntimeTarget } from "@/lib/hf-
 import { ApiError } from "@/lib/server/errors";
 import { luneryModelsDir } from "@/lib/server/lunery-profile";
 import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
-import { nativeUnlinkExternalIdentity } from "@/lib/server/native-profile-fs";
+import {
+  nativeProfileMkdir,
+  nativeProfileRename,
+  nativeProfileUnlink,
+  nativeProfileWrite,
+  nativeUnlinkExternalIdentity,
+  profileRelativePath,
+} from "@/lib/server/native-profile-fs";
 
 export type ImportedModelSource = "local-path" | "huggingface-url";
 export type ImportedModelStatus = "ready" | "queued";
@@ -144,17 +151,12 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function syncDirectory(directoryPath: string): Promise<void> {
-  let handle: import("node:fs/promises").FileHandle | null = null;
-  try {
-    handle = await fs.open(directoryPath, "r");
-    await handle.sync();
-  } catch {
-    // Some filesystems do not expose directory fsync. The journal file itself
-    // is still synced before publication, and startup reconciliation remains safe.
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
+function modelsRelative(filePath: string): string {
+  return profileRelativePath("models", filePath);
+}
+
+async function unlinkModelsFile(filePath: string): Promise<void> {
+  await nativeProfileUnlink("models", modelsRelative(filePath), { missingOk: true });
 }
 
 async function writeExternalDeleteJournal(
@@ -162,24 +164,23 @@ async function writeExternalDeleteJournal(
   journal: ExternalModelDeleteJournal,
   exclusive = false,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(journalPath), { recursive: true });
+  await nativeProfileMkdir("models", modelsRelative(path.dirname(journalPath)));
   const tmpPath = `${journalPath}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await fs.open(tmpPath, "wx");
   try {
-    await handle.writeFile(JSON.stringify(journal), "utf8");
-    await handle.sync();
+    await nativeProfileWrite(
+      "models",
+      modelsRelative(tmpPath),
+      Buffer.from(JSON.stringify(journal), "utf8"),
+      { replace: false },
+    );
+    await nativeProfileRename(
+      "models",
+      modelsRelative(tmpPath),
+      modelsRelative(journalPath),
+      { replace: !exclusive },
+    );
   } finally {
-    await handle.close();
-  }
-  try {
-    if (exclusive) {
-      await fs.link(tmpPath, journalPath);
-    } else {
-      await fs.rename(tmpPath, journalPath);
-    }
-    await syncDirectory(path.dirname(journalPath));
-  } finally {
-    await fs.unlink(tmpPath).catch(() => undefined);
+    await unlinkModelsFile(tmpPath).catch(() => undefined);
   }
 }
 
@@ -265,7 +266,7 @@ async function restoreUnexpectedStagedPath(
     await writeExternalDeleteJournal(journalPath, journal);
     try {
       await movePathNoReplace(stagedPath, restoredPath, identity);
-      await fs.unlink(journalPath).catch(() => undefined);
+      await unlinkModelsFile(journalPath).catch(() => undefined);
       return restoredPath;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -411,7 +412,7 @@ export async function stageImportedExternalModelFile(
   try {
     await fs.rename(record.modelPath, stagedPath);
   } catch (error) {
-    await fs.unlink(journalPath).catch(() => undefined);
+    await unlinkModelsFile(journalPath).catch(() => undefined);
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStage(false);
     throw new ApiError({
       status: 503,
@@ -437,7 +438,7 @@ export async function stageImportedExternalModelFile(
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      await fs.unlink(journalPath).catch(() => undefined);
+      await unlinkModelsFile(journalPath).catch(() => undefined);
       return emptyStage(false);
     }
     throw new ApiError({
@@ -491,7 +492,7 @@ export async function rollbackImportedExternalModelFile(
 export async function finishImportedExternalModelRollback(
   stage: StagedExternalModelFile,
 ): Promise<void> {
-  if (stage.journalPath) await fs.unlink(stage.journalPath).catch(() => undefined);
+  if (stage.journalPath) await unlinkModelsFile(stage.journalPath).catch(() => undefined);
 }
 
 export async function commitImportedExternalModelFile(
@@ -508,7 +509,7 @@ export async function commitImportedExternalModelFile(
   // the exact file staged earlier. A replacement at the staging name is user
   // data: preserve it and leave the journal actionable for startup recovery.
   await nativeUnlinkExternalIdentity(stage.stagedPath, stage.expectedIdentity);
-  await fs.unlink(stage.journalPath).catch(() => undefined);
+  await unlinkModelsFile(stage.journalPath).catch(() => undefined);
   return 1;
 }
 
@@ -709,7 +710,7 @@ export async function reconcileExternalModelDeleteJournals(): Promise<void> {
   }
 
   if (registryChanged) await writeImportedModels(records);
-  await Promise.all(completed.map((journalPath) => fs.unlink(journalPath).catch(() => undefined)));
+  await Promise.all(completed.map((journalPath) => unlinkModelsFile(journalPath).catch(() => undefined)));
   });
 }
 
@@ -955,20 +956,22 @@ async function writeImportedModels(records: ImportedModelRecord[]): Promise<void
     await __importedModelRegistryTestHooks.beforeWrite();
   }
   const registryPath = importedModelsRegistryPath();
-  await fs.mkdir(path.dirname(registryPath), { recursive: true });
   const tmpPath = `${registryPath}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    const handle = await fs.open(tmpPath, "wx");
-    try {
-      await handle.writeFile(JSON.stringify(records, null, 2), "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fs.rename(tmpPath, registryPath);
-    await syncDirectory(path.dirname(registryPath));
+    await nativeProfileWrite(
+      "models",
+      modelsRelative(tmpPath),
+      Buffer.from(JSON.stringify(records, null, 2), "utf8"),
+      { replace: false },
+    );
+    await nativeProfileRename(
+      "models",
+      modelsRelative(tmpPath),
+      modelsRelative(registryPath),
+      { replace: true },
+    );
   } finally {
-    await fs.unlink(tmpPath).catch(() => undefined);
+    await unlinkModelsFile(tmpPath).catch(() => undefined);
   }
 }
 
