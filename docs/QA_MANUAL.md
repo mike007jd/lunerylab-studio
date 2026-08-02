@@ -16,8 +16,8 @@ Human desktop QA cases. Run in Tauri.
 | Layout / i18n / a11y | QA-001–003 + C-UX |
 | Package / release | QA-001–005 + C-PKG or C-REL + affected cases |
 
-macOS Apple Silicon is primary; add Windows when affected. Paid/BYOK calls need
-owner approval.
+macOS Apple Silicon is the supported release target. Paid/BYOK calls need owner
+approval.
 
 ## Prepare safely
 
@@ -135,8 +135,8 @@ not release proof. Ev: identity, build evidence, smoke.
 
 **C-REL Published artifact (P0)** — Pre: disposable OS user; download/checksum
 verified per Operations. Act: install/launch normally; QA-001–005.
-Pass: version/checksum match; macOS Gatekeeper/notarization passes; Windows shows
-valid signing when present or documented unsigned warning. Ev: trust/smoke.
+Pass: version/checksum match and macOS Gatekeeper/notarization passes. Ev:
+trust/smoke.
 
 ## Maintainer gates
 

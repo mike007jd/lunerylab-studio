@@ -25,7 +25,7 @@
 ### Environment
 
 - App version:
-- OS: [macOS or Windows, including version]
+- OS: [macOS version; note if testing an unsupported development platform]
 - Hardware: [chip/CPU, memory, GPU if relevant]
 - Runtime or model source:
 - Development only: [Node.js and pnpm versions]

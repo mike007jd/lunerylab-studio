@@ -1,8 +1,8 @@
 name: desktop-release
 
-# Build the two launch installers, then publish a single GitHub Release.
-# CUDA/Vulkan-specific Windows installers are intentionally deferred until their
-# release builds are stable; the launch Windows installer runs on CPU.
+# Build the supported macOS installer, then publish a single GitHub Release.
+# Windows packaging stays disabled until every profile mutation and local-engine
+# path has a reparse-point-safe implementation and Windows acceptance coverage.
 #
 # Build / release are split on purpose:
 #   - `build` (matrix) compiles + bundles each variant and stages it under a
@@ -73,13 +73,6 @@ jobs:
             asset: Lunery-Lab-Studio-macOS-arm64.dmg
             bundleDir: my-app/src-tauri/target/release/bundle/dmg
             bundlePattern: "*.dmg"
-          - os: windows-latest
-            runner: windows-latest
-            accel: cpu
-            label: windows-x64-cpu
-            asset: Lunery-Lab-Studio-Windows-x64.exe
-            bundleDir: my-app/src-tauri/target/release/bundle/nsis
-            bundlePattern: "*-setup.exe"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -121,9 +114,7 @@ jobs:
         # workflow_dispatch, so a manual run is a full signed + notarized
         # rehearsal of the release build without publishing anything. macOS
         # must NOT ship unsigned: Gatekeeper blocks unsigned apps outright, so
-        # missing Apple secrets fail the build. Windows Authenticode is optional
-        # at launch — with no certificate the installer is left unsigned
-        # (SmartScreen warning) instead of failing.
+        # missing Apple secrets fail the build.
         id: signing
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         shell: bash
@@ -134,23 +125,19 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           SIGNING_CREDENTIAL_OWNER: ${{ vars.SIGNING_CREDENTIAL_OWNER }}
           NOTARIZATION_CREDENTIAL_ROTATED_AT: ${{ vars.NOTARIZATION_CREDENTIAL_ROTATED_AT }}
-          WINDOWS_EXPECTED_PUBLISHER: ${{ vars.WINDOWS_EXPECTED_PUBLISHER }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
-            missing=()
-            for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD SIGNING_CREDENTIAL_OWNER NOTARIZATION_CREDENTIAL_ROTATED_AT; do
-              [ -n "${!name:-}" ] || missing+=("$name")
-            done
-            if [ ${#missing[@]} -ne 0 ]; then
-              echo "::error::Refusing to publish an unsigned ${{ matrix.label }} installer. Missing secrets: ${missing[*]}"
-              exit 1
-            fi
-            node <<'NODE'
+          missing=()
+          for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD SIGNING_CREDENTIAL_OWNER NOTARIZATION_CREDENTIAL_ROTATED_AT; do
+            [ -n "${!name:-}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Refusing to publish an unsigned ${{ matrix.label }} installer. Missing secrets: ${missing[*]}"
+            exit 1
+          fi
+          node <<'NODE'
           const raw = process.env.NOTARIZATION_CREDENTIAL_ROTATED_AT;
           const rotatedAt = new Date(`${raw}T00:00:00Z`);
           const ageDays = (Date.now() - rotatedAt.getTime()) / 86_400_000;
@@ -158,16 +145,7 @@ jobs:
             throw new Error("NOTARIZATION_CREDENTIAL_ROTATED_AT must be a valid YYYY-MM-DD date within the last 180 days.");
           }
           NODE
-            echo "Signing secrets present for ${{ matrix.label }}."
-          else
-            if [ -n "${WINDOWS_CERTIFICATE:-}" ] && [ -n "${WINDOWS_CERTIFICATE_PASSWORD:-}" ] && [ -n "${WINDOWS_EXPECTED_PUBLISHER:-}" ]; then
-              echo "sign_windows=true" >> "$GITHUB_OUTPUT"
-              echo "Windows signing certificate present; installer will be Authenticode-signed."
-            else
-              echo "sign_windows=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::No Windows signing certificate configured; publishing an unsigned Windows installer."
-            fi
-          fi
+          echo "Signing secrets present for ${{ matrix.label }}."
 
       - name: Import Apple Developer certificate into a temporary keychain
         # Hosted runners have no signing identity in the keychain; import the
@@ -231,52 +209,8 @@ jobs:
           xcrun stapler validate "$dmg"
           hdiutil verify "$dmg"
 
-      - name: Sign Windows installer (Authenticode) + verify
-        if: matrix.os == 'windows-latest' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && steps.signing.outputs.sign_windows == 'true'
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_EXPECTED_PUBLISHER: ${{ vars.WINDOWS_EXPECTED_PUBLISHER }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $exe = Get-ChildItem -Path "my-app/src-tauri/target/release/bundle/nsis" -Filter *-setup.exe |
-            Select-Object -First 1
-          if (-not $exe) { throw "No NSIS installer found to sign." }
-
-          # Decode the base64 PFX secret to a temp file.
-          $pfx = Join-Path $env:RUNNER_TEMP "code-sign.pfx"
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-
-          # Resolve signtool.exe from the installed Windows SDK.
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $signtool) { throw "signtool.exe not found in the Windows SDK." }
-
-          try {
-            & $signtool.FullName sign `
-              /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD `
-              /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
-              $exe.FullName
-            if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
-          } finally {
-            if (Test-Path $pfx) { Remove-Item $pfx -Force }
-          }
-
-          $sig = Get-AuthenticodeSignature $exe.FullName
-          if ($sig.Status -ne 'Valid') { throw "Authenticode signature not Valid: $($sig.Status)" }
-          if (-not $sig.TimeStamperCertificate) { throw "Authenticode signature has no RFC-3161 timestamp certificate." }
-          $publisher = $sig.SignerCertificate.Subject
-          if ($publisher -notlike "*$env:WINDOWS_EXPECTED_PUBLISHER*") {
-            throw "Unexpected Authenticode publisher: $publisher"
-          }
-          & $signtool.FullName verify /pa /all /v $exe.FullName
-          if ($LASTEXITCODE -ne 0) { throw "signtool verification failed with exit code $LASTEXITCODE" }
-          Write-Host "Signed $($exe.Name); publisher=$publisher; timestamp=$($sig.TimeStamperCertificate.Subject)"
-
       - name: Stage installer under a stable asset name
-        # bash runs on both macOS and Windows runners (Git Bash); one script
-        # for the whole matrix. Tauri's default filename carries the version +
+        # Tauri's default filename carries the version +
         # arch, which we flatten to a fixed name per variant.
         shell: bash
         run: |
@@ -328,8 +262,6 @@ jobs:
           ## Install
 
           - **macOS (Apple Silicon)** — download the `.dmg`, open it, and drag Lunery Lab Studio to Applications, then launch it normally. The build is signed with an Apple Developer ID and notarized.
-          - **Windows (x64)** — download the `.exe` installer and run it. The launch Windows installer runs on CPU and works everywhere. If SmartScreen warns about an unrecognized app, verify your download against `SHA256SUMS.txt`, then choose "More info → Run anyway".
-
           Verify your download against `SHA256SUMS.txt`.
 
           Local-first and account-less: bring your own local models or provider keys.

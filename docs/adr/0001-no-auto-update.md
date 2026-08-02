@@ -13,8 +13,8 @@ marketing website. The product is:
 
 - Free, Apache-2.0 open-source, no monetization layer.
 - Single-user, **account-less** — no backend identity, no entitlement service.
-- Distributed via GitHub Releases (macOS DMG and Windows NSIS installer built
-  by `.github/workflows/desktop-release.yml`; no Linux build).
+- Distributed via GitHub Releases as a signed and notarized Apple Silicon macOS
+  DMG built by `.github/workflows/desktop-release.yml`.
 
 The code-review identified that the Tauri config does not wire
 `tauri-plugin-updater`, so the desktop installs do not check for or fetch new
@@ -45,8 +45,8 @@ versions on their own.
   published build. No build-time tag rendering is involved.
 - "Check for updates" is not surfaced in-app; the About panel links to the
   Releases page in the user's browser.
-- No update server, no signing key beyond the existing macOS notarization +
-  Windows code-signing cert, no per-release manifest publishing step.
+- No update server, no signing key beyond the existing macOS notarization
+  credentials, no per-release manifest publishing step.
 
 ## Decision
 

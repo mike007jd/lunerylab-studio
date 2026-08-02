@@ -25,8 +25,7 @@ Studio running with the fewest steps.
 | Node.js | `>=22.23.1` (CI uses `22.23.1`) |
 | pnpm | `>=10` (repo pins `pnpm@10.15.1` via `packageManager`) |
 | Rust | Stable toolchain (`rustup`), needed for Tauri |
-| macOS | Xcode Command Line Tools; Apple Silicon is the primary desktop target |
-| Windows | MSVC build tools + WebView2; x64 target |
+| macOS | Xcode Command Line Tools; Apple Silicon is the supported release target |
 
 Optional but useful: `pnpm desktop:info` (Tauri doctor) after install.
 
