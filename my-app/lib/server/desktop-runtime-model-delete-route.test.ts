@@ -19,6 +19,12 @@ import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model
 vi.mock("server-only", () => ({}));
 
 const mocks = vi.hoisted(() => ({
+  BridgeDownloadJobsError: class BridgeDownloadJobsError extends Error {
+    readonly retryable = true;
+    constructor(readonly code: string, message: string) {
+      super(message);
+    }
+  },
   isDesktopRuntime: vi.fn(),
   findHfModelEntry: vi.fn(),
   bridgeFetch: vi.fn(),
@@ -52,6 +58,7 @@ vi.mock("@/lib/hf-model-catalog", () => ({
 }));
 
 vi.mock("@/lib/server/desktop-bridge", () => ({
+  BridgeDownloadJobsError: mocks.BridgeDownloadJobsError,
   bridgeFetch: mocks.bridgeFetch,
   getBridgeDownloadJobs: mocks.getBridgeDownloadJobs,
   requireDesktopBridge: mocks.requireDesktopBridge,
@@ -635,6 +642,30 @@ describe("/api/desktop-runtime/models/[modelId]", () => {
     });
     expect(mocks.stageManagedModelFiles).not.toHaveBeenCalled();
   }, 10_000);
+
+  it("fails closed when listing active downloads reaches its hard deadline", async () => {
+    const modelId = "imported-llama-cpp-list-timeout-12345678";
+    mocks.findImportedModel.mockResolvedValue({
+      id: modelId,
+      source: "huggingface-url",
+      runtimeTarget: "llama-cpp",
+      modelPath: "/profile/models/llama-cpp/imported/download.gguf",
+      jobId: "job-unknown",
+      status: "downloading",
+    });
+    mocks.getBridgeDownloadJobs.mockRejectedValue(
+      new mocks.BridgeDownloadJobsError("bridge_timeout", "listing timed out"),
+    );
+
+    const response = await request(modelId);
+
+    expect(response.status).toBe(504);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "bridge_timeout",
+      retryable: true,
+    });
+    expect(mocks.removeManagedModelFiles).not.toHaveBeenCalled();
+  });
 
   it("stops an active SD model before removing its cache", async () => {
     const modelId = "imported-sd-cpp-demo-12345678";

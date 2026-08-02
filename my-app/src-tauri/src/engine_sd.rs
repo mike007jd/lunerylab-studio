@@ -12,6 +12,137 @@ use crate::download::canonical_models_roots;
 use crate::residency_global;
 use crate::sd_cpp_resident::SdCppResident;
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdOutputIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct PinnedSdOutput {
+    parent: std::fs::File,
+    name: std::ffi::OsString,
+    file: std::fs::File,
+    identity: SdOutputIdentity,
+}
+
+#[cfg(unix)]
+impl PinnedSdOutput {
+    fn pin(argv: &[String]) -> Result<Self, String> {
+        use rustix::fs::{open, openat, Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+
+        let path = sd_output_path_from_argv(argv)?;
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| "SD output must include a parent directory".to_string())?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| "SD output must point to a file".to_string())?
+            .to_os_string();
+        let parent = std::fs::File::from(
+            open(
+                parent_path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| format!("Could not pin SD output directory: {error}"))?,
+        );
+        let metadata = parent
+            .metadata()
+            .map_err(|error| format!("Could not inspect SD output directory: {error}"))?;
+        if metadata.mode() & 0o777 != 0o700 || metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err("SD output directory must be private and owned by this user".to_string());
+        }
+        let file = std::fs::File::from(
+            openat(
+                &parent,
+                &name,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|error| format!("Could not reserve SD output safely: {error}"))?,
+        );
+        let file_metadata = file
+            .metadata()
+            .map_err(|error| format!("Could not inspect SD output file: {error}"))?;
+        if !file_metadata.file_type().is_file() {
+            return Err("SD output is not a regular file".to_string());
+        }
+        let identity = SdOutputIdentity {
+            device: file_metadata.dev(),
+            inode: file_metadata.ino(),
+        };
+        rustix::fs::fchmod(&parent, Mode::from_raw_mode(0o500))
+            .map_err(|error| format!("Could not seal SD output directory: {error}"))?;
+        Ok(Self {
+            parent,
+            name,
+            file,
+            identity,
+        })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        use rustix::fs::{openat, Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+
+        let current = std::fs::File::from(
+            openat(
+                &self.parent,
+                &self.name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| format!("Could not verify SD output file: {error}"))?,
+        );
+        let metadata = current
+            .metadata()
+            .map_err(|error| format!("Could not inspect SD output file: {error}"))?;
+        let current_identity = SdOutputIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        if current_identity != self.identity {
+            return Err("SD output file was replaced during generation".to_string());
+        }
+        self.file
+            .metadata()
+            .map_err(|error| format!("Pinned SD output became unavailable: {error}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PinnedSdOutput {
+    fn drop(&mut self) {
+        let _ = rustix::fs::fchmod(&self.parent, rustix::fs::Mode::from_raw_mode(0o700));
+    }
+}
+
+#[cfg(not(unix))]
+struct PinnedSdOutput;
+
+#[cfg(not(unix))]
+impl PinnedSdOutput {
+    fn pin(_argv: &[String]) -> Result<Self, String> {
+        Err(
+            "Local SD generation is unavailable until reparse-safe output handling is enabled"
+                .to_string(),
+        )
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        Err(
+            "Local SD generation is unavailable until reparse-safe output handling is enabled"
+                .to_string(),
+        )
+    }
+}
+
 static SD_INFLIGHT_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 pub(crate) fn sd_inflight_child() -> &'static Mutex<Option<Child>> {
     SD_INFLIGHT_CHILD.get_or_init(|| Mutex::new(None))
@@ -813,6 +944,16 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
             total_images,
             SdProgressPhase::Preparing,
         );
+        let pinned_output = match PinnedSdOutput::pin(&args) {
+            Ok(output) => output,
+            Err(error) => {
+                results.push(SdRunResult {
+                    ok: false,
+                    error: Some(error),
+                });
+                continue;
+            }
+        };
         let mut cmd = Command::new(&bin);
         cmd.args(&args)
             .stdin(Stdio::null())
@@ -959,19 +1100,25 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
         canceled |= sd_cancel_flag().load(Ordering::SeqCst);
 
         match outcome {
-            Ok(status) if status.success() => {
-                any_success = true;
-                set_sd_image_phase(
-                    &run_id,
-                    current_image,
-                    total_images,
-                    SdProgressPhase::Finalizing,
-                );
-                results.push(SdRunResult {
-                    ok: true,
-                    error: None,
-                });
-            }
+            Ok(status) if status.success() => match pinned_output.verify() {
+                Ok(()) => {
+                    any_success = true;
+                    set_sd_image_phase(
+                        &run_id,
+                        current_image,
+                        total_images,
+                        SdProgressPhase::Finalizing,
+                    );
+                    results.push(SdRunResult {
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(error) => results.push(SdRunResult {
+                    ok: false,
+                    error: Some(error),
+                }),
+            },
             Ok(status) => {
                 let tail = stderr_tail
                     .lock()
@@ -1034,6 +1181,19 @@ fn canonical_sd_output_root() -> Result<PathBuf, String> {
         .map_err(|err| format!("Could not verify temp output root: {err}"))
 }
 
+fn sd_output_path_from_argv(argv: &[String]) -> Result<PathBuf, String> {
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-o" || arg == "--output" {
+            return iter
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "Missing value after output flag".to_string());
+        }
+    }
+    Err("Missing SD output path".to_string())
+}
+
 /// Confirm that `value` (an argv path that follows `-o`/`--output`) resolves
 /// under `root`. The file itself need not exist yet, so we canonicalize its
 /// PARENT and join the file name — same approach as `hf_download_start_inner`'s
@@ -1053,7 +1213,30 @@ fn sd_output_path_allowed(value: &str, root: &Path) -> bool {
     let Ok(parent_canon) = parent.canonicalize() else {
         return false;
     };
-    parent_canon.starts_with(root) && parent_canon.join(file_name).starts_with(root)
+    if parent_canon.parent() != Some(root)
+        || !parent_canon
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("lunery-sd-"))
+        || path.extension().and_then(|extension| extension.to_str()) != Some("png")
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::metadata(&parent_canon) else {
+            return false;
+        };
+        metadata.file_type().is_dir()
+            && metadata.mode() & 0o777 == 0o700
+            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && parent_canon.join(file_name).starts_with(root)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Confirm that `value` (an argv path that follows `-m`/`--model`/
@@ -1170,8 +1353,8 @@ mod tests {
         queue_pending_cancel, release_sd_model_delete_lease, sd_active_model_path, sd_cancel_flag,
         sd_inflight_child, sd_may_spawn, sd_model_id_from_argv, sd_progress_for_run,
         sd_runtime_epoch, sd_spawn_decision, sd_spawn_gate, set_sd_image_phase, set_sd_progress,
-        validate_sd_run_argv, ActiveSdModelGuard, SdProgress, SdProgressParser, SdProgressPhase,
-        SdSpawnDecision,
+        validate_sd_run_argv, ActiveSdModelGuard, PinnedSdOutput, SdProgress, SdProgressParser,
+        SdProgressPhase, SdSpawnDecision,
     };
     use crate::test_global_lock;
     use std::sync::atomic::Ordering;
@@ -1720,7 +1903,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be available")
             .as_nanos();
-        std::env::temp_dir().join(format!("lunerylab-sd-{name}-{nonce}"))
+        std::env::temp_dir().join(format!("lunery-sd-{name}-{nonce}"))
     }
 
     #[test]
@@ -1744,6 +1927,12 @@ mod tests {
         let out_root = unique_test_dir("out");
         std::fs::create_dir_all(root.join("sd-cpp")).expect("create model dir");
         std::fs::create_dir_all(&out_root).expect("create out dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out_root, std::fs::Permissions::from_mode(0o700))
+                .expect("secure output dir");
+        }
         let model = root.join("sd-cpp").join("flux2-dev-Q4_K_M.gguf");
         let vae = root
             .join("sd-cpp")
@@ -1767,7 +1956,9 @@ mod tests {
             output.to_string_lossy().to_string(),
         ];
 
-        let out_root_canon = out_root.canonicalize().expect("canonical out root");
+        let out_root_canon = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
         let root_canon = root.canonicalize().expect("canonical model root");
 
         assert!(validate_sd_run_argv(&argv, &out_root_canon, &[root_canon]).is_ok());
@@ -1782,6 +1973,12 @@ mod tests {
         let outside = unique_test_dir("outside");
         std::fs::create_dir_all(root.join("sd-cpp")).expect("create model dir");
         std::fs::create_dir_all(&out_root).expect("create out dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out_root, std::fs::Permissions::from_mode(0o700))
+                .expect("secure output dir");
+        }
         std::fs::create_dir_all(&outside).expect("create outside dir");
         let model = root.join("sd-cpp").join("flux2-dev-Q4_K_M.gguf");
         let vae = outside.join("full_encoder_small_decoder.safetensors");
@@ -1798,12 +1995,43 @@ mod tests {
             output.to_string_lossy().to_string(),
         ];
 
-        let out_root_canon = out_root.canonicalize().expect("canonical out root");
+        let out_root_canon = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
         let root_canon = root.canonicalize().expect("canonical model root");
 
         assert!(validate_sd_run_argv(&argv, &out_root_canon, &[root_canon]).is_err());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(out_root);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sd_output_pin_rejects_before_spawn_symlink_and_preserves_outside_sentinel() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let output_dir = unique_test_dir("symlink-output");
+        let outside = unique_test_dir("outside-sentinel");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+        std::fs::set_permissions(&output_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure output dir");
+        std::fs::write(&outside, b"outside-sentinel").expect("write sentinel");
+        let output = output_dir.join("image-0.png");
+        symlink(&outside, &output).expect("plant output symlink");
+        let argv = vec!["-o".to_string(), output.to_string_lossy().to_string()];
+
+        let error = PinnedSdOutput::pin(&argv).expect_err("symlink must fail closed");
+        assert!(error.contains("reserve SD output safely"));
+        assert_eq!(
+            std::fs::read(&outside).expect("outside sentinel"),
+            b"outside-sentinel"
+        );
+        assert!(std::fs::symlink_metadata(&output)
+            .expect("output symlink remains")
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(&output_dir).expect("remove output fixture");
+        std::fs::remove_file(&outside).expect("remove sentinel");
     }
 }

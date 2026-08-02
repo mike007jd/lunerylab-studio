@@ -256,6 +256,9 @@ export async function probeHfDownloadOwnership(
   if (!snapshot || typeof snapshot.status !== "string") {
     return { kind: "ambiguous", jobId, error: "Download status payload was incomplete." };
   }
+  if (snapshot.status === "unknown") {
+    return { kind: "missing", jobId };
+  }
   return {
     kind: "observed",
     jobId,

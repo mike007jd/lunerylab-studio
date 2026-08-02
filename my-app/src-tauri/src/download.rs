@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -134,6 +136,13 @@ where
     }
 }
 
+async fn await_managed_file_io<F>(operation: F) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    operation.await
+}
+
 // ---------------------------------------------------------------------------
 // Download state (managed by Tauri + shared with bridge handler)
 // ---------------------------------------------------------------------------
@@ -170,6 +179,7 @@ pub(crate) struct DownloadJob {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DownloadCancelRequest {
     Accepted,
+    Pending,
     NotFound,
     Terminal,
 }
@@ -178,6 +188,7 @@ pub(crate) enum DownloadCancelRequest {
 enum DownloadReservation {
     Created,
     Existing,
+    Canceled,
 }
 
 impl DownloadJob {
@@ -204,11 +215,14 @@ pub struct DownloadState(
     Mutex<HashMap<PathBuf, DestinationDeleteLease>>,
     Mutex<usize>,
     Condvar,
+    Mutex<HashMap<String, Instant>>,
 );
 
 const TERMINAL_HISTORY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_TERMINAL_HISTORY: usize = 128;
 const DESTINATION_DELETE_LEASE_TTL: Duration = Duration::from_secs(60);
+const PENDING_CANCEL_TTL: Duration = Duration::from_secs(2 * 60);
+const MAX_PENDING_CANCELS: usize = 128;
 
 impl DownloadState {
     pub(crate) fn begin_background_task(&self) {
@@ -246,7 +260,27 @@ impl DownloadState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(job) = jobs.get(job_id) else {
-            return DownloadCancelRequest::NotFound;
+            if !is_canonical_uuid(job_id) {
+                return DownloadCancelRequest::NotFound;
+            }
+            let now = Instant::now();
+            let mut pending = self
+                .4
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending
+                .retain(|_, created| now.saturating_duration_since(*created) <= PENDING_CANCEL_TTL);
+            if pending.len() >= MAX_PENDING_CANCELS && !pending.contains_key(job_id) {
+                if let Some(oldest) = pending
+                    .iter()
+                    .min_by_key(|(_, created)| **created)
+                    .map(|(id, _)| id.clone())
+                {
+                    pending.remove(&oldest);
+                }
+            }
+            pending.insert(job_id.to_string(), now);
+            return DownloadCancelRequest::Pending;
         };
         if is_terminal_download_status(&job.status) {
             return DownloadCancelRequest::Terminal;
@@ -328,6 +362,12 @@ impl DownloadState {
             .0
             .lock()
             .map_err(|_| "Download state lock poisoned".to_string())?;
+        let mut pending = self
+            .4
+            .lock()
+            .map_err(|_| "Download pending-cancel lock poisoned".to_string())?;
+        pending.retain(|_, created| now.saturating_duration_since(*created) <= PENDING_CANCEL_TTL);
+        let canceled_before_reservation = pending.remove(job_id).is_some();
         reserve_download_job_for_request(
             &mut jobs,
             job_id,
@@ -336,6 +376,7 @@ impl DownloadState {
             cancel,
             tx,
             deletion_leases.contains_key(&destination),
+            canceled_before_reservation,
         )
     }
 
@@ -426,8 +467,32 @@ struct SecureDownloadTarget {
     destination_name: std::ffi::OsString,
     #[cfg(unix)]
     part_name: std::ffi::OsString,
-    #[cfg(not(unix))]
-    canonical_parent: PathBuf,
+    #[cfg(unix)]
+    part_identity: Mutex<Option<SecureFileIdentity>>,
+    #[cfg(unix)]
+    destination_identity: Mutex<Option<SecureFileIdentity>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SecureFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+static DOWNLOAD_QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+impl SecureFileIdentity {
+    fn from_file(file: &std::fs::File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
 }
 
 impl SecureDownloadTarget {
@@ -482,15 +547,16 @@ impl SecureDownloadTarget {
                 parent: std::fs::File::from(directory),
                 destination_name,
                 part_name,
+                part_identity: Mutex::new(None),
+                destination_identity: Mutex::new(None),
             })
         }
 
         #[cfg(not(unix))]
-        Ok(Self {
-            destination,
-            part_path,
-            canonical_parent: parent_path,
-        })
+        {
+            let _ = (destination, part_path);
+            Err("Secure download mutations are unavailable on this platform".to_string())
+        }
     }
 
     #[cfg(unix)]
@@ -519,27 +585,23 @@ impl SecureDownloadTarget {
         #[cfg(unix)]
         {
             match self.open_at(&self.destination_name, rustix::fs::OFlags::RDONLY) {
-                Ok(file) => Ok(Some(tokio::fs::File::from_std(file))),
+                Ok(file) => {
+                    let identity = SecureFileIdentity::from_file(&file)?;
+                    *self
+                        .destination_identity
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
+                    Ok(Some(tokio::fs::File::from_std(file)))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error),
             }
         }
         #[cfg(not(unix))]
         {
-            self.revalidate_windows_parent()?;
-            if self
-                .destination
-                .symlink_metadata()
-                .map(|metadata| metadata.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                return Err(std::io::Error::other("download destination is a symlink"));
-            }
-            match std::fs::File::open(&self.destination) {
-                Ok(file) => Ok(Some(tokio::fs::File::from_std(file))),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error),
-            }
+            Err(std::io::Error::other(
+                "secure download mutations are unavailable on this platform",
+            ))
         }
     }
 
@@ -554,16 +616,9 @@ impl SecureDownloadTarget {
         }
         #[cfg(not(unix))]
         {
-            self.revalidate_windows_parent()?;
-            match self.part_path.symlink_metadata() {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    Err(std::io::Error::other("download part is a symlink"))
-                }
-                Ok(metadata) if metadata.file_type().is_file() => Ok(metadata.len()),
-                Ok(_) => Err(std::io::Error::other("download part is not a regular file")),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-                Err(error) => Err(error),
-            }
+            Err(std::io::Error::other(
+                "secure download mutations are unavailable on this platform",
+            ))
         }
     }
 
@@ -572,116 +627,145 @@ impl SecureDownloadTarget {
         {
             use rustix::fs::OFlags;
             let flags = if resume {
-                OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND
+                OFlags::RDWR | OFlags::CREATE | OFlags::APPEND
             } else {
-                OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC
+                OFlags::RDWR | OFlags::CREATE | OFlags::TRUNC
             };
-            self.open_at(&self.part_name, flags)
-                .map(tokio::fs::File::from_std)
+            let file = self.open_at(&self.part_name, flags)?;
+            let identity = SecureFileIdentity::from_file(&file)?;
+            *self
+                .part_identity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
+            Ok(tokio::fs::File::from_std(file))
         }
         #[cfg(not(unix))]
         {
-            self.revalidate_windows_parent()?;
-            if self
-                .part_path
-                .symlink_metadata()
-                .map(|metadata| metadata.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                return Err(std::io::Error::other("download part is a symlink"));
-            }
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).write(true);
-            if resume {
-                options.append(true);
-            } else {
-                options.truncate(true);
-            }
-            options.open(&self.part_path).map(tokio::fs::File::from_std)
+            let _ = resume;
+            Err(std::io::Error::other(
+                "secure download mutations are unavailable on this platform",
+            ))
         }
     }
 
     fn open_part_read(&self) -> std::io::Result<tokio::fs::File> {
         #[cfg(unix)]
         {
-            self.open_at(&self.part_name, rustix::fs::OFlags::RDONLY)
-                .map(tokio::fs::File::from_std)
+            let file = self.open_at(&self.part_name, rustix::fs::OFlags::RDONLY)?;
+            let identity = SecureFileIdentity::from_file(&file)?;
+            *self
+                .part_identity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
+            Ok(tokio::fs::File::from_std(file))
         }
         #[cfg(not(unix))]
         {
-            self.revalidate_windows_parent()?;
-            if self
-                .part_path
-                .symlink_metadata()
-                .map(|metadata| metadata.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                return Err(std::io::Error::other("download part is a symlink"));
-            }
-            std::fs::File::open(&self.part_path).map(tokio::fs::File::from_std)
+            Err(std::io::Error::other(
+                "secure download mutations are unavailable on this platform",
+            ))
         }
+    }
+
+    #[cfg(unix)]
+    fn expected_identity(
+        identity: &Mutex<Option<SecureFileIdentity>>,
+        label: &str,
+    ) -> std::io::Result<SecureFileIdentity> {
+        identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "{label} has no pinned file identity; refusing pathname mutation"
+                ))
+            })
+    }
+
+    #[cfg(unix)]
+    fn quarantine_entry(
+        &self,
+        name: &std::ffi::OsStr,
+        identity: &Mutex<Option<SecureFileIdentity>>,
+        label: &str,
+    ) -> std::io::Result<()> {
+        use rustix::fs::{renameat_with, RenameFlags};
+
+        let expected = Self::expected_identity(identity, label)?;
+        let current = match self.open_at(name, rustix::fs::OFlags::RDONLY) {
+            Ok(file) => SecureFileIdentity::from_file(&file)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let sequence = DOWNLOAD_QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut quarantine_name = name.to_os_string();
+        quarantine_name.push(format!(
+            ".lunery-quarantine-{}-{sequence}",
+            std::process::id()
+        ));
+        renameat_with(
+            &self.parent,
+            name,
+            &self.parent,
+            &quarantine_name,
+            RenameFlags::NOREPLACE,
+        )?;
+
+        let quarantined = self.open_at(&quarantine_name, rustix::fs::OFlags::RDONLY)?;
+        let quarantined_identity = SecureFileIdentity::from_file(&quarantined)?;
+        if current != expected || quarantined_identity != expected {
+            return Err(std::io::Error::other(format!(
+                "{label} was replaced during cleanup; the replacement was preserved as {}",
+                quarantine_name.to_string_lossy()
+            )));
+        }
+        Ok(())
     }
 
     fn unlink_part(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            match rustix::fs::unlinkat(&self.parent, &self.part_name, rustix::fs::AtFlags::empty())
-            {
-                Ok(()) => Ok(()),
-                Err(error)
-                    if std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound =>
-                {
-                    Ok(())
-                }
-                Err(error) => Err(error.into()),
-            }
+            self.quarantine_entry(&self.part_name, &self.part_identity, "partial download")
         }
         #[cfg(not(unix))]
         {
-            self.revalidate_windows_parent()?;
-            match std::fs::remove_file(&self.part_path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            }
+            Err(std::io::Error::other(
+                "secure download mutations are unavailable on this platform",
+            ))
         }
     }
 
     fn unlink_destination(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            match rustix::fs::unlinkat(
-                &self.parent,
+            self.quarantine_entry(
                 &self.destination_name,
-                rustix::fs::AtFlags::empty(),
-            ) {
-                Ok(()) => Ok(()),
-                Err(error)
-                    if std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound =>
-                {
-                    Ok(())
-                }
-                Err(error) => Err(error.into()),
-            }
+                &self.destination_identity,
+                "download destination",
+            )
         }
         #[cfg(not(unix))]
         {
-            self.revalidate_windows_parent()?;
-            match std::fs::remove_file(&self.destination) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            }
+            Err(std::io::Error::other(
+                "secure download mutations are unavailable on this platform",
+            ))
         }
     }
 
     fn rename_part_to_destination(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            // Keep a no-follow descriptor open across rename and reject any
-            // destination entry. Both names are resolved relative to the
-            // pinned parent descriptor, never through a mutable path prefix.
-            let _part = self.open_at(&self.part_name, rustix::fs::OFlags::RDONLY)?;
+            use rustix::fs::{renameat_with, RenameFlags};
+
+            // Bind promotion to the exact inode that was written/hashed. A
+            // regular-file replacement is just as unsafe as a symlink swap.
+            let expected = Self::expected_identity(&self.part_identity, "partial download")?;
+            let part = self.open_at(&self.part_name, rustix::fs::OFlags::RDONLY)?;
+            if SecureFileIdentity::from_file(&part)? != expected {
+                return Err(std::io::Error::other(
+                    "partial download was replaced before finalization",
+                ));
+            }
             match self.open_at(&self.destination_name, rustix::fs::OFlags::RDONLY) {
                 Ok(_) => {
                     return Err(std::io::Error::new(
@@ -692,48 +776,32 @@ impl SecureDownloadTarget {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            rustix::fs::renameat(
+            renameat_with(
                 &self.parent,
                 &self.part_name,
                 &self.parent,
                 &self.destination_name,
+                RenameFlags::NOREPLACE,
             )?;
+            let destination = self.open_at(&self.destination_name, rustix::fs::OFlags::RDONLY)?;
+            let destination_identity = SecureFileIdentity::from_file(&destination)?;
+            if destination_identity != expected {
+                return Err(std::io::Error::other(
+                    "download destination was replaced after finalization",
+                ));
+            }
+            *self
+                .destination_identity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(expected);
             Ok(())
         }
         #[cfg(not(unix))]
         {
-            // Windows lacks openat-style directory-relative primitives in the
-            // standard library. Revalidate containment and both final entries
-            // immediately before rename and fail closed on any symlink/change.
-            self.revalidate_windows_parent()?;
-            if self.destination.exists()
-                || self
-                    .part_path
-                    .symlink_metadata()
-                    .map(|metadata| metadata.file_type().is_symlink())
-                    .unwrap_or(true)
-            {
-                return Err(std::io::Error::other(
-                    "download target changed during transfer",
-                ));
-            }
-            std::fs::rename(&self.part_path, &self.destination)
+            Err(std::io::Error::other(
+                "secure download mutations are unavailable on this platform",
+            ))
         }
-    }
-
-    #[cfg(not(unix))]
-    fn revalidate_windows_parent(&self) -> std::io::Result<()> {
-        let current = self
-            .destination
-            .parent()
-            .ok_or_else(|| std::io::Error::other("download destination has no parent"))?
-            .canonicalize()?;
-        if current != self.canonical_parent {
-            return Err(std::io::Error::other(
-                "download parent changed during transfer",
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -747,9 +815,21 @@ pub(crate) fn hf_download_start_inner(
     job_id: String,
     state: Arc<DownloadState>,
 ) -> Result<(), String> {
+    hf_download_start_inner_for_platform(url, dest, sha256, job_id, state, cfg!(windows))
+}
+
+fn hf_download_start_inner_for_platform(
+    url: String,
+    dest: String,
+    sha256: Option<String>,
+    job_id: String,
+    state: Arc<DownloadState>,
+    is_windows: bool,
+) -> Result<(), String> {
     if !is_canonical_uuid(&job_id) {
         return Err("Invalid job_id".to_string());
     }
+    ensure_secure_download_mutation_platform(is_windows)?;
 
     let request_identity = DownloadRequestIdentity {
         url: url.clone(),
@@ -804,6 +884,7 @@ pub(crate) fn hf_download_start_inner(
         tx.clone(),
     )? {
         DownloadReservation::Existing => return Ok(()),
+        DownloadReservation::Canceled => return Ok(()),
         DownloadReservation::Created => {}
     }
     state.begin_background_task();
@@ -832,6 +913,16 @@ pub(crate) fn hf_download_start_inner(
         .await;
     });
 
+    Ok(())
+}
+
+fn ensure_secure_download_mutation_platform(is_windows: bool) -> Result<(), String> {
+    if is_windows {
+        return Err(
+            "Hugging Face downloads are unavailable on Windows until reparse-safe file operations are enabled"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -903,7 +994,8 @@ fn reserve_download_job(
     cancel: Arc<DownloadCancel>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
 ) -> Result<(), String> {
-    reserve_download_job_for_request(jobs, job_id, destination, None, cancel, tx, false).map(|_| ())
+    reserve_download_job_for_request(jobs, job_id, destination, None, cancel, tx, false, false)
+        .map(|_| ())
 }
 
 fn reserve_download_job_for_request(
@@ -914,6 +1006,7 @@ fn reserve_download_job_for_request(
     cancel: Arc<DownloadCancel>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
     destination_delete_leased: bool,
+    canceled_before_reservation: bool,
 ) -> Result<DownloadReservation, String> {
     prune_download_history(jobs, Instant::now());
     if let Some(existing) = jobs.get(job_id) {
@@ -922,31 +1015,43 @@ fn reserve_download_job_for_request(
         }
         return Err("Job ID conflicts with a different download request".to_string());
     }
-    if destination_delete_leased {
+    if destination_delete_leased && !canceled_before_reservation {
         return Err("Model file is being deleted".to_string());
     }
-    if jobs
-        .values()
-        .any(|job| job.owns_destination && job.destination == destination)
+    if !canceled_before_reservation
+        && jobs
+            .values()
+            .any(|job| job.owns_destination && job.destination == destination)
     {
         return Err("Download destination already has an active job".to_string());
+    }
+    if canceled_before_reservation {
+        cancel.request();
     }
     jobs.insert(
         job_id.to_string(),
         DownloadJob {
-            status: "queued".to_string(),
+            status: if canceled_before_reservation {
+                "canceled".to_string()
+            } else {
+                "queued".to_string()
+            },
             received: 0,
             total: 0,
             error: None,
             destination,
-            owns_destination: true,
-            finished_at: None,
+            owns_destination: !canceled_before_reservation,
+            finished_at: canceled_before_reservation.then(Instant::now),
             request_identity,
             cancel,
             tx,
         },
     );
-    Ok(DownloadReservation::Created)
+    Ok(if canceled_before_reservation {
+        DownloadReservation::Canceled
+    } else {
+        DownloadReservation::Created
+    })
 }
 
 /// Available bytes on the volume holding `path` (longest mount-point match).
@@ -1626,7 +1731,7 @@ async fn run_download_task(task: DownloadTask) {
 
     loop {
         if cancel.is_canceled() {
-            if let Err(err) = file.flush().await {
+            if let Err(err) = await_managed_file_io(file.flush()).await {
                 let primary = format!("Could not preserve canceled partial download: {err}");
                 drop(file);
                 let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
@@ -1641,7 +1746,7 @@ async fn run_download_task(task: DownloadTask) {
         let next = race_cancel_timeout(&cancel, timeouts.read_idle, stream.next()).await;
         match next {
             WaitOutcome::Canceled => {
-                if let Err(err) = file.flush().await {
+                if let Err(err) = await_managed_file_io(file.flush()).await {
                     let primary = format!("Could not preserve canceled partial download: {err}");
                     drop(file);
                     let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
@@ -1652,7 +1757,7 @@ async fn run_download_task(task: DownloadTask) {
                 return;
             }
             WaitOutcome::TimedOut => {
-                if let Err(flush_err) = file.flush().await {
+                if let Err(flush_err) = await_managed_file_io(file.flush()).await {
                     let primary = format!(
                         "Read idle timeout. Partial download could not be preserved: {flush_err}"
                     );
@@ -1690,7 +1795,7 @@ async fn run_download_task(task: DownloadTask) {
                 }
             }
             WaitOutcome::Ready(Some(Err(ref err))) => {
-                if let Err(flush_err) = file.flush().await {
+                if let Err(flush_err) = await_managed_file_io(file.flush()).await {
                     let primary = format!(
                         "Stream error: {err}. Partial download could not be preserved: {flush_err}"
                     );
@@ -1716,31 +1821,25 @@ async fn run_download_task(task: DownloadTask) {
         }
     }
 
-    // Final flush is itself cancel/timeout-raced: a stalling flush must not
-    // ignore cancellation or hang past the read-idle budget.
-    match race_cancel_timeout(&cancel, timeouts.read_idle, file.flush()).await {
-        WaitOutcome::Canceled => {
-            drop(file);
-            mark_download_canceled(&state, &job_id, &tx, received, total).await;
-            return;
-        }
-        WaitOutcome::TimedOut => {
-            drop(file);
-            let primary = "Timed out flushing download to disk.";
-            let message = cleanup_failed_part(&secure_target, primary, "Part file").await;
-            set_job_error(&state, &job_id, &tx, &message);
-            return;
-        }
-        WaitOutcome::Ready(Err(err)) => {
+    // File-system flush is not reliably cancelable in-process. Keep it owned
+    // by the registered task until the syscall really completes; shutdown is
+    // fully drained rather than reporting a false hard deadline.
+    match await_managed_file_io(file.flush()).await {
+        Err(err) => {
             let primary = format!("Flush error: {err}");
             drop(file);
             let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
             set_job_error(&state, &job_id, &tx, &message);
             return;
         }
-        WaitOutcome::Ready(Ok(())) => {
+        Ok(()) => {
             drop(file);
         }
+    }
+
+    if cancel.is_canceled() {
+        mark_download_canceled(&state, &job_id, &tx, received, total).await;
+        return;
     }
 
     if matches!(
@@ -2217,14 +2316,17 @@ pub(crate) fn set_job_error(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::SecureFileIdentity;
     use super::{
-        can_commit_download_status, classify_partial_download, cleanup_result_message,
-        compare_download_hashes, fetch_remote_download_metadata, finalize_decision_after_rename,
-        finalize_decision_before_rename, is_canonical_uuid, linked_etag_from_headers,
-        parse_content_range_total, reserve_download_job, run_download_task, sha256_file_from_disk,
-        sha256_reader_cancellable, update_job_status, validate_hf_download_dest,
-        AuxiliaryHeadError, DownloadCancel, DownloadCancelRequest, DownloadJob,
-        DownloadRequestIdentity, DownloadReservation, DownloadState, DownloadTask,
+        await_managed_file_io, can_commit_download_status, classify_partial_download,
+        cleanup_result_message, compare_download_hashes, ensure_secure_download_mutation_platform,
+        fetch_remote_download_metadata, finalize_decision_after_rename,
+        finalize_decision_before_rename, hf_download_start_inner_for_platform, is_canonical_uuid,
+        linked_etag_from_headers, parse_content_range_total, reserve_download_job,
+        run_download_task, sha256_file_from_disk, sha256_reader_cancellable, update_job_status,
+        validate_hf_download_dest, AuxiliaryHeadError, DownloadCancel, DownloadCancelRequest,
+        DownloadJob, DownloadRequestIdentity, DownloadReservation, DownloadState, DownloadTask,
         DownloadTimeouts, FinalizeDecision, HashReadTestHook, PartialDownloadState,
         SecureDownloadTarget, MAX_TERMINAL_HISTORY,
     };
@@ -2427,6 +2529,99 @@ mod tests {
         std::fs::remove_file(&outside).expect("remove outside sentinel");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn finalization_rejects_regular_file_substitution_after_hash_open() {
+        use std::io::Write;
+
+        let root = unique_test_path("part-regular-swap-root");
+        std::fs::create_dir_all(&root).expect("create model root");
+        let canonical_root = root.canonicalize().expect("canonical model root");
+        let destination = canonical_root.join("model.gguf");
+        let target = SecureDownloadTarget::pin_in_root(canonical_root, destination.clone())
+            .expect("pin destination");
+        let part_path = root.join("model.gguf.part");
+
+        let mut original = target
+            .open_at(
+                &target.part_name,
+                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::TRUNC,
+            )
+            .expect("open original part");
+        original.write_all(b"verified-a").expect("write original");
+        let identity = SecureFileIdentity::from_file(&original).expect("original identity");
+        *target.part_identity.lock().expect("identity lock") = Some(identity);
+        drop(original);
+
+        let displaced = root.join("displaced-a");
+        std::fs::rename(&part_path, &displaced).expect("displace original part");
+        std::fs::write(&part_path, b"replacement-b").expect("plant regular replacement");
+
+        let error = target
+            .rename_part_to_destination()
+            .expect_err("replacement must not be promoted");
+        assert!(error.to_string().contains("replaced"));
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read(&part_path).expect("replacement preserved"),
+            b"replacement-b"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("original preserved"),
+            b"verified-a"
+        );
+        std::fs::remove_dir_all(&root).expect("remove model fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_quarantines_but_never_deletes_a_regular_file_replacement() {
+        use std::io::Write;
+
+        let root = unique_test_path("cleanup-regular-swap-root");
+        std::fs::create_dir_all(&root).expect("create model root");
+        let canonical_root = root.canonicalize().expect("canonical model root");
+        let target = SecureDownloadTarget::pin_in_root(
+            canonical_root.clone(),
+            canonical_root.join("model.gguf"),
+        )
+        .expect("pin destination");
+        let part_path = root.join("model.gguf.part");
+
+        let mut original = target
+            .open_at(
+                &target.part_name,
+                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::TRUNC,
+            )
+            .expect("open original part");
+        original.write_all(b"verified-a").expect("write original");
+        let identity = SecureFileIdentity::from_file(&original).expect("original identity");
+        *target.part_identity.lock().expect("identity lock") = Some(identity);
+        drop(original);
+
+        std::fs::remove_file(&part_path).expect("remove original name");
+        std::fs::write(&part_path, b"replacement-b").expect("plant regular replacement");
+        let error = target
+            .unlink_part()
+            .expect_err("replacement must be reported and preserved");
+        assert!(error.to_string().contains("preserved"));
+        let quarantined = std::fs::read_dir(&root)
+            .expect("list model root")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("lunery-quarantine")
+            })
+            .expect("replacement quarantine");
+        assert_eq!(
+            std::fs::read(quarantined.path()).expect("replacement preserved"),
+            b"replacement-b"
+        );
+        std::fs::remove_dir_all(&root).expect("remove model fixture");
+    }
+
     #[test]
     fn validates_profile_model_cache_destination() {
         let _guard = test_global_lock();
@@ -2551,6 +2746,58 @@ mod tests {
         assert!(!message.contains("Part file removed"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_file_io_remains_registered_until_the_operation_completes() {
+        let state = Arc::new(DownloadState::default());
+        let cancel = Arc::new(DownloadCancel::new());
+        let (tx, _) = tokio::sync::broadcast::channel(2);
+        state
+            .reserve_job(
+                "123e4567-e89b-12d3-a456-426614174002",
+                unique_test_path("managed-flush.gguf"),
+                Arc::clone(&cancel),
+                tx,
+            )
+            .expect("reserve job");
+        state.begin_background_task();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_task = Arc::clone(&release);
+        let state_task = Arc::clone(&state);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = await_managed_file_io(async move {
+                let _ = entered_tx.send(());
+                release_task.notified().await;
+                Ok(())
+            })
+            .await;
+            state_task.finish_background_task();
+            result
+        });
+        entered_rx.await.expect("operation entered");
+
+        state.request_cancel_all_active();
+        assert!(cancel.is_canceled());
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let state_waiter = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || {
+            state_waiter.wait_for_background_tasks();
+            let _ = drained_tx.send(());
+        });
+        assert!(drained_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release.notify_one();
+        task.await
+            .expect("managed task")
+            .expect("managed operation");
+        drained_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown drain completes after operation release");
+        waiter.join().expect("drain waiter");
+        assert_eq!(*state.2.lock().expect("active task count"), 0);
+    }
+
     #[test]
     fn active_destination_is_exclusive_until_every_terminal_state() {
         for terminal in ["ready", "error", "canceled"] {
@@ -2657,12 +2904,69 @@ mod tests {
     }
 
     #[test]
+    fn cancel_before_reservation_is_consumed_as_terminal_without_spawning() {
+        let state = DownloadState::default();
+        let job_id = "123e4567-e89b-12d3-a456-426614174001";
+        let destination = unique_test_path("cancel-before-reserve.gguf");
+        let identity = DownloadRequestIdentity {
+            url: "https://huggingface.co/org/repo/resolve/main/model.gguf".to_string(),
+            dest: destination.to_string_lossy().to_string(),
+            sha256: Some("b".repeat(64)),
+        };
+
+        assert_eq!(
+            state.request_cancel_job(job_id),
+            DownloadCancelRequest::Pending
+        );
+        let (tx, _) = tokio::sync::broadcast::channel(2);
+        assert_eq!(
+            state
+                .reserve_request_job(
+                    job_id,
+                    destination.clone(),
+                    identity,
+                    Arc::new(DownloadCancel::new()),
+                    tx,
+                )
+                .unwrap(),
+            DownloadReservation::Canceled
+        );
+        let jobs = state.0.lock().unwrap();
+        let job = jobs.get(job_id).expect("terminal tombstone job");
+        assert_eq!(job.status, "canceled");
+        assert!(!job.owns_destination);
+        assert!(job.cancel.is_canceled());
+        assert!(!destination.exists());
+        assert_eq!(*state.2.lock().unwrap(), 0);
+        assert!(state.4.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn download_job_id_requires_canonical_uuid_shape() {
         assert!(is_canonical_uuid("123e4567-e89b-12d3-a456-426614174000"));
         assert!(is_canonical_uuid("123E4567-E89B-12D3-A456-426614174000"));
         assert!(!is_canonical_uuid("job-1"));
         assert!(!is_canonical_uuid("123e4567e89b12d3a456426614174000"));
         assert!(!is_canonical_uuid("123e4567-e89b-12d3-a456-42661417400z"));
+    }
+
+    #[test]
+    fn windows_download_mutation_contract_fails_closed() {
+        assert!(ensure_secure_download_mutation_platform(false).is_ok());
+        let state = Arc::new(DownloadState::default());
+        let error = hf_download_start_inner_for_platform(
+            "not-a-url".to_string(),
+            "relative/path.gguf".to_string(),
+            None,
+            "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            Arc::clone(&state),
+            true,
+        )
+        .expect_err("Windows mutation must remain disabled before validation or I/O");
+        assert!(error.contains("unavailable on Windows"));
+        assert!(error.contains("reparse-safe"));
+        assert!(state.0.lock().unwrap().is_empty());
+        assert_eq!(*state.2.lock().unwrap(), 0);
     }
 
     #[test]
@@ -3053,6 +3357,7 @@ mod tests {
             match cancel_result {
                 DownloadCancelRequest::Accepted => assert_eq!(status, "canceled"),
                 DownloadCancelRequest::Terminal => assert_eq!(status, "ready"),
+                DownloadCancelRequest::Pending => panic!("reserved job became pending"),
                 DownloadCancelRequest::NotFound => panic!("reserved job disappeared"),
             }
         }

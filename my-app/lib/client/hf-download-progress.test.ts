@@ -132,6 +132,39 @@ describe("hf-download progress helpers", () => {
     );
   });
 
+  it("maps an exact bridge unknown snapshot to not-found ownership", async () => {
+    const fetcher = vi.fn(async () => jsonResponse({ status: "unknown" }));
+
+    await expect(probeHfDownloadOwnership("job-unknown", fetcher)).resolves.toEqual({
+      kind: "missing",
+      jobId: "job-unknown",
+    });
+  });
+
+  it("retries a lost POST with the exact same id after 200 unknown", async () => {
+    const jobId = "123e4567-e89b-12d3-a456-426614174000";
+    const fetcher = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("response lost"))
+      .mockResolvedValueOnce(jsonResponse({ status: "unknown" }))
+      .mockResolvedValueOnce(jsonResponse({ jobId }));
+
+    await expect(
+      resolveHfDownloadStartOwnership(
+        { modelId: "model-a", jobId },
+        { fetcher },
+      ),
+    ).resolves.toEqual({ kind: "accepted", jobId });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher.mock.calls[0]?.[0]).toBe("/api/desktop-runtime/hf-download");
+    expect(fetcher.mock.calls[1]?.[0]).toBe(
+      `/api/desktop-runtime/hf-download/${jobId}`,
+    );
+    expect(fetcher.mock.calls[2]?.[0]).toBe("/api/desktop-runtime/hf-download");
+    expect(fetcher.mock.calls[0]?.[1]?.body).toBe(fetcher.mock.calls[2]?.[1]?.body);
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toMatchObject({ jobId });
+  });
+
   it("waits through active and transient status reads for server terminal truth", async () => {
     const responses: Array<Response | Error> = [
       new Error("temporary bridge disconnect"),

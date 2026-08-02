@@ -7,6 +7,7 @@ import { EXTERNAL_MODEL_DELETE_CONFIRMATION } from "@/lib/desktop-external-model
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { findHfModelEntry, type HfModelEntry } from "@/lib/hf-model-catalog";
 import {
+  BridgeDownloadJobsError,
   bridgeFetch,
   getBridgeDownloadJobs,
   requireDesktopBridge,
@@ -91,11 +92,14 @@ async function settleActiveDownloadsForPaths(
 ): Promise<void> {
   const destinations = new Set(await Promise.all(modelPaths.map(canonicalModelPath)));
   const matchingActiveJobs = async () => {
-    const jobs = await getBridgeDownloadJobs(bridge);
-    if (!jobs) {
+    let jobs: Awaited<ReturnType<typeof getBridgeDownloadJobs>>;
+    try {
+      jobs = await getBridgeDownloadJobs(bridge);
+    } catch (error) {
+      if (!(error instanceof BridgeDownloadJobsError)) throw error;
       throw new ApiError({
-        status: 503,
-        code: "bridge_unreachable",
+        status: error.code === "bridge_timeout" ? 504 : 503,
+        code: error.code,
         message: "Could not inspect active model downloads.",
         retryable: true,
       });

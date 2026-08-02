@@ -833,13 +833,14 @@ fn handle_bridge_request(
             }
             match serde_json::from_str::<CancelBody>(&body) {
                 Ok(cancel) => match download_state.request_cancel_job(&cancel.job_id) {
-                    DownloadCancelRequest::Accepted => write_http_response(
+                    outcome @ (DownloadCancelRequest::Accepted | DownloadCancelRequest::Pending) => write_http_response(
                         &mut stream,
                         "202 Accepted",
                         &serde_json::json!({
                             "ok": true,
                             "cancelRequested": true,
                             "jobId": cancel.job_id,
+                            "pendingReservation": matches!(outcome, DownloadCancelRequest::Pending),
                         })
                         .to_string(),
                     ),

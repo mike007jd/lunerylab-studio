@@ -40,6 +40,26 @@ export interface BridgeDownloadJob {
   destination: string;
 }
 
+export type BridgeDownloadJobsErrorCode =
+  | "bridge_timeout"
+  | "bridge_aborted"
+  | "bridge_unreachable"
+  | "bridge_rejected"
+  | "invalid_response";
+
+export class BridgeDownloadJobsError extends Error {
+  readonly retryable = true;
+
+  constructor(
+    readonly code: BridgeDownloadJobsErrorCode,
+    message: string,
+    readonly bridgeStatus?: number,
+  ) {
+    super(message);
+    this.name = "BridgeDownloadJobsError";
+  }
+}
+
 /**
  * Shared guard for desktop-runtime API routes.
  *
@@ -363,6 +383,9 @@ export async function probeBridgeDownloadJob(
       cause: new Error("Bridge status payload missing status"),
     };
   }
+  if (body.status === "unknown") {
+    return { outcome: "not_found", jobId };
+  }
   return { outcome: "observed", jobId, status: body.status, body };
 }
 
@@ -383,16 +406,65 @@ export async function getBridgeDownloadStatus(
 
 export async function getBridgeDownloadJobs(
   bridge: DesktopBridge,
-): Promise<BridgeDownloadJob[] | null> {
-  const response = await bridgeFetch(bridge, "/hf-download-list").catch(() => null);
-  if (!response?.ok) return null;
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<BridgeDownloadJob[]> {
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 15_000);
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, timeoutSignal])
+    : timeoutSignal;
+  let response: Response;
+  try {
+    response = await bridgeFetch(bridge, "/hf-download-list", { signal });
+  } catch (error) {
+    if (timeoutSignal.aborted) {
+      throw new BridgeDownloadJobsError(
+        "bridge_timeout",
+        "Desktop runtime bridge timed out while listing downloads.",
+      );
+    }
+    if (options.signal?.aborted) {
+      throw new BridgeDownloadJobsError(
+        "bridge_aborted",
+        "Desktop runtime download listing was aborted.",
+      );
+    }
+    throw new BridgeDownloadJobsError(
+      "bridge_unreachable",
+      error instanceof Error ? error.message : "Desktop runtime bridge is unreachable.",
+    );
+  }
+  if (!response.ok) {
+    throw new BridgeDownloadJobsError(
+      "bridge_rejected",
+      `Desktop runtime rejected the download listing with status ${response.status}.`,
+      response.status,
+    );
+  }
   const payload = await response.json().catch(() => null) as { jobs?: unknown } | null;
-  if (!Array.isArray(payload?.jobs)) return null;
-  return payload.jobs.filter((job): job is BridgeDownloadJob => {
-    if (!job || typeof job !== "object") return false;
+  if (!Array.isArray(payload?.jobs)) {
+    throw new BridgeDownloadJobsError(
+      "invalid_response",
+      "Desktop runtime returned an invalid download listing.",
+    );
+  }
+  const jobs: BridgeDownloadJob[] = [];
+  for (const job of payload.jobs) {
+    if (!job || typeof job !== "object") {
+      throw new BridgeDownloadJobsError(
+        "invalid_response",
+        "Desktop runtime returned an invalid download job.",
+      );
+    }
     const candidate = job as Partial<BridgeDownloadJob>;
-    return typeof candidate.jobId === "string"
-      && typeof candidate.status === "string"
-      && typeof candidate.destination === "string";
-  });
+    if (typeof candidate.jobId !== "string"
+      || typeof candidate.status !== "string"
+      || typeof candidate.destination !== "string") {
+      throw new BridgeDownloadJobsError(
+        "invalid_response",
+        "Desktop runtime returned an invalid download job.",
+      );
+    }
+    jobs.push(candidate as BridgeDownloadJob);
+  }
+  return jobs;
 }

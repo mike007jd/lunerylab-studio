@@ -6,8 +6,10 @@ vi.mock("node:fs", () => ({
   existsSync: vi.fn().mockReturnValue(false),
   promises: {
     access: vi.fn().mockResolvedValue(undefined),
+    chmod: vi.fn().mockResolvedValue(undefined),
+    mkdtemp: vi.fn().mockResolvedValue("/tmp/lunery-sd-private"),
     readFile: vi.fn().mockRejectedValue(new Error("not expected")),
-    unlink: vi.fn().mockResolvedValue(undefined),
+    rm: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
