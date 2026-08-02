@@ -789,6 +789,7 @@ fn handle_bridge_request(
             match serde_json::from_str::<StartBody>(&body) {
                 Ok(start) => {
                     let state = Arc::clone(&download_state);
+                    let job_id = start.job_id.clone();
                     match hf_download_start_inner(
                         start.url,
                         start.dest,
@@ -799,8 +800,11 @@ fn handle_bridge_request(
                         Ok(()) => write_http_response(
                             &mut stream,
                             "200 OK",
-                            &serde_json::json!({ "ok": true }).to_string(),
+                            &serde_json::json!({ "ok": true, "jobId": job_id }).to_string(),
                         ),
+                        Err(err) if err.contains("conflicts with a different") => {
+                            bridge_error(&mut stream, "409 Conflict", &err)
+                        }
                         Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
                     }
                 }
@@ -1317,11 +1321,12 @@ mod tests {
         BRIDGE_MAX_CONTROL, BRIDGE_MAX_LONG,
     };
     use crate::download::{
-        update_job_status, DownloadCancel, DownloadJob, DownloadState, JobSnapshot,
+        auxiliary_head_for_shutdown_test, update_job_status, DownloadCancel, DownloadJob,
+        DownloadState, JobSnapshot,
     };
     use crate::test_global_lock;
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1442,6 +1447,7 @@ mod tests {
                     destination: std::env::temp_dir().join(format!("sse-{i}.gguf")),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel,
                     tx,
                 },
@@ -1618,6 +1624,7 @@ mod tests {
                 destination: std::env::temp_dir().join("blocked-sse.gguf"),
                 owns_destination: true,
                 finished_at: None,
+                request_identity: None,
                 cancel,
                 tx: tx.clone(),
             },
@@ -1678,6 +1685,7 @@ mod tests {
                 destination: std::env::temp_dir().join("background-download.gguf"),
                 owns_destination: true,
                 finished_at: None,
+                request_identity: None,
                 cancel: Arc::clone(&cancel),
                 tx: tx.clone(),
             },
@@ -1718,6 +1726,98 @@ mod tests {
                 .lock()
                 .expect("jobs")
                 .get("background-download")
+                .expect("job")
+                .status,
+            "canceled"
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_a_real_auxiliary_head_that_never_responds() {
+        let _g = test_global_lock();
+        let upstream = TcpListener::bind("127.0.0.1:0").expect("bind stalled HEAD server");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let upstream_thread = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().expect("accept HEAD request");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("upstream timeout");
+            let mut request = [0u8; 4096];
+            let read = socket.read(&mut request).expect("read HEAD request");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("HEAD "));
+            accepted_tx.send(()).expect("signal accepted HEAD");
+            // Never send response headers. Cancellation must drop the request
+            // future and close this socket before the server timeout matters.
+            let _ = socket.read(&mut request);
+        });
+
+        let download_state = Arc::new(DownloadState::default());
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        download_state.begin_background_task();
+        download_state.0.lock().expect("jobs").insert(
+            "auxiliary-head".to_string(),
+            DownloadJob {
+                status: "downloading".to_string(),
+                received: 1,
+                total: 100,
+                error: None,
+                destination: std::env::temp_dir().join("auxiliary-head.gguf"),
+                owns_destination: true,
+                finished_at: None,
+                request_identity: None,
+                cancel: Arc::clone(&cancel),
+                tx: tx.clone(),
+            },
+        );
+        let worker_state = Arc::clone(&download_state);
+        let worker = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let result = runtime.block_on(auxiliary_head_for_shutdown_test(
+                &format!("http://{upstream_addr}/metadata"),
+                &cancel,
+            ));
+            assert!(
+                result
+                    .expect_err("shutdown must cancel HEAD")
+                    .contains("canceled"),
+                "auxiliary request must report cancellation"
+            );
+            update_job_status(
+                &worker_state,
+                "auxiliary-head",
+                &tx,
+                "canceled",
+                1,
+                100,
+                None,
+            );
+            worker_state.finish_background_task();
+        });
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("auxiliary HEAD accepted");
+
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server = start_desktop_bridge(Arc::clone(&download_state), reset).expect("bridge");
+        let started = Instant::now();
+        server.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must wake the real auxiliary HEAD"
+        );
+        worker.join().expect("auxiliary worker");
+        upstream_thread.join().expect("stalled HEAD server");
+        assert_eq!(
+            download_state
+                .0
+                .lock()
+                .expect("jobs")
+                .get("auxiliary-head")
                 .expect("job")
                 .status,
             "canceled"

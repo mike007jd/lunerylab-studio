@@ -97,6 +97,7 @@ struct SdModelState {
 }
 
 static SD_MODEL_STATE: OnceLock<Mutex<SdModelState>> = OnceLock::new();
+const SD_MODEL_DELETE_LEASE_TTL: Duration = Duration::from_secs(60);
 fn sd_model_state() -> &'static Mutex<SdModelState> {
     SD_MODEL_STATE.get_or_init(|| Mutex::new(SdModelState::default()))
 }
@@ -125,11 +126,18 @@ pub(crate) fn acquire_sd_model_delete_lease(
     model_path: &str,
     lease_id: &str,
 ) -> Result<(), String> {
+    acquire_sd_model_delete_lease_at(model_path, lease_id, Instant::now())
+}
+
+fn acquire_sd_model_delete_lease_at(
+    model_path: &str,
+    lease_id: &str,
+    now: Instant,
+) -> Result<(), String> {
     if lease_id.is_empty() || lease_id.len() > 128 {
         return Err("Invalid SD model deletion lease".to_string());
     }
     let model_path = normalize_sd_model_path(model_path);
-    let now = Instant::now();
     let mut state = sd_model_state()
         .lock()
         .map_err(|_| "SD model state lock poisoned".to_string())?;
@@ -145,7 +153,7 @@ pub(crate) fn acquire_sd_model_delete_lease(
         model_path,
         SdModelDeleteLease {
             lease_id: lease_id.to_string(),
-            expires_at: now + Duration::from_secs(60),
+            expires_at: now + SD_MODEL_DELETE_LEASE_TTL,
         },
     );
     Ok(())
@@ -171,8 +179,11 @@ struct ActiveSdModelGuard {
 
 impl ActiveSdModelGuard {
     fn set(path: Option<String>) -> Result<Self, String> {
+        Self::set_at(path, Instant::now())
+    }
+
+    fn set_at(path: Option<String>, now: Instant) -> Result<Self, String> {
         let path = path.map(|value| normalize_sd_model_path(&value));
-        let now = Instant::now();
         let mut state = sd_model_state()
             .lock()
             .map_err(|_| "SD model state lock poisoned".to_string())?;
@@ -453,16 +464,22 @@ pub(crate) fn bridge_stop_sd_if_model_path(expected_model_path: &str) -> bool {
 /// Cancel only the matching run. Unknown run ids are queued briefly because
 /// the cancel request can beat the generate request to the bridge lock.
 pub(crate) fn bridge_cancel_sd(run_id: &str) -> bool {
+    // This is the same gate used by begin and native spawn. Reading progress,
+    // consuming/publishing pending cancel state, and canceling an active run
+    // therefore form one admission critical section.
+    let _gate = match sd_spawn_gate().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    bridge_cancel_sd_under_gate(run_id)
+}
+
+fn bridge_cancel_sd_under_gate(run_id: &str) -> bool {
     let matching_progress = sd_progress_for_run(run_id);
     match matching_progress {
         Some(progress) if progress.phase == SdProgressPhase::Canceled => true,
         Some(progress) if progress.phase.is_terminal() => false,
         Some(_) => {
-            // Same gate as stop/spawn so cancel cannot race a mid-spawn worker.
-            let _gate = match sd_spawn_gate().lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
             let _ = advance_sd_runtime_epoch();
             sd_cancel_flag().store(true, Ordering::SeqCst);
             set_sd_phase(run_id, SdProgressPhase::Canceled);
@@ -651,12 +668,31 @@ fn canceled_run_results(total_images: usize) -> Vec<SdRunResult> {
         .collect()
 }
 
-fn begin_sd_run(run_id: &str, total_images: usize) -> bool {
-    sd_cancel_flag().store(false, Ordering::SeqCst);
+fn begin_sd_run(captured_epoch: u64, run_id: &str, total_images: usize) -> bool {
+    // Stop/reset/cancel and native spawn use this same gate. Revalidate the
+    // captured epoch before clearing a stale cancel bit so a concurrent
+    // teardown can never be erased by a fresh-run reset.
+    let _gate = match sd_spawn_gate().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    begin_sd_run_under_gate(captured_epoch, run_id, total_images)
+}
+
+fn begin_sd_run_under_gate(captured_epoch: u64, run_id: &str, total_images: usize) -> bool {
+    if captured_epoch != sd_runtime_epoch() {
+        return false;
+    }
+    let canceled = take_pending_cancel(run_id);
+    sd_cancel_flag().store(canceled, Ordering::SeqCst);
     let started_at_ms = epoch_ms();
     set_sd_progress(SdProgress {
         run_id: run_id.to_string(),
-        phase: SdProgressPhase::Preparing,
+        phase: if canceled {
+            SdProgressPhase::Canceled
+        } else {
+            SdProgressPhase::Preparing
+        },
         current_image: usize::from(total_images > 0),
         total_images,
         step: None,
@@ -665,12 +701,7 @@ fn begin_sd_run(run_id: &str, total_images: usize) -> bool {
         started_at_ms,
         updated_at_ms: started_at_ms,
     });
-    if !take_pending_cancel(run_id) {
-        return true;
-    }
-    sd_cancel_flag().store(true, Ordering::SeqCst);
-    set_sd_phase(run_id, SdProgressPhase::Canceled);
-    false
+    !canceled
 }
 
 pub(crate) fn valid_sd_run_id(run_id: &str) -> bool {
@@ -713,13 +744,6 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
     let _generate_guard = sd_generate_lock()
         .lock()
         .map_err(|_| "sd generation lock poisoned".to_string())?;
-    if !sd_may_spawn(
-        captured_epoch,
-        sd_runtime_epoch(),
-        sd_cancel_flag().load(Ordering::SeqCst),
-    ) {
-        return Ok(canceled_run_results(total_images));
-    }
     let _active_model = ActiveSdModelGuard::set(
         body.runs
             .first()
@@ -731,7 +755,7 @@ pub(crate) fn bridge_sd_generate(body: SdGenerateBody) -> Result<Vec<SdRunResult
     // batch (not just each image) so a multi-image request can't outrun the
     // caller's overall deadline. The batch cap is the per-image timeout times
     // the image count, hard-capped at 1 h.
-    if !begin_sd_run(&run_id, total_images) {
+    if !begin_sd_run(captured_epoch, &run_id, total_images) {
         return Ok(canceled_run_results(total_images));
     }
     if !sd_may_spawn(captured_epoch, sd_runtime_epoch(), false) {
@@ -1141,17 +1165,17 @@ fn sd_model_path_from_argv(argv: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_sd_model_delete_lease, advance_sd_runtime_epoch, begin_sd_run, bridge_cancel_sd,
-        bridge_stop_sd, bridge_stop_sd_if_model_path, queue_pending_cancel,
-        release_sd_model_delete_lease, sd_active_model_path, sd_cancel_flag, sd_inflight_child,
-        sd_may_spawn, sd_model_id_from_argv, sd_progress_for_run, sd_runtime_epoch,
-        sd_spawn_decision, sd_spawn_gate, set_sd_image_phase, set_sd_progress,
+        acquire_sd_model_delete_lease, acquire_sd_model_delete_lease_at, advance_sd_runtime_epoch,
+        begin_sd_run, bridge_cancel_sd, bridge_stop_sd, bridge_stop_sd_if_model_path,
+        queue_pending_cancel, release_sd_model_delete_lease, sd_active_model_path, sd_cancel_flag,
+        sd_inflight_child, sd_may_spawn, sd_model_id_from_argv, sd_progress_for_run,
+        sd_runtime_epoch, sd_spawn_decision, sd_spawn_gate, set_sd_image_phase, set_sd_progress,
         validate_sd_run_argv, ActiveSdModelGuard, SdProgress, SdProgressParser, SdProgressPhase,
         SdSpawnDecision,
     };
     use crate::test_global_lock;
     use std::sync::atomic::Ordering;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     // bridge_stop_sd must kill + reap the in-flight child and clear the slot.
     #[cfg(unix)]
@@ -1231,6 +1255,29 @@ mod tests {
     }
 
     #[test]
+    fn same_id_renewal_blocks_sd_start_past_original_expiry() {
+        let _g = test_global_lock();
+        let model_path = "/models/renewed-delete.safetensors";
+        let t0 = Instant::now();
+        acquire_sd_model_delete_lease_at(model_path, "renew", t0).expect("initial lease");
+        acquire_sd_model_delete_lease_at(model_path, "renew", t0 + Duration::from_secs(59))
+            .expect("same-id renewal");
+
+        assert!(ActiveSdModelGuard::set_at(
+            Some(model_path.to_string()),
+            t0 + Duration::from_secs(61),
+        )
+        .is_err());
+        assert!(acquire_sd_model_delete_lease_at(
+            model_path,
+            "different-owner",
+            t0 + Duration::from_secs(61),
+        )
+        .is_err());
+        release_sd_model_delete_lease(model_path, "renew");
+    }
+
+    #[test]
     fn parses_chunked_carriage_return_progress_and_both_speed_units() {
         let mut parser = SdProgressParser::default();
 
@@ -1286,22 +1333,148 @@ mod tests {
     #[test]
     fn canceled_batch_cannot_start_and_retry_gets_fresh_state() {
         let _g = test_global_lock();
-        queue_pending_cancel("run-canceled");
+        let captured_epoch = sd_runtime_epoch();
+        {
+            let _gate = sd_spawn_gate().lock().expect("spawn gate");
+            queue_pending_cancel("run-canceled");
+        }
 
-        assert!(!begin_sd_run("run-canceled", 2));
+        assert!(!begin_sd_run(captured_epoch, "run-canceled", 2));
         assert!(sd_cancel_flag().load(Ordering::SeqCst));
         assert_eq!(
             sd_progress_for_run("run-canceled").map(|progress| progress.phase),
             Some(SdProgressPhase::Canceled)
         );
 
-        assert!(begin_sd_run("run-retry", 2));
+        assert!(begin_sd_run(captured_epoch, "run-retry", 2));
         assert!(!sd_cancel_flag().load(Ordering::SeqCst));
         assert!(sd_progress_for_run("run-canceled").is_none());
         assert_eq!(
             sd_progress_for_run("run-retry").map(|progress| progress.phase),
             Some(SdProgressPhase::Preparing)
         );
+    }
+
+    #[test]
+    fn fresh_generation_clears_prior_stop_cancel_without_weakening_epoch() {
+        let _g = test_global_lock();
+        *super::sd_progress_slot().lock().unwrap() = None;
+        super::sd_pending_cancels().lock().unwrap().clear();
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+
+        bridge_stop_sd();
+        let fresh_epoch = sd_runtime_epoch();
+        assert!(sd_cancel_flag().load(Ordering::SeqCst));
+        assert!(begin_sd_run(fresh_epoch, "run-after-stop", 1));
+        assert!(!sd_cancel_flag().load(Ordering::SeqCst));
+        assert_eq!(
+            sd_progress_for_run("run-after-stop").map(|progress| progress.phase),
+            Some(SdProgressPhase::Preparing)
+        );
+
+        // A stop after capture still wins. The stale request may not clear the
+        // new cancel bit or replace the stopped run's terminal progress.
+        bridge_stop_sd();
+        assert!(!begin_sd_run(fresh_epoch, "run-stale-epoch", 1));
+        assert!(sd_cancel_flag().load(Ordering::SeqCst));
+        assert!(sd_progress_for_run("run-stale-epoch").is_none());
+
+        *super::sd_progress_slot().lock().unwrap() = None;
+        super::sd_pending_cancels().lock().unwrap().clear();
+        sd_cancel_flag().store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn pending_cancel_handshake_is_atomic_for_both_gate_orderings() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Barrier};
+
+        fn reset_run_control() {
+            let _gate = sd_spawn_gate().lock().expect("spawn gate");
+            *super::sd_progress_slot().lock().unwrap() = None;
+            super::sd_pending_cancels().lock().unwrap().clear();
+            sd_cancel_flag().store(false, Ordering::SeqCst);
+        }
+
+        let _g = test_global_lock();
+        reset_run_control();
+
+        // Ordering A: cancel owns the gate while progress is absent. Begin is
+        // already attempting admission, but cannot publish until cancel queues
+        // the run id; it must then consume that cancel and refuse the run.
+        {
+            let captured_epoch = sd_runtime_epoch();
+            let cancel_has_gate = Arc::new(Barrier::new(2));
+            let release_cancel = Arc::new(Barrier::new(2));
+            let cancel_has_gate_w = Arc::clone(&cancel_has_gate);
+            let release_cancel_w = Arc::clone(&release_cancel);
+            let cancel = std::thread::spawn(move || {
+                let _gate = sd_spawn_gate().lock().expect("cancel gate");
+                cancel_has_gate_w.wait();
+                release_cancel_w.wait();
+                super::bridge_cancel_sd_under_gate("race-cancel-first")
+            });
+            cancel_has_gate.wait();
+
+            let (attempting_tx, attempting_rx) = mpsc::channel();
+            let begin = std::thread::spawn(move || {
+                attempting_tx.send(()).expect("begin attempt signal");
+                begin_sd_run(captured_epoch, "race-cancel-first", 1)
+            });
+            attempting_rx.recv().expect("begin is attempting admission");
+            release_cancel.wait();
+
+            assert!(cancel.join().expect("cancel thread"));
+            assert!(!begin.join().expect("begin thread"));
+            assert!(sd_cancel_flag().load(Ordering::SeqCst));
+            assert_eq!(
+                sd_progress_for_run("race-cancel-first").map(|progress| progress.phase),
+                Some(SdProgressPhase::Canceled)
+            );
+            assert!(super::sd_pending_cancels().lock().unwrap().is_empty());
+        }
+
+        reset_run_control();
+
+        // Ordering B: begin owns the gate and publishes Preparing before
+        // cancel can inspect state. Cancel must then observe the active run,
+        // revoke its epoch, and commit Canceled instead of enqueueing late.
+        {
+            let captured_epoch = sd_runtime_epoch();
+            let begin_has_gate = Arc::new(Barrier::new(2));
+            let release_begin = Arc::new(Barrier::new(2));
+            let begin_has_gate_w = Arc::clone(&begin_has_gate);
+            let release_begin_w = Arc::clone(&release_begin);
+            let begin = std::thread::spawn(move || {
+                let _gate = sd_spawn_gate().lock().expect("begin gate");
+                begin_has_gate_w.wait();
+                release_begin_w.wait();
+                super::begin_sd_run_under_gate(captured_epoch, "race-begin-first", 1)
+            });
+            begin_has_gate.wait();
+
+            let (attempting_tx, attempting_rx) = mpsc::channel();
+            let cancel = std::thread::spawn(move || {
+                attempting_tx.send(()).expect("cancel attempt signal");
+                bridge_cancel_sd("race-begin-first")
+            });
+            attempting_rx
+                .recv()
+                .expect("cancel is attempting admission");
+            release_begin.wait();
+
+            assert!(begin.join().expect("begin thread"));
+            assert!(cancel.join().expect("cancel thread"));
+            assert!(sd_cancel_flag().load(Ordering::SeqCst));
+            assert_ne!(captured_epoch, sd_runtime_epoch());
+            assert_eq!(
+                sd_progress_for_run("race-begin-first").map(|progress| progress.phase),
+                Some(SdProgressPhase::Canceled)
+            );
+            assert!(super::sd_pending_cancels().lock().unwrap().is_empty());
+        }
+
+        reset_run_control();
     }
 
     #[test]

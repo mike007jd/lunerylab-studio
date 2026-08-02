@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
@@ -146,6 +146,13 @@ pub struct JobSnapshot {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DownloadRequestIdentity {
+    url: String,
+    dest: String,
+    sha256: Option<String>,
+}
+
 pub(crate) struct DownloadJob {
     pub(crate) status: String,
     pub(crate) received: u64,
@@ -154,6 +161,7 @@ pub(crate) struct DownloadJob {
     pub(crate) destination: PathBuf,
     pub(crate) owns_destination: bool,
     pub(crate) finished_at: Option<Instant>,
+    pub(crate) request_identity: Option<DownloadRequestIdentity>,
     pub(crate) cancel: Arc<DownloadCancel>,
     /// Broadcast channel sender — SSE bridge subscribers drain from a receiver.
     pub(crate) tx: tokio::sync::broadcast::Sender<JobSnapshot>,
@@ -164,6 +172,12 @@ pub(crate) enum DownloadCancelRequest {
     Accepted,
     NotFound,
     Terminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownloadReservation {
+    Created,
+    Existing,
 }
 
 impl DownloadJob {
@@ -254,6 +268,7 @@ impl DownloadState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 
+    #[cfg(test)]
     fn reserve_job(
         &self,
         job_id: &str,
@@ -261,20 +276,81 @@ impl DownloadState {
         cancel: Arc<DownloadCancel>,
         tx: tokio::sync::broadcast::Sender<JobSnapshot>,
     ) -> Result<(), String> {
-        let now = Instant::now();
+        self.reserve_job_at(job_id, destination, cancel, tx, Instant::now())
+    }
+
+    #[cfg(test)]
+    fn reserve_job_at(
+        &self,
+        job_id: &str,
+        destination: PathBuf,
+        cancel: Arc<DownloadCancel>,
+        tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.reserve_job_common(job_id, destination, None, cancel, tx, now)
+            .map(|_| ())
+    }
+
+    fn reserve_request_job(
+        &self,
+        job_id: &str,
+        destination: PathBuf,
+        request_identity: DownloadRequestIdentity,
+        cancel: Arc<DownloadCancel>,
+        tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+    ) -> Result<DownloadReservation, String> {
+        self.reserve_job_common(
+            job_id,
+            destination,
+            Some(request_identity),
+            cancel,
+            tx,
+            Instant::now(),
+        )
+    }
+
+    fn reserve_job_common(
+        &self,
+        job_id: &str,
+        destination: PathBuf,
+        request_identity: Option<DownloadRequestIdentity>,
+        cancel: Arc<DownloadCancel>,
+        tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+        now: Instant,
+    ) -> Result<DownloadReservation, String> {
         let mut deletion_leases = self
             .1
             .lock()
             .map_err(|_| "Download deletion lease lock poisoned".to_string())?;
         deletion_leases.retain(|_, lease| lease.expires_at > now);
-        if deletion_leases.contains_key(&destination) {
-            return Err("Model file is being deleted".to_string());
-        }
         let mut jobs = self
             .0
             .lock()
             .map_err(|_| "Download state lock poisoned".to_string())?;
-        reserve_download_job(&mut jobs, job_id, destination, cancel, tx)
+        reserve_download_job_for_request(
+            &mut jobs,
+            job_id,
+            destination.clone(),
+            request_identity,
+            cancel,
+            tx,
+            deletion_leases.contains_key(&destination),
+        )
+    }
+
+    fn existing_request_matches(
+        &self,
+        job_id: &str,
+        request_identity: &DownloadRequestIdentity,
+    ) -> Result<Option<bool>, String> {
+        let jobs = self
+            .0
+            .lock()
+            .map_err(|_| "Download state lock poisoned".to_string())?;
+        Ok(jobs
+            .get(job_id)
+            .map(|job| job.request_identity.as_ref() == Some(request_identity)))
     }
 
     pub(crate) fn acquire_destination_delete_lease(
@@ -282,7 +358,15 @@ impl DownloadState {
         destination: PathBuf,
         lease_id: &str,
     ) -> Result<(), String> {
-        let now = Instant::now();
+        self.acquire_destination_delete_lease_at(destination, lease_id, Instant::now())
+    }
+
+    fn acquire_destination_delete_lease_at(
+        &self,
+        destination: PathBuf,
+        lease_id: &str,
+        now: Instant,
+    ) -> Result<(), String> {
         let mut leases = self
             .1
             .lock()
@@ -333,6 +417,326 @@ pub(crate) fn canonical_download_destination(value: &str) -> Result<PathBuf, Str
     ))
 }
 
+struct SecureDownloadTarget {
+    destination: PathBuf,
+    part_path: PathBuf,
+    #[cfg(unix)]
+    parent: std::fs::File,
+    #[cfg(unix)]
+    destination_name: std::ffi::OsString,
+    #[cfg(unix)]
+    part_name: std::ffi::OsString,
+    #[cfg(not(unix))]
+    canonical_parent: PathBuf,
+}
+
+impl SecureDownloadTarget {
+    fn pin(destination: PathBuf) -> Result<Self, String> {
+        let root = canonical_models_root_for_path(&destination)?;
+        Self::pin_in_root(root, destination)
+    }
+
+    fn pin_in_root(root: PathBuf, destination: PathBuf) -> Result<Self, String> {
+        let parent_path = destination
+            .parent()
+            .ok_or_else(|| "Download destination must include a parent directory".to_string())?
+            .to_path_buf();
+        if !parent_path.starts_with(&root) {
+            return Err("Download destination escapes the model directory".to_string());
+        }
+        let destination_name = destination
+            .file_name()
+            .ok_or_else(|| "Download destination must point to a file".to_string())?
+            .to_os_string();
+        let mut part_name = destination_name.clone();
+        part_name.push(".part");
+        let part_path = parent_path.join(&part_name);
+
+        #[cfg(unix)]
+        {
+            use rustix::fs::{open, openat, Mode, OFlags};
+            let mut directory = open(
+                &root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| format!("Could not pin model root: {error}"))?;
+            let relative_parent = parent_path
+                .strip_prefix(&root)
+                .map_err(|_| "Download destination escapes the model directory".to_string())?;
+            for component in relative_parent.components() {
+                let Component::Normal(name) = component else {
+                    return Err("Download destination contains an unsafe component".to_string());
+                };
+                directory = openat(
+                    &directory,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|error| format!("Could not pin model directory: {error}"))?;
+            }
+            Ok(Self {
+                destination,
+                part_path,
+                parent: std::fs::File::from(directory),
+                destination_name,
+                part_name,
+            })
+        }
+
+        #[cfg(not(unix))]
+        Ok(Self {
+            destination,
+            part_path,
+            canonical_parent: parent_path,
+        })
+    }
+
+    #[cfg(unix)]
+    fn open_at(
+        &self,
+        name: &std::ffi::OsStr,
+        flags: rustix::fs::OFlags,
+    ) -> std::io::Result<std::fs::File> {
+        use rustix::fs::{openat, Mode, OFlags};
+        let descriptor = openat(
+            &self.parent,
+            name,
+            flags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(0o600),
+        )?;
+        let file = std::fs::File::from(descriptor);
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::other(
+                "download target is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn open_destination_read(&self) -> std::io::Result<Option<tokio::fs::File>> {
+        #[cfg(unix)]
+        {
+            match self.open_at(&self.destination_name, rustix::fs::OFlags::RDONLY) {
+                Ok(file) => Ok(Some(tokio::fs::File::from_std(file))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate_windows_parent()?;
+            if self
+                .destination
+                .symlink_metadata()
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(std::io::Error::other("download destination is a symlink"));
+            }
+            match std::fs::File::open(&self.destination) {
+                Ok(file) => Ok(Some(tokio::fs::File::from_std(file))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn part_len(&self) -> std::io::Result<u64> {
+        #[cfg(unix)]
+        {
+            match self.open_at(&self.part_name, rustix::fs::OFlags::RDONLY) {
+                Ok(file) => file.metadata().map(|metadata| metadata.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate_windows_parent()?;
+            match self.part_path.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    Err(std::io::Error::other("download part is a symlink"))
+                }
+                Ok(metadata) if metadata.file_type().is_file() => Ok(metadata.len()),
+                Ok(_) => Err(std::io::Error::other("download part is not a regular file")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn open_part(&self, resume: bool) -> std::io::Result<tokio::fs::File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::OFlags;
+            let flags = if resume {
+                OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND
+            } else {
+                OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC
+            };
+            self.open_at(&self.part_name, flags)
+                .map(tokio::fs::File::from_std)
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate_windows_parent()?;
+            if self
+                .part_path
+                .symlink_metadata()
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(std::io::Error::other("download part is a symlink"));
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).write(true);
+            if resume {
+                options.append(true);
+            } else {
+                options.truncate(true);
+            }
+            options.open(&self.part_path).map(tokio::fs::File::from_std)
+        }
+    }
+
+    fn open_part_read(&self) -> std::io::Result<tokio::fs::File> {
+        #[cfg(unix)]
+        {
+            self.open_at(&self.part_name, rustix::fs::OFlags::RDONLY)
+                .map(tokio::fs::File::from_std)
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate_windows_parent()?;
+            if self
+                .part_path
+                .symlink_metadata()
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(std::io::Error::other("download part is a symlink"));
+            }
+            std::fs::File::open(&self.part_path).map(tokio::fs::File::from_std)
+        }
+    }
+
+    fn unlink_part(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            match rustix::fs::unlinkat(&self.parent, &self.part_name, rustix::fs::AtFlags::empty())
+            {
+                Ok(()) => Ok(()),
+                Err(error)
+                    if std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate_windows_parent()?;
+            match std::fs::remove_file(&self.part_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn unlink_destination(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            match rustix::fs::unlinkat(
+                &self.parent,
+                &self.destination_name,
+                rustix::fs::AtFlags::empty(),
+            ) {
+                Ok(()) => Ok(()),
+                Err(error)
+                    if std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.revalidate_windows_parent()?;
+            match std::fs::remove_file(&self.destination) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn rename_part_to_destination(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            // Keep a no-follow descriptor open across rename and reject any
+            // destination entry. Both names are resolved relative to the
+            // pinned parent descriptor, never through a mutable path prefix.
+            let _part = self.open_at(&self.part_name, rustix::fs::OFlags::RDONLY)?;
+            match self.open_at(&self.destination_name, rustix::fs::OFlags::RDONLY) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "download destination appeared during transfer",
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            rustix::fs::renameat(
+                &self.parent,
+                &self.part_name,
+                &self.parent,
+                &self.destination_name,
+            )?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows lacks openat-style directory-relative primitives in the
+            // standard library. Revalidate containment and both final entries
+            // immediately before rename and fail closed on any symlink/change.
+            self.revalidate_windows_parent()?;
+            if self.destination.exists()
+                || self
+                    .part_path
+                    .symlink_metadata()
+                    .map(|metadata| metadata.file_type().is_symlink())
+                    .unwrap_or(true)
+            {
+                return Err(std::io::Error::other(
+                    "download target changed during transfer",
+                ));
+            }
+            std::fs::rename(&self.part_path, &self.destination)
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn revalidate_windows_parent(&self) -> std::io::Result<()> {
+        let current = self
+            .destination
+            .parent()
+            .ok_or_else(|| std::io::Error::other("download destination has no parent"))?
+            .canonicalize()?;
+        if current != self.canonical_parent {
+            return Err(std::io::Error::other(
+                "download parent changed during transfer",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Synchronous entry point for starting a download job — called from the bridge
 /// handler. Validates state, inserts the job record, then spawns an async task
 /// on Tauri's runtime (no second runtime created).
@@ -343,8 +747,19 @@ pub(crate) fn hf_download_start_inner(
     job_id: String,
     state: Arc<DownloadState>,
 ) -> Result<(), String> {
-    if job_id.is_empty() || job_id.len() > 128 {
+    if !is_canonical_uuid(&job_id) {
         return Err("Invalid job_id".to_string());
+    }
+
+    let request_identity = DownloadRequestIdentity {
+        url: url.clone(),
+        dest: dest.clone(),
+        sha256: sha256.clone(),
+    };
+    match state.existing_request_matches(&job_id, &request_identity)? {
+        Some(true) => return Ok(()),
+        Some(false) => return Err("Job ID conflicts with a different download request".to_string()),
+        None => {}
     }
 
     let url = validate_hf_download_url(&url)?;
@@ -361,8 +776,6 @@ pub(crate) fn hf_download_start_inner(
     {
         return Err("Download destination must not be a symlink".to_string());
     }
-    let dest = dest_path.to_string_lossy().to_string();
-
     // Best-effort disk pre-check before any network traffic. The real check
     // against the model's actual size happens in the streaming task once the
     // Content-Length header arrives (see `run_download_task`).
@@ -374,13 +787,25 @@ pub(crate) fn hf_download_start_inner(
         }
     }
 
-    let destination = canonical_download_destination(&dest)?;
+    let destination = canonical_download_destination(&dest_path.to_string_lossy())?;
+    let secure_target = SecureDownloadTarget::pin(destination.clone())?;
+    let dest = secure_target.destination.to_string_lossy().to_string();
+    let part_path = secure_target.part_path.clone();
 
     // Set up a broadcast channel for SSE progress ticks (capacity 64 frames).
     let (tx, _) = tokio::sync::broadcast::channel::<JobSnapshot>(64);
     let cancel = Arc::new(DownloadCancel::new());
 
-    state.reserve_job(&job_id, destination, Arc::clone(&cancel), tx.clone())?;
+    match state.reserve_request_job(
+        &job_id,
+        destination,
+        request_identity,
+        Arc::clone(&cancel),
+        tx.clone(),
+    )? {
+        DownloadReservation::Existing => return Ok(()),
+        DownloadReservation::Created => {}
+    }
     state.begin_background_task();
 
     let state_clone = Arc::clone(&state);
@@ -400,6 +825,7 @@ pub(crate) fn hf_download_start_inner(
             tx,
             cancel,
             timeouts: DownloadTimeouts::default(),
+            secure_target,
             #[cfg(test)]
             hash_test_hook: None,
         })
@@ -407,6 +833,14 @@ pub(crate) fn hf_download_start_inner(
     });
 
     Ok(())
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 struct DownloadTaskCompletionGuard {
@@ -461,6 +895,7 @@ fn prune_download_history(jobs: &mut HashMap<String, DownloadJob>, now: Instant)
     }
 }
 
+#[cfg(test)]
 fn reserve_download_job(
     jobs: &mut HashMap<String, DownloadJob>,
     job_id: &str,
@@ -468,13 +903,27 @@ fn reserve_download_job(
     cancel: Arc<DownloadCancel>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
 ) -> Result<(), String> {
+    reserve_download_job_for_request(jobs, job_id, destination, None, cancel, tx, false).map(|_| ())
+}
+
+fn reserve_download_job_for_request(
+    jobs: &mut HashMap<String, DownloadJob>,
+    job_id: &str,
+    destination: PathBuf,
+    request_identity: Option<DownloadRequestIdentity>,
+    cancel: Arc<DownloadCancel>,
+    tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+    destination_delete_leased: bool,
+) -> Result<DownloadReservation, String> {
     prune_download_history(jobs, Instant::now());
-    if jobs
-        .get(job_id)
-        .map(|job| job.owns_destination)
-        .unwrap_or(false)
-    {
-        return Err("Job already in progress".to_string());
+    if let Some(existing) = jobs.get(job_id) {
+        if request_identity.is_some() && existing.request_identity == request_identity {
+            return Ok(DownloadReservation::Existing);
+        }
+        return Err("Job ID conflicts with a different download request".to_string());
+    }
+    if destination_delete_leased {
+        return Err("Model file is being deleted".to_string());
     }
     if jobs
         .values()
@@ -492,11 +941,12 @@ fn reserve_download_job(
             destination,
             owns_destination: true,
             finished_at: None,
+            request_identity,
             cancel,
             tx,
         },
     );
-    Ok(())
+    Ok(DownloadReservation::Created)
 }
 
 /// Available bytes on the volume holding `path` (longest mount-point match).
@@ -640,6 +1090,7 @@ struct DownloadTask {
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
     cancel: Arc<DownloadCancel>,
     timeouts: DownloadTimeouts,
+    secure_target: SecureDownloadTarget,
     #[cfg(test)]
     hash_test_hook: Option<Arc<HashReadTestHook>>,
 }
@@ -678,7 +1129,7 @@ async fn mark_download_canceled(
 async fn run_download_task(task: DownloadTask) {
     let DownloadTask {
         url,
-        dest,
+        dest: _dest,
         part_path,
         sha256,
         job_id,
@@ -686,21 +1137,36 @@ async fn run_download_task(task: DownloadTask) {
         tx,
         cancel,
         timeouts,
+        secure_target,
         #[cfg(test)]
         hash_test_hook,
     } = task;
-    let dest_path = PathBuf::from(&dest);
     if cancel.is_canceled() {
         mark_download_canceled(&state, &job_id, &tx, 0, 0).await;
         return;
     }
-    if dest_path.is_file() {
-        let existing_dest_bytes = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let existing_destination = match secure_target.open_destination_read() {
+        Ok(file) => file,
+        Err(error) => {
+            set_job_error(
+                &state,
+                &job_id,
+                &tx,
+                &format!("Could not securely open destination: {error}"),
+            );
+            return;
+        }
+    };
+    if let Some(mut existing_dest_file) = existing_destination {
+        let existing_dest_bytes = existing_dest_file
+            .metadata()
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let linked_etag = if sha256.is_none() {
-            match race_cancel_timeout(&cancel, timeouts.headers, fetch_hf_linked_etag(&url)).await {
-                WaitOutcome::Ready(Ok(value)) => value,
-                WaitOutcome::Ready(Err(_)) => None,
-                WaitOutcome::Canceled => {
+            match fetch_hf_linked_etag(&url, &cancel, timeouts).await {
+                Ok(value) => value,
+                Err(AuxiliaryHeadError::Canceled) => {
                     mark_download_canceled(
                         &state,
                         &job_id,
@@ -711,7 +1177,7 @@ async fn run_download_task(task: DownloadTask) {
                     .await;
                     return;
                 }
-                WaitOutcome::TimedOut => None,
+                Err(AuxiliaryHeadError::Request(_) | AuxiliaryHeadError::TimedOut) => None,
             }
         } else {
             None
@@ -725,8 +1191,8 @@ async fn run_download_task(task: DownloadTask) {
             );
             return;
         }
-        match sha256_file_from_disk_cancellable(
-            &dest_path,
+        match sha256_reader_cancellable(
+            &mut existing_dest_file,
             &cancel,
             timeouts.read_idle,
             #[cfg(test)]
@@ -760,8 +1226,9 @@ async fn run_download_task(task: DownloadTask) {
                         return;
                     }
                     Err(message) => {
-                        let message = cleanup_failed_download(
-                            &dest_path,
+                        drop(existing_dest_file);
+                        let message = cleanup_failed_destination(
+                            &secure_target,
                             &message,
                             "Untrusted destination file",
                         )
@@ -795,10 +1262,17 @@ async fn run_download_task(task: DownloadTask) {
     }
 
     // Determine how many bytes we already have (resume).
-    let existing_bytes = if part_path.exists() {
-        part_path.metadata().map(|m| m.len()).unwrap_or(0)
-    } else {
-        0
+    let existing_bytes = match secure_target.part_len() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            set_job_error(
+                &state,
+                &job_id,
+                &tx,
+                &format!("Could not securely inspect part file: {error}"),
+            );
+            return;
+        }
     };
 
     // Build the HTTP request with optional Range header.
@@ -847,7 +1321,7 @@ async fn run_download_task(task: DownloadTask) {
         let mut linked_etag = linked_etag_from_headers(response.headers());
 
         if remote_total.is_none() || linked_etag.is_none() {
-            match fetch_remote_download_metadata(&client, &url).await {
+            match fetch_remote_download_metadata(&client, &url, &cancel, timeouts).await {
                 Ok(metadata) => {
                     if remote_total.is_none() {
                         remote_total = metadata.total;
@@ -855,6 +1329,10 @@ async fn run_download_task(task: DownloadTask) {
                     if linked_etag.is_none() {
                         linked_etag = metadata.linked_etag;
                     }
+                }
+                Err(AuxiliaryHeadError::Canceled) => {
+                    mark_download_canceled(&state, &job_id, &tx, existing_bytes, 0).await;
+                    return;
                 }
                 Err(err) if remote_total.is_none() => {
                     set_job_error(
@@ -892,8 +1370,8 @@ async fn run_download_task(task: DownloadTask) {
                     );
                     return;
                 }
-                let actual = match sha256_file_from_disk_cancellable(
-                    &part_path,
+                let actual = match sha256_secure_part_cancellable(
+                    &secure_target,
                     &cancel,
                     timeouts.read_idle,
                     #[cfg(test)]
@@ -913,7 +1391,7 @@ async fn run_download_task(task: DownloadTask) {
                     Err(err) => {
                         let primary = format!("Could not verify completed partial download: {err}");
                         let message =
-                            cleanup_failed_download(&part_path, &primary, "Part file").await;
+                            cleanup_failed_part(&secure_target, &primary, "Part file").await;
                         set_job_error(&state, &job_id, &tx, &message);
                         return;
                     }
@@ -926,7 +1404,7 @@ async fn run_download_task(task: DownloadTask) {
                 if let Err(message) =
                     compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref())
                 {
-                    let message = cleanup_failed_download(&part_path, &message, "Part file").await;
+                    let message = cleanup_failed_part(&secure_target, &message, "Part file").await;
                     set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
@@ -938,7 +1416,7 @@ async fn run_download_task(task: DownloadTask) {
                         .await;
                     return;
                 }
-                if let Err(err) = tokio::fs::rename(&part_path, &dest).await {
+                if let Err(err) = secure_target.rename_part_to_destination() {
                     if matches!(
                         finalize_decision_before_rename(cancel.is_canceled()),
                         FinalizeDecision::CancelKeepPart
@@ -983,7 +1461,7 @@ async fn run_download_task(task: DownloadTask) {
                 let primary = format!(
                     "Partial download is larger than the remote file ({existing_bytes} > {remote_total})"
                 );
-                let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
                 set_job_error(&state, &job_id, &tx, &message);
                 return;
             }
@@ -1014,7 +1492,14 @@ async fn run_download_task(task: DownloadTask) {
     // be the file SHA, so only trust x-linked-etag as the live digest source.
     let mut linked_etag = linked_etag_from_headers(response.headers());
     if linked_etag.is_none() && sha256.is_none() {
-        linked_etag = fetch_hf_linked_etag(&url).await.ok().flatten();
+        match fetch_hf_linked_etag(&url, &cancel, timeouts).await {
+            Ok(value) => linked_etag = value,
+            Err(AuxiliaryHeadError::Canceled) => {
+                mark_download_canceled(&state, &job_id, &tx, existing_bytes, 0).await;
+                return;
+            }
+            Err(AuxiliaryHeadError::Request(_) | AuxiliaryHeadError::TimedOut) => {}
+        }
     }
     if sha256.is_none() && linked_etag.is_none() {
         set_job_error(
@@ -1078,12 +1563,7 @@ async fn run_download_task(task: DownloadTask) {
     //   - 206 genuine resume  → append mode, received starts at existing_bytes
     //   - 200 (fresh or Range-ignored) → create+truncate, received starts at 0
     let (mut file, received_start) = if is_resume {
-        let f = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&part_path)
-            .await
-        {
+        let f = match secure_target.open_part(true) {
             Ok(f) => f,
             Err(err) => {
                 set_job_error(
@@ -1099,13 +1579,7 @@ async fn run_download_task(task: DownloadTask) {
     } else {
         // Either a fresh download or the server ignored our Range header and sent 200.
         // Truncate any stale .part so we start clean.
-        let f = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&part_path)
-            .await
-        {
+        let f = match secure_target.open_part(false) {
             Ok(f) => f,
             Err(err) => {
                 set_job_error(
@@ -1155,7 +1629,7 @@ async fn run_download_task(task: DownloadTask) {
             if let Err(err) = file.flush().await {
                 let primary = format!("Could not preserve canceled partial download: {err}");
                 drop(file);
-                let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
                 set_job_error(&state, &job_id, &tx, &message);
                 return;
             }
@@ -1170,7 +1644,7 @@ async fn run_download_task(task: DownloadTask) {
                 if let Err(err) = file.flush().await {
                     let primary = format!("Could not preserve canceled partial download: {err}");
                     drop(file);
-                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
                     set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
@@ -1183,7 +1657,7 @@ async fn run_download_task(task: DownloadTask) {
                         "Read idle timeout. Partial download could not be preserved: {flush_err}"
                     );
                     drop(file);
-                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
                     set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
@@ -1202,7 +1676,7 @@ async fn run_download_task(task: DownloadTask) {
                 if let Err(err) = file.write_all(chunk.as_ref()).await {
                     let primary = format!("Write error: {err}");
                     drop(file);
-                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
                     set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
@@ -1221,7 +1695,7 @@ async fn run_download_task(task: DownloadTask) {
                         "Stream error: {err}. Partial download could not be preserved: {flush_err}"
                     );
                     drop(file);
-                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
                     set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
@@ -1253,14 +1727,14 @@ async fn run_download_task(task: DownloadTask) {
         WaitOutcome::TimedOut => {
             drop(file);
             let primary = "Timed out flushing download to disk.";
-            let message = cleanup_failed_download(&part_path, primary, "Part file").await;
+            let message = cleanup_failed_part(&secure_target, primary, "Part file").await;
             set_job_error(&state, &job_id, &tx, &message);
             return;
         }
         WaitOutcome::Ready(Err(err)) => {
             let primary = format!("Flush error: {err}");
             drop(file);
-            let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+            let message = cleanup_failed_part(&secure_target, &primary, "Part file").await;
             set_job_error(&state, &job_id, &tx, &message);
             return;
         }
@@ -1294,8 +1768,8 @@ async fn run_download_task(task: DownloadTask) {
                     .collect::<String>()
             }
             None => {
-                match sha256_file_from_disk_cancellable(
-                    &part_path,
+                match sha256_secure_part_cancellable(
+                    &secure_target,
                     &cancel,
                     timeouts.read_idle,
                     #[cfg(test)]
@@ -1314,7 +1788,7 @@ async fn run_download_task(task: DownloadTask) {
                     Err(err) => {
                         let primary = format!("Could not verify download integrity: {err}");
                         let message =
-                            cleanup_failed_download(&part_path, &primary, "Part file").await;
+                            cleanup_failed_part(&secure_target, &primary, "Part file").await;
                         set_job_error(&state, &job_id, &tx, &message);
                         return;
                     }
@@ -1331,7 +1805,7 @@ async fn run_download_task(task: DownloadTask) {
         if let Err(message) =
             compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref())
         {
-            let message = cleanup_failed_download(&part_path, &message, "Part file").await;
+            let message = cleanup_failed_part(&secure_target, &message, "Part file").await;
             set_job_error(&state, &job_id, &tx, &message);
             return;
         }
@@ -1349,7 +1823,7 @@ async fn run_download_task(task: DownloadTask) {
     // Rename .part → dest. Once the OS rename begins it cannot be preempted;
     // cancel observed afterwards keeps the verified destination but the job
     // remains canceled and can never transition to ready.
-    if let Err(err) = tokio::fs::rename(&part_path, &dest).await {
+    if let Err(err) = secure_target.rename_part_to_destination() {
         if matches!(
             finalize_decision_before_rename(cancel.is_canceled()),
             FinalizeDecision::CancelKeepPart
@@ -1393,6 +1867,24 @@ async fn sha256_file_from_disk(path: &std::path::Path) -> Result<String, std::io
     .await
 }
 
+async fn sha256_secure_part_cancellable(
+    target: &SecureDownloadTarget,
+    cancel: &DownloadCancel,
+    read_idle: Duration,
+    #[cfg(test)] test_hook: Option<&HashReadTestHook>,
+) -> Result<String, std::io::Error> {
+    let mut file = target.open_part_read()?;
+    sha256_reader_cancellable(
+        &mut file,
+        cancel,
+        read_idle,
+        #[cfg(test)]
+        test_hook,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn sha256_file_from_disk_cancellable(
     path: &std::path::Path,
     cancel: &DownloadCancel,
@@ -1473,6 +1965,23 @@ struct RemoteDownloadMetadata {
     linked_etag: Option<String>,
 }
 
+#[derive(Debug)]
+enum AuxiliaryHeadError {
+    Request(reqwest::Error),
+    Canceled,
+    TimedOut,
+}
+
+impl std::fmt::Display for AuxiliaryHeadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => write!(formatter, "{error}"),
+            Self::Canceled => formatter.write_str("download canceled during metadata request"),
+            Self::TimedOut => formatter.write_str("metadata request timed out"),
+        }
+    }
+}
+
 fn parse_content_range_total(value: &str) -> Option<u64> {
     let (_, total) = value.trim().split_once('/')?;
     let total = total.trim();
@@ -1508,11 +2017,13 @@ fn content_length_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u
 async fn fetch_remote_download_metadata(
     client: &reqwest::Client,
     url: &str,
-) -> Result<RemoteDownloadMetadata, reqwest::Error> {
-    let response = client.head(url).send().await?;
+    cancel: &DownloadCancel,
+    timeouts: DownloadTimeouts,
+) -> Result<RemoteDownloadMetadata, AuxiliaryHeadError> {
+    let response = send_auxiliary_head(client, url, cancel, timeouts.headers).await?;
     let mut linked_etag = linked_etag_from_headers(response.headers());
     if linked_etag.is_none() {
-        linked_etag = fetch_hf_linked_etag(url).await.ok().flatten();
+        linked_etag = fetch_hf_linked_etag(url, cancel, timeouts).await?;
     }
     Ok(RemoteDownloadMetadata {
         total: content_length_from_headers(response.headers()),
@@ -1520,13 +2031,64 @@ async fn fetch_remote_download_metadata(
     })
 }
 
-async fn fetch_hf_linked_etag(url: &str) -> Result<Option<String>, reqwest::Error> {
-    let client = reqwest::Client::builder()
+async fn send_auxiliary_head(
+    client: &reqwest::Client,
+    url: &str,
+    cancel: &DownloadCancel,
+    timeout: Duration,
+) -> Result<reqwest::Response, AuxiliaryHeadError> {
+    match race_cancel_timeout(cancel, timeout, client.head(url).timeout(timeout).send()).await {
+        WaitOutcome::Ready(Ok(response)) => Ok(response),
+        WaitOutcome::Ready(Err(error)) => Err(AuxiliaryHeadError::Request(error)),
+        WaitOutcome::Canceled => Err(AuxiliaryHeadError::Canceled),
+        WaitOutcome::TimedOut => Err(AuxiliaryHeadError::TimedOut),
+    }
+}
+
+fn hf_metadata_client(timeouts: DownloadTimeouts) -> Result<reqwest::Client, reqwest::Error> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if timeouts.connect == DownloadTimeouts::default().connect
+        && timeouts.headers == DownloadTimeouts::default().headers
+    {
+        if let Some(client) = CLIENT.get() {
+            return Ok(client.clone());
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("Lunery Lab Desktop/1.0")
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.headers)
+            .build()?;
+        let _ = CLIENT.set(client);
+        return Ok(CLIENT.get().expect("metadata OnceLock set above").clone());
+    }
+    reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("Lunery Lab Desktop/1.0")
-        .build()?;
-    let response = client.head(url).send().await?;
+        .connect_timeout(timeouts.connect)
+        .timeout(timeouts.headers)
+        .build()
+}
+
+async fn fetch_hf_linked_etag(
+    url: &str,
+    cancel: &DownloadCancel,
+    timeouts: DownloadTimeouts,
+) -> Result<Option<String>, AuxiliaryHeadError> {
+    let client = hf_metadata_client(timeouts).map_err(AuxiliaryHeadError::Request)?;
+    let response = send_auxiliary_head(&client, url, cancel, timeouts.headers).await?;
     Ok(linked_etag_from_headers(response.headers()))
+}
+
+#[cfg(test)]
+pub(crate) async fn auxiliary_head_for_shutdown_test(
+    url: &str,
+    cancel: &DownloadCancel,
+) -> Result<(), String> {
+    fetch_hf_linked_etag(url, cancel, DownloadTimeouts::default())
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn compare_download_hashes(
@@ -1572,8 +2134,16 @@ fn cleanup_result_message(
     }
 }
 
-async fn cleanup_failed_download(path: &Path, primary: &str, label: &str) -> String {
-    cleanup_result_message(primary, label, tokio::fs::remove_file(path).await)
+async fn cleanup_failed_part(target: &SecureDownloadTarget, primary: &str, label: &str) -> String {
+    cleanup_result_message(primary, label, target.unlink_part())
+}
+
+async fn cleanup_failed_destination(
+    target: &SecureDownloadTarget,
+    primary: &str,
+    label: &str,
+) -> String {
+    cleanup_result_message(primary, label, target.unlink_destination())
 }
 
 /// Terminal status transitions are monotonic. Once a job is ready/error/canceled
@@ -1649,12 +2219,14 @@ pub(crate) fn set_job_error(
 mod tests {
     use super::{
         can_commit_download_status, classify_partial_download, cleanup_result_message,
-        compare_download_hashes, finalize_decision_after_rename, finalize_decision_before_rename,
-        linked_etag_from_headers, parse_content_range_total, reserve_download_job,
-        run_download_task, sha256_file_from_disk, sha256_reader_cancellable, update_job_status,
-        validate_hf_download_dest, DownloadCancel, DownloadCancelRequest, DownloadJob,
-        DownloadState, DownloadTask, DownloadTimeouts, FinalizeDecision, HashReadTestHook,
-        PartialDownloadState, MAX_TERMINAL_HISTORY,
+        compare_download_hashes, fetch_remote_download_metadata, finalize_decision_after_rename,
+        finalize_decision_before_rename, is_canonical_uuid, linked_etag_from_headers,
+        parse_content_range_total, reserve_download_job, run_download_task, sha256_file_from_disk,
+        sha256_reader_cancellable, update_job_status, validate_hf_download_dest,
+        AuxiliaryHeadError, DownloadCancel, DownloadCancelRequest, DownloadJob,
+        DownloadRequestIdentity, DownloadReservation, DownloadState, DownloadTask,
+        DownloadTimeouts, FinalizeDecision, HashReadTestHook, PartialDownloadState,
+        SecureDownloadTarget, MAX_TERMINAL_HISTORY,
     };
     use crate::test_global_lock;
     use reqwest::header::{HeaderMap, HeaderValue};
@@ -1665,7 +2237,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Barrier};
     use std::task::{Context, Poll};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio::sync::oneshot;
 
@@ -1698,6 +2270,14 @@ mod tests {
             .expect("clock should be available")
             .as_nanos();
         std::env::temp_dir().join(format!("lunerylab-{name}-{nonce}"))
+    }
+
+    fn secure_target_for_test(destination: &std::path::Path) -> SecureDownloadTarget {
+        let parent = destination.parent().expect("test destination parent");
+        std::fs::create_dir_all(parent).expect("create test destination parent");
+        let root = parent.canonicalize().expect("canonical test parent");
+        let destination = root.join(destination.file_name().expect("test destination name"));
+        SecureDownloadTarget::pin_in_root(root, destination).expect("pin test destination")
     }
 
     fn restore_env(name: &str, value: Option<OsString>) {
@@ -1735,6 +2315,116 @@ mod tests {
                 tx,
             )
             .expect("released lease allows a new download");
+    }
+
+    #[test]
+    fn same_id_renewal_blocks_download_start_past_original_expiry() {
+        let state = DownloadState::default();
+        let destination = unique_test_path("renewed-download.gguf");
+        let t0 = Instant::now();
+        state
+            .acquire_destination_delete_lease_at(destination.clone(), "renew", t0)
+            .expect("initial lease");
+        state
+            .acquire_destination_delete_lease_at(
+                destination.clone(),
+                "renew",
+                t0 + Duration::from_secs(59),
+            )
+            .expect("same-id renewal");
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+        assert!(state
+            .reserve_job_at(
+                "blocked-after-original-expiry",
+                destination.clone(),
+                Arc::new(DownloadCancel::new()),
+                tx.clone(),
+                t0 + Duration::from_secs(61),
+            )
+            .is_err());
+        assert!(state
+            .acquire_destination_delete_lease_at(
+                destination,
+                "different-owner",
+                t0 + Duration::from_secs(61),
+            )
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_parent_blocks_intermediate_directory_symlink_swap() {
+        use rustix::fs::OFlags;
+
+        let root = unique_test_path("pinned-parent-root");
+        let original_parent = root.join("nested");
+        let moved_parent = root.join("pinned-original");
+        let outside = unique_test_path("pinned-parent-outside");
+        std::fs::create_dir_all(&original_parent).expect("create model directory");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        let canonical_root = root.canonicalize().expect("canonical model root");
+        let destination = canonical_root.join("nested/model.gguf");
+        let target = SecureDownloadTarget::pin_in_root(canonical_root, destination)
+            .expect("pin nested parent");
+        let release = Arc::new(Barrier::new(2));
+        let release_w = Arc::clone(&release);
+        let worker = std::thread::spawn(move || {
+            release_w.wait();
+            let mut file = target
+                .open_at(
+                    &target.part_name,
+                    OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+                )
+                .expect("open through pinned directory descriptor");
+            file.write_all(b"pinned").expect("write pinned part");
+        });
+
+        std::fs::rename(&original_parent, &moved_parent).expect("move original directory");
+        std::os::unix::fs::symlink(&outside, &original_parent)
+            .expect("swap intermediate directory with symlink");
+        release.wait();
+        worker.join().expect("pinned writer");
+
+        assert_eq!(
+            std::fs::read(moved_parent.join("model.gguf.part")).expect("pinned part"),
+            b"pinned"
+        );
+        assert!(!outside.join("model.gguf.part").exists());
+        std::fs::remove_dir_all(&root).expect("remove model fixture");
+        std::fs::remove_dir_all(&outside).expect("remove outside fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_part_open_and_rename_reject_symlink_swap() {
+        let root = unique_test_path("part-swap-root");
+        let outside = unique_test_path("part-swap-outside");
+        std::fs::create_dir_all(&root).expect("create model root");
+        std::fs::write(&outside, b"outside-sentinel").expect("write outside sentinel");
+        let canonical_root = root.canonicalize().expect("canonical model root");
+        let destination = canonical_root.join("model.gguf");
+        let target = SecureDownloadTarget::pin_in_root(canonical_root, destination)
+            .expect("pin destination");
+        let part_path = root.join("model.gguf.part");
+        let release = Arc::new(Barrier::new(2));
+        let release_w = Arc::clone(&release);
+        let worker = std::thread::spawn(move || {
+            release_w.wait();
+            assert!(target.open_part(false).is_err());
+            assert!(target.rename_part_to_destination().is_err());
+        });
+
+        std::os::unix::fs::symlink(&outside, &part_path).expect("swap part with symlink");
+        release.wait();
+        worker.join().expect("nofollow worker");
+
+        assert_eq!(
+            std::fs::read(&outside).expect("outside sentinel remains"),
+            b"outside-sentinel"
+        );
+        assert!(!root.join("model.gguf").exists());
+        std::fs::remove_dir_all(&root).expect("remove model fixture");
+        std::fs::remove_file(&outside).expect("remove outside sentinel");
     }
 
     #[test]
@@ -1913,6 +2603,69 @@ mod tests {
     }
 
     #[test]
+    fn client_job_id_retry_is_idempotent_only_for_the_exact_request() {
+        let state = DownloadState::default();
+        let destination = unique_test_path("idempotent-request.gguf");
+        let identity = DownloadRequestIdentity {
+            url: "https://huggingface.co/org/repo/resolve/main/model.gguf".to_string(),
+            dest: destination.to_string_lossy().to_string(),
+            sha256: Some("a".repeat(64)),
+        };
+        let (first_tx, _) = tokio::sync::broadcast::channel(2);
+        assert_eq!(
+            state
+                .reserve_request_job(
+                    "123e4567-e89b-12d3-a456-426614174000",
+                    destination.clone(),
+                    identity.clone(),
+                    Arc::new(DownloadCancel::new()),
+                    first_tx,
+                )
+                .unwrap(),
+            DownloadReservation::Created
+        );
+
+        let (retry_tx, _) = tokio::sync::broadcast::channel(2);
+        assert_eq!(
+            state
+                .reserve_request_job(
+                    "123e4567-e89b-12d3-a456-426614174000",
+                    destination.clone(),
+                    identity.clone(),
+                    Arc::new(DownloadCancel::new()),
+                    retry_tx,
+                )
+                .unwrap(),
+            DownloadReservation::Existing
+        );
+        assert_eq!(state.0.lock().unwrap().len(), 1);
+
+        let (conflict_tx, _) = tokio::sync::broadcast::channel(2);
+        let mut conflicting = identity;
+        conflicting.url = "https://huggingface.co/org/repo/resolve/main/other.gguf".to_string();
+        let error = state
+            .reserve_request_job(
+                "123e4567-e89b-12d3-a456-426614174000",
+                destination,
+                conflicting,
+                Arc::new(DownloadCancel::new()),
+                conflict_tx,
+            )
+            .expect_err("same id with another payload must conflict");
+        assert!(error.contains("conflicts"));
+        assert_eq!(state.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn download_job_id_requires_canonical_uuid_shape() {
+        assert!(is_canonical_uuid("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(is_canonical_uuid("123E4567-E89B-12D3-A456-426614174000"));
+        assert!(!is_canonical_uuid("job-1"));
+        assert!(!is_canonical_uuid("123e4567e89b12d3a456426614174000"));
+        assert!(!is_canonical_uuid("123e4567-e89b-12d3-a456-42661417400z"));
+    }
+
+    #[test]
     fn terminal_download_history_is_bounded() {
         let state = Arc::new(DownloadState::default());
         for index in 0..(MAX_TERMINAL_HISTORY + 10) {
@@ -1972,6 +2725,7 @@ mod tests {
                     destination: dest_path.clone(),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
@@ -1988,6 +2742,7 @@ mod tests {
             tx,
             cancel: Arc::clone(&cancel),
             timeouts: DownloadTimeouts::default(),
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: None,
         })
         .await;
@@ -2040,6 +2795,7 @@ mod tests {
                     destination: dest_path.clone(),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
@@ -2056,6 +2812,7 @@ mod tests {
             tx,
             cancel: Arc::clone(&cancel),
             timeouts: DownloadTimeouts::default(),
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: None,
         })
         .await;
@@ -2103,6 +2860,7 @@ mod tests {
                     destination: dest_path.clone(),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
@@ -2119,6 +2877,7 @@ mod tests {
             tx,
             cancel,
             timeouts: DownloadTimeouts::default(),
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: None,
         })
         .await;
@@ -2172,6 +2931,7 @@ mod tests {
                     destination: dest_path.clone(),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
@@ -2188,6 +2948,7 @@ mod tests {
             tx,
             cancel,
             timeouts: DownloadTimeouts::default(),
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: None,
         })
         .await;
@@ -2264,6 +3025,7 @@ mod tests {
                     destination: unique_test_path("cancel-ready-race.bin"),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel,
                     tx: tx.clone(),
                 },
@@ -2311,6 +3073,7 @@ mod tests {
                 destination: unique_test_path("cancel-ownership.bin"),
                 owns_destination: true,
                 finished_at: None,
+                request_identity: None,
                 cancel,
                 tx: tx.clone(),
             },
@@ -2379,6 +3142,7 @@ mod tests {
                     destination: dest_path.clone(),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
@@ -2399,6 +3163,7 @@ mod tests {
                 headers: Duration::from_secs(2),
                 read_idle: Duration::from_millis(200),
             },
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: None,
         }));
 
@@ -2473,6 +3238,7 @@ mod tests {
                     destination: dest_path.clone(),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
@@ -2493,6 +3259,7 @@ mod tests {
                 headers: Duration::from_secs(2),
                 read_idle: Duration::from_secs(2),
             },
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: None,
         }));
 
@@ -2616,6 +3383,7 @@ mod tests {
                     destination: dest_path.clone(),
                     owns_destination: true,
                     finished_at: None,
+                    request_identity: None,
                     cancel: Arc::clone(&cancel),
                     tx: tx.clone(),
                 },
@@ -2632,6 +3400,7 @@ mod tests {
             tx: tx.clone(),
             cancel: Arc::clone(&cancel),
             timeouts: DownloadTimeouts::default(),
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: Some(Arc::clone(&hook)),
         }));
         hook.first_chunk.notified().await;
@@ -2652,6 +3421,53 @@ mod tests {
         );
         let _ = std::fs::remove_file(&dest_path);
         let _ = std::fs::remove_file(&part_path);
+    }
+
+    #[tokio::test]
+    async fn cancel_wakes_auxiliary_head_that_never_responds() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind metadata server");
+        let addr = listener.local_addr().expect("metadata address");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept metadata HEAD");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("metadata request timeout");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).expect("read metadata HEAD");
+            let _ = accepted_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("metadata client");
+        let cancel = Arc::new(DownloadCancel::new());
+        let cancel_for_head = Arc::clone(&cancel);
+        let head = tokio::spawn(async move {
+            fetch_remote_download_metadata(
+                &client,
+                &format!("http://{addr}/model.bin"),
+                &cancel_for_head,
+                DownloadTimeouts {
+                    connect: Duration::from_secs(2),
+                    headers: Duration::from_secs(5),
+                    read_idle: Duration::from_secs(2),
+                },
+            )
+            .await
+        });
+        accepted_rx.await.expect("metadata server accepted HEAD");
+        cancel.request();
+        let result = tokio::time::timeout(Duration::from_secs(1), head)
+            .await
+            .expect("auxiliary HEAD cancellation is bounded")
+            .expect("metadata task join");
+        assert!(matches!(result, Err(AuxiliaryHeadError::Canceled)));
+        let _ = release_tx.send(());
+        server.join().expect("metadata server exits");
     }
 
     #[tokio::test]
@@ -2706,6 +3522,7 @@ mod tests {
                 destination: dest_path.clone(),
                 owns_destination: true,
                 finished_at: None,
+                request_identity: None,
                 cancel: Arc::clone(&cancel),
                 tx: tx.clone(),
             },
@@ -2725,6 +3542,7 @@ mod tests {
                 headers: Duration::from_secs(1),
                 read_idle: Duration::from_secs(1),
             },
+            secure_target: secure_target_for_test(&dest_path),
             hash_test_hook: Some(Arc::clone(&hook)),
         }));
         hook.first_chunk.notified().await;

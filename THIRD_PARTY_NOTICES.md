@@ -111,6 +111,7 @@ holds their own key and pays the provider directly.
 | [@tauri-apps/api](https://github.com/tauri-apps/tauri) | MIT / Apache-2.0 | Tauri client SDK. |
 | [tauri-plugin-single-instance 2.4.3](https://github.com/tauri-apps/plugins-workspace) | MIT / Apache-2.0 | Ensure a single desktop instance; focus the existing main window on relaunch. Last verified 2026-08-02. |
 | [fs4 1.1.0](https://github.com/al8n/fs4) | MIT / Apache-2.0 | Cross-platform OS advisory lock for the resolved Lunery profile. Last verified 2026-08-02. |
+| [rustix 1.1.4](https://github.com/bytecodealliance/rustix) | Apache-2.0 WITH LLVM-exception / Apache-2.0 / MIT | Unix directory-handle and no-follow file operations for secure model downloads. Last verified 2026-08-03. |
 
 ## Data + storage
 
@@ -136,7 +137,7 @@ This file is hand-curated for major dependencies. The three pinned sidecar fetch
 scripts refresh their matching license files from the exact upstream release
 tag. `pnpm licenses:check` verifies that those files are present and non-empty,
 that the bundled component list above matches `scripts/sidecar-manifest.json`,
-and that direct desktop dependencies `tauri-plugin-single-instance` and `fs4`
+and that direct desktop dependencies `tauri-plugin-single-instance`, `fs4`, and `rustix`
 remain declared in `my-app/src-tauri/Cargo.toml` with matching notices here.
 Tauri packages both the license directory and this notice with the application.
 

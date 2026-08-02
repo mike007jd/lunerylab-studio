@@ -55,6 +55,11 @@ const requiredDesktopDeps = [
     version: "1.1.0",
     noticeNeedle: "fs4 1.1.0",
   },
+  {
+    cargoKey: "rustix",
+    version: "1.1.4",
+    noticeNeedle: "rustix 1.1.4",
+  },
 ];
 
 for (const dep of requiredDesktopDeps) {

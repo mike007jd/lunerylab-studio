@@ -1,6 +1,6 @@
 use keyring_core::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,9 @@ pub(crate) const KEYCHAIN_SERVICE: &str = "com.lunerylab.studio.provider";
 /// Short positive-cache TTL for configured provider secrets. Repeated authenticated
 /// reads of one provider reuse this entry instead of spending keychain miss budget.
 const SECRET_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Status reads are memory-only. Expired presence remains a usable snapshot
+/// while one background worker refreshes it away from the status call path.
+const SECRET_PRESENCE_TTL: Duration = Duration::from_secs(30);
 /// Authenticated real keychain reads. High enough for legitimate multi-provider
 /// startup while still bounding malicious cache-miss churn.
 const SECRET_READ_LIMIT: usize = 60;
@@ -136,6 +139,12 @@ struct CachedSecret {
     expires_at: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct CachedPresence {
+    state: KeychainSecretState,
+    expires_at: Instant,
+}
+
 struct InflightRead {
     done: Mutex<Option<Result<String, ProviderSecretReadError>>>,
     cv: Condvar,
@@ -144,6 +153,11 @@ struct InflightRead {
 struct SecretReadState {
     cache: HashMap<String, CachedSecret>,
     inflight: HashMap<String, Arc<InflightRead>>,
+    generations: HashMap<String, u64>,
+    presence: HashMap<String, CachedPresence>,
+    presence_queue: VecDeque<String>,
+    presence_queued: HashSet<String>,
+    presence_worker_active: bool,
     read_times: Vec<Instant>,
     failure_times: Vec<Instant>,
 }
@@ -154,6 +168,11 @@ fn secret_read_state() -> &'static Mutex<SecretReadState> {
         Mutex::new(SecretReadState {
             cache: HashMap::new(),
             inflight: HashMap::new(),
+            generations: HashMap::new(),
+            presence: HashMap::new(),
+            presence_queue: VecDeque::new(),
+            presence_queued: HashSet::new(),
+            presence_worker_active: false,
             read_times: Vec::new(),
             failure_times: Vec::new(),
         })
@@ -195,14 +214,16 @@ fn record_keychain_read_failure(now: Instant) {
 struct InflightLeaderGuard {
     provider_id: String,
     inflight: Arc<InflightRead>,
+    generation: u64,
     settled: bool,
 }
 
 impl InflightLeaderGuard {
-    fn new(provider_id: &str, inflight: Arc<InflightRead>) -> Self {
+    fn new(provider_id: &str, inflight: Arc<InflightRead>, generation: u64) -> Self {
         Self {
             provider_id: provider_id.to_string(),
             inflight,
+            generation,
             settled: false,
         }
     }
@@ -221,13 +242,39 @@ impl InflightLeaderGuard {
         let mut state = secret_read_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.inflight.remove(&self.provider_id);
-        if let Ok(ref value) = outcome {
-            state.cache.insert(
+        if state
+            .inflight
+            .get(&self.provider_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inflight))
+        {
+            state.inflight.remove(&self.provider_id);
+        }
+        let generation_is_current = state
+            .generations
+            .get(&self.provider_id)
+            .copied()
+            .unwrap_or(0)
+            == self.generation;
+        if generation_is_current {
+            let presence = match outcome {
+                Ok(ref value) => {
+                    state.cache.insert(
+                        self.provider_id.clone(),
+                        CachedSecret {
+                            value: value.clone(),
+                            expires_at: now + SECRET_CACHE_TTL,
+                        },
+                    );
+                    KeychainSecretState::Present
+                }
+                Err(ProviderSecretReadError::Missing) => KeychainSecretState::Missing,
+                Err(_) => KeychainSecretState::Unavailable,
+            };
+            state.presence.insert(
                 self.provider_id.clone(),
-                CachedSecret {
-                    value: value.clone(),
-                    expires_at: now + SECRET_CACHE_TTL,
+                CachedPresence {
+                    state: presence,
+                    expires_at: now + SECRET_PRESENCE_TTL,
                 },
             );
         }
@@ -253,12 +300,41 @@ impl Drop for InflightLeaderGuard {
     }
 }
 
-pub(crate) fn invalidate_provider_secret_cache(provider_id: &str) {
-    secret_read_state()
+fn invalidate_provider_secret_cache_inner(
+    provider_id: &str,
+    presence: Option<KeychainSecretState>,
+) {
+    let mut state = secret_read_state()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .cache
-        .remove(provider_id);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = state
+        .generations
+        .entry(provider_id.to_string())
+        .or_default();
+    *generation = generation.wrapping_add(1);
+    state.cache.remove(provider_id);
+    // Readers that started before a successful mutation may still complete
+    // for their existing callers, but new callers must elect a new-generation
+    // leader instead of following the stale read.
+    state.inflight.remove(provider_id);
+    state.presence_queue.retain(|queued| queued != provider_id);
+    state.presence_queued.remove(provider_id);
+    if let Some(presence) = presence {
+        state.presence.insert(
+            provider_id.to_string(),
+            CachedPresence {
+                state: presence,
+                expires_at: Instant::now() + SECRET_PRESENCE_TTL,
+            },
+        );
+    } else {
+        state.presence.remove(provider_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn invalidate_provider_secret_cache(provider_id: &str) {
+    invalidate_provider_secret_cache_inner(provider_id, None);
 }
 
 /// Append a tamper-evident-ish audit line for every secret-read attempt. We
@@ -285,20 +361,98 @@ fn classify_keychain_mutation_error(_error: KeyringError) -> ProviderSecretMutat
     ProviderSecretMutationError::Unavailable
 }
 
-pub(crate) fn keychain_secret_state(provider_id: &str) -> KeychainSecretState {
-    let Ok(entry) = provider_entry(provider_id) else {
-        return KeychainSecretState::Unavailable;
-    };
-    match entry.get_password() {
-        Ok(_) => KeychainSecretState::Present,
-        Err(KeyringError::NoEntry) => KeychainSecretState::Missing,
-        Err(_) => KeychainSecretState::Unavailable,
-    }
-}
-
 fn read_keychain_password(provider_id: &str) -> Result<String, ProviderSecretReadError> {
     let entry = provider_entry(provider_id).map_err(|_| ProviderSecretReadError::Unavailable)?;
     entry.get_password().map_err(classify_keychain_read_error)
+}
+
+type PresenceReader =
+    Arc<dyn Fn(&str) -> Result<String, ProviderSecretReadError> + Send + Sync + 'static>;
+
+struct PresenceWorkerGuard;
+
+impl Drop for PresenceWorkerGuard {
+    fn drop(&mut self) {
+        let mut state = secret_read_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.presence_worker_active = false;
+    }
+}
+
+fn run_presence_worker(reader: PresenceReader) {
+    let _guard = PresenceWorkerGuard;
+    loop {
+        let provider_id = {
+            let mut state = secret_read_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(provider_id) = state.presence_queue.pop_front() else {
+                // Clear while holding the queue mutex so a concurrent status
+                // enqueue either observes an active worker or starts a new one.
+                state.presence_worker_active = false;
+                return;
+            };
+            provider_id
+        };
+        let _ = resolve_provider_secret_with(&provider_id, Instant::now(), |id| reader(id));
+        let mut state = secret_read_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.presence_queued.remove(&provider_id);
+    }
+}
+
+/// Returns a memory snapshot immediately. A cache miss or stale snapshot only
+/// enqueues one background refresh; the desktop status command never waits for
+/// the OS keychain and cannot fan out one blocked keychain thread per provider.
+fn keychain_secret_state_with(
+    provider_id: &str,
+    now: Instant,
+    reader: PresenceReader,
+) -> KeychainSecretState {
+    if validate_provider_id(provider_id).is_err() {
+        return KeychainSecretState::Unavailable;
+    }
+    let (snapshot, spawn_worker) = {
+        let mut state = secret_read_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = state.presence.get(provider_id).copied();
+        let snapshot = cached
+            .map(|presence| presence.state)
+            .unwrap_or(KeychainSecretState::Unavailable);
+        if cached.is_none_or(|presence| presence.expires_at <= now)
+            && state.presence_queued.insert(provider_id.to_string())
+        {
+            state.presence_queue.push_back(provider_id.to_string());
+        }
+        let spawn_worker = !state.presence_worker_active && !state.presence_queue.is_empty();
+        if spawn_worker {
+            state.presence_worker_active = true;
+        }
+        (snapshot, spawn_worker)
+    };
+    if spawn_worker
+        && std::thread::Builder::new()
+            .name("lunery-secret-presence".to_string())
+            .spawn(move || run_presence_worker(reader))
+            .is_err()
+    {
+        let mut state = secret_read_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.presence_worker_active = false;
+    }
+    snapshot
+}
+
+pub(crate) fn keychain_secret_state(provider_id: &str) -> KeychainSecretState {
+    keychain_secret_state_with(
+        provider_id,
+        Instant::now(),
+        Arc::new(read_keychain_password),
+    )
 }
 
 /// Resolve a provider secret through the positive cache / same-provider
@@ -355,16 +509,17 @@ where
     state
         .inflight
         .insert(provider_id.to_string(), Arc::clone(&inflight));
+    let generation = state.generations.get(provider_id).copied().unwrap_or(0);
 
     // Charge before any OS-keychain / injected backend read.
     if !consume_keychain_read_budget(&mut state, now) {
         drop(state);
-        return InflightLeaderGuard::new(provider_id, inflight)
+        return InflightLeaderGuard::new(provider_id, inflight, generation)
             .publish(Err(ProviderSecretReadError::RateLimited), now);
     }
     drop(state);
 
-    let leader = InflightLeaderGuard::new(provider_id, inflight);
+    let leader = InflightLeaderGuard::new(provider_id, inflight, generation);
     let outcome = read_keychain(provider_id);
     if matches!(
         outcome,
@@ -393,7 +548,7 @@ pub(crate) fn save_provider_secret(
         .set_password(payload.api_key.trim())
         .map_err(classify_keychain_mutation_error)?;
 
-    invalidate_provider_secret_cache(&provider_id);
+    invalidate_provider_secret_cache_inner(&provider_id, Some(KeychainSecretState::Present));
 
     Ok(ProviderSecretStatus {
         provider_id,
@@ -426,7 +581,10 @@ pub(crate) fn delete_provider_secret(
     let entry = provider_entry(&provider_id)?;
     match entry.delete_credential() {
         Ok(()) | Err(KeyringError::NoEntry) => {
-            invalidate_provider_secret_cache(&provider_id);
+            invalidate_provider_secret_cache_inner(
+                &provider_id,
+                Some(KeychainSecretState::Missing),
+            );
             Ok(ProviderSecretStatus {
                 provider_id,
                 configured: false,
@@ -441,9 +599,9 @@ pub(crate) fn delete_provider_secret(
 mod tests {
     use super::{
         classify_keychain_mutation_error, classify_keychain_read_error,
-        invalidate_provider_secret_cache, resolve_provider_secret_with, secret_read_state,
-        ProviderSecretMutationError, ProviderSecretReadError, SECRET_FAILURE_LIMIT,
-        SECRET_READ_LIMIT,
+        invalidate_provider_secret_cache, keychain_secret_state_with, resolve_provider_secret_with,
+        secret_read_state, KeychainSecretState, PresenceReader, ProviderSecretMutationError,
+        ProviderSecretReadError, SECRET_FAILURE_LIMIT, SECRET_READ_LIMIT,
     };
     use crate::test_global_lock;
     use keyring_core::Error as KeyringError;
@@ -455,6 +613,11 @@ mod tests {
         let mut state = secret_read_state().lock().expect("secret state");
         state.cache.clear();
         state.inflight.clear();
+        state.generations.clear();
+        state.presence.clear();
+        state.presence_queue.clear();
+        state.presence_queued.clear();
+        state.presence_worker_active = false;
         state.read_times.clear();
         state.failure_times.clear();
     }
@@ -513,6 +676,73 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         // One charged positive-cache miss; nineteen cache hits are free.
         assert_eq!(secret_read_state().lock().unwrap().read_times.len(), 1);
+    }
+
+    #[test]
+    fn status_presence_is_nonblocking_and_single_worker_bounded() {
+        let _g = test_global_lock();
+        reset_secret_state();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let reads_worker = Arc::clone(&reads);
+        let release_worker = Arc::clone(&release);
+        let reader: PresenceReader = Arc::new(move |_| {
+            reads_worker.fetch_add(1, Ordering::SeqCst);
+            let (lock, cv) = &*release_worker;
+            let guard = lock.lock().unwrap();
+            let _ = cv
+                .wait_timeout_while(guard, Duration::from_secs(2), |released| !*released)
+                .unwrap();
+            Ok("status-secret".to_string())
+        });
+
+        assert_eq!(
+            keychain_secret_state_with("status-provider", Instant::now(), Arc::clone(&reader)),
+            KeychainSecretState::Unavailable
+        );
+        for _ in 0..100 {
+            if reads.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        let started = Instant::now();
+        let mut callers = Vec::new();
+        for _ in 0..20 {
+            let reader = Arc::clone(&reader);
+            callers.push(std::thread::spawn(move || {
+                keychain_secret_state_with("status-provider", Instant::now(), reader)
+            }));
+        }
+        for caller in callers {
+            assert_eq!(caller.join().unwrap(), KeychainSecretState::Unavailable);
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        for _ in 0..100 {
+            let state = secret_read_state().lock().unwrap();
+            let ready = !state.presence_worker_active
+                && state
+                    .presence
+                    .get("status-provider")
+                    .is_some_and(|presence| presence.state == KeychainSecretState::Present);
+            drop(state);
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            keychain_secret_state_with("status-provider", Instant::now(), reader),
+            KeychainSecretState::Present
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -661,6 +891,50 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(secret_read_state().lock().unwrap().read_times.len(), 1);
         assert!(secret_read_state().lock().unwrap().inflight.is_empty());
+    }
+
+    #[test]
+    fn mutation_generation_prevents_stale_inflight_cache_republish() {
+        let _g = test_global_lock();
+        reset_secret_state();
+        let old_read_started = Arc::new(std::sync::Barrier::new(2));
+        let release_old_read = Arc::new(std::sync::Barrier::new(2));
+        let old_read_started_w = Arc::clone(&old_read_started);
+        let release_old_read_w = Arc::clone(&release_old_read);
+        let old_leader = std::thread::spawn(move || {
+            resolve_provider_secret_with("rotated", Instant::now(), |_| {
+                old_read_started_w.wait();
+                release_old_read_w.wait();
+                Ok("old-secret".to_string())
+            })
+        });
+        old_read_started.wait();
+
+        // Models a successful save/delete after its keychain operation. The
+        // mutation advances generation and detaches the old in-flight read.
+        invalidate_provider_secret_cache("rotated");
+        let fresh = resolve_provider_secret_with("rotated", Instant::now(), |_| {
+            Ok("new-secret".to_string())
+        })
+        .expect("new-generation read");
+        assert_eq!(fresh, "new-secret");
+
+        release_old_read.wait();
+        assert_eq!(
+            old_leader.join().unwrap().expect("old caller completes"),
+            "old-secret"
+        );
+
+        // The late old leader must neither overwrite the fresh cache nor
+        // remove a newer in-flight entry.
+        let cached = resolve_provider_secret_with("rotated", Instant::now(), |_| {
+            panic!("fresh cache must survive stale leader publish")
+        })
+        .expect("fresh cache");
+        assert_eq!(cached, "new-secret");
+        let state = secret_read_state().lock().unwrap();
+        assert!(state.inflight.is_empty());
+        assert_eq!(state.generations.get("rotated"), Some(&1));
     }
 
     #[test]

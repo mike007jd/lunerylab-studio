@@ -31,6 +31,7 @@ struct LlamaModelState {
 }
 
 static LLAMA_MODEL_STATE: OnceLock<Mutex<LlamaModelState>> = OnceLock::new();
+const LLAMA_MODEL_DELETE_LEASE_TTL: Duration = Duration::from_secs(60);
 
 fn llama_model_state() -> &'static Mutex<LlamaModelState> {
     LLAMA_MODEL_STATE.get_or_init(|| Mutex::new(LlamaModelState::default()))
@@ -53,11 +54,18 @@ pub(crate) fn acquire_llama_model_delete_lease(
     model_path: &str,
     lease_id: &str,
 ) -> Result<(), String> {
+    acquire_llama_model_delete_lease_at(model_path, lease_id, Instant::now())
+}
+
+fn acquire_llama_model_delete_lease_at(
+    model_path: &str,
+    lease_id: &str,
+    now: Instant,
+) -> Result<(), String> {
     if lease_id.is_empty() || lease_id.len() > 128 {
         return Err("Invalid llama model deletion lease".to_string());
     }
     let model_path = normalize_llama_model_path(model_path);
-    let now = Instant::now();
     let mut state = llama_model_state()
         .lock()
         .map_err(|_| "Llama model state lock poisoned".to_string())?;
@@ -76,7 +84,7 @@ pub(crate) fn acquire_llama_model_delete_lease(
         model_path,
         LlamaModelDeleteLease {
             lease_id: lease_id.to_string(),
-            expires_at: now + Duration::from_secs(60),
+            expires_at: now + LLAMA_MODEL_DELETE_LEASE_TTL,
         },
     );
     Ok(())
@@ -102,8 +110,11 @@ struct LlamaModelStartGuard {
 
 impl LlamaModelStartGuard {
     fn acquire(model_path: &str) -> Result<Self, String> {
+        Self::acquire_at(model_path, Instant::now())
+    }
+
+    fn acquire_at(model_path: &str, now: Instant) -> Result<Self, String> {
         let model_path = normalize_llama_model_path(model_path);
-        let now = Instant::now();
         let mut state = llama_model_state()
             .lock()
             .map_err(|_| "Llama model state lock poisoned".to_string())?;
@@ -384,17 +395,17 @@ pub(crate) fn bridge_stop_llama() {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_llama_model_delete_lease, bridge_stop_llama, cleanup_llama_exit_if_current,
-        llama_bridge_child, llama_engine_slot, llama_residency_slot, prepare_llama_start,
-        release_llama_model_delete_lease, validate_model_alias, LlamaEngineInfo,
-        LlamaModelStartGuard, LLAMA_LIFECYCLE,
+        acquire_llama_model_delete_lease, acquire_llama_model_delete_lease_at, bridge_stop_llama,
+        cleanup_llama_exit_if_current, llama_bridge_child, llama_engine_slot, llama_residency_slot,
+        prepare_llama_start, release_llama_model_delete_lease, validate_model_alias,
+        LlamaEngineInfo, LlamaModelStartGuard, LLAMA_LIFECYCLE,
     };
     use crate::llama_resident::LlamaResident;
     use crate::model_residency::ResidencyManager;
     use crate::test_global_lock;
     use std::ffi::OsString;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct RuntimeDirRestore(Option<OsString>);
 
@@ -437,6 +448,30 @@ mod tests {
         acquire_llama_model_delete_lease(&model_path, "racing-delete")
             .expect("start completion releases admission");
         release_llama_model_delete_lease(&model_path, "racing-delete");
+    }
+
+    #[test]
+    fn same_id_renewal_blocks_llama_start_past_original_expiry() {
+        let _g = test_global_lock();
+        let model_path = std::env::temp_dir()
+            .join("lunery-llama-renewed-delete-lease.gguf")
+            .to_string_lossy()
+            .to_string();
+        let t0 = Instant::now();
+        acquire_llama_model_delete_lease_at(&model_path, "renew", t0).expect("initial lease");
+        acquire_llama_model_delete_lease_at(&model_path, "renew", t0 + Duration::from_secs(59))
+            .expect("same-id renewal");
+
+        assert!(
+            LlamaModelStartGuard::acquire_at(&model_path, t0 + Duration::from_secs(61)).is_err()
+        );
+        assert!(acquire_llama_model_delete_lease_at(
+            &model_path,
+            "different-owner",
+            t0 + Duration::from_secs(61),
+        )
+        .is_err());
+        release_llama_model_delete_lease(&model_path, "renew");
     }
 
     #[cfg(unix)]
