@@ -52,6 +52,7 @@ vi.mock("@/lib/server/dto", () => ({
 }));
 
 import { POST } from "@/app/api/canvas/sessions/[id]/export/route";
+import { acquireWorkspaceExclusive, resetWorkspaceOperationGateForTests } from "@/lib/server/workspace-operation-gate";
 
 const storedPng = {
   storagePath: "generated/project-1/export.png",
@@ -73,6 +74,7 @@ function requestFor(mode: "original" | "platforms", presetIds: string[] = []) {
 }
 
 beforeEach(() => {
+  resetWorkspaceOperationGateForTests();
   vi.clearAllMocks();
   mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "user-1" });
   mocks.requireWritableCanvasSession.mockResolvedValue({ id: "session-1", projectId: "project-1" });
@@ -98,6 +100,23 @@ beforeEach(() => {
 });
 
 describe("Canvas export route", () => {
+  it("returns retryable workspace_busy while restore owns exclusivity", async () => {
+    const exclusive = await acquireWorkspaceExclusive("restore");
+    try {
+      const response = await POST(requestFor("original"), {
+        params: Promise.resolve({ id: "session-1" }),
+      });
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "workspace_busy",
+        retryable: true,
+      });
+      expect(mocks.requireWritableCanvasSession).not.toHaveBeenCalled();
+    } finally {
+      exclusive.release();
+    }
+  });
+
   it("stores an original-size PNG through the generated-media path", async () => {
     const response = await POST(requestFor("original"), {
       params: Promise.resolve({ id: "session-1" }),

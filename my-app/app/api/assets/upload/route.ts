@@ -14,9 +14,9 @@ import { parseFormData } from "@/lib/server/http-validation";
 import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export async function POST(request: NextRequest) {
-  return withSharedMutationLease(async () => {
   try {
     const user = await requireLocalWorkspaceOwner();
+    return await withSharedMutationLease(async () => {
 
     assertRequestContentLength(request.headers, getMaxUploadBytesPerFile() + 64 * 1024);
     const formData = await parseFormData(request);
@@ -90,9 +90,9 @@ export async function POST(request: NextRequest) {
       });
     });
 
-    return NextResponse.json({ asset: toAssetDTO(asset) });
+      return NextResponse.json({ asset: toAssetDTO(asset) });
+    });
   } catch (error) {
     return jsonError(error);
   }
-  });
 }

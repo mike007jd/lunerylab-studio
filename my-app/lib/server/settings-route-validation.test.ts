@@ -1,0 +1,121 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  requireLocalWorkspaceOwner: vi.fn(),
+  getLocalWorkspacePreferences: vi.fn(),
+  update: vi.fn(),
+  resolveImageModelEntry: vi.fn(),
+  resolveVideoModelEntry: vi.fn(),
+  getProviderStatus: vi.fn(),
+  getByokConnectionMeta: vi.fn(),
+  listLocalModelInstallStatuses: vi.fn(),
+}));
+
+vi.mock("server-only", () => ({}));
+vi.mock("@/lib/server/local-workspace-owner", () => ({
+  requireLocalWorkspaceOwner: mocks.requireLocalWorkspaceOwner,
+  getLocalWorkspacePreferences: mocks.getLocalWorkspacePreferences,
+}));
+vi.mock("@/lib/server/prisma", () => ({
+  prisma: { userSettings: { update: mocks.update } },
+}));
+vi.mock("@/lib/server/model-catalog", () => ({
+  resolveImageModelEntry: mocks.resolveImageModelEntry,
+  resolveVideoModelEntry: mocks.resolveVideoModelEntry,
+}));
+vi.mock("@/lib/server/api-keys", () => ({ getProviderStatus: mocks.getProviderStatus }));
+vi.mock("@/lib/server/byok-connection-store", () => ({
+  getByokConnectionMeta: mocks.getByokConnectionMeta,
+}));
+vi.mock("@/lib/server/local-model-inventory", () => ({
+  listLocalModelInstallStatuses: mocks.listLocalModelInstallStatuses,
+}));
+
+import { GET, PATCH } from "@/app/api/settings/route";
+import { acquireWorkspaceExclusive, resetWorkspaceOperationGateForTests } from "@/lib/server/workspace-operation-gate";
+
+function patch(defaultTextModel: string) {
+  return PATCH(new Request("http://localhost/api/settings", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ defaultTextModel }),
+  }));
+}
+
+describe("settings text-model server validation", () => {
+  beforeEach(() => {
+    resetWorkspaceOperationGateForTests();
+    vi.clearAllMocks();
+    mocks.requireLocalWorkspaceOwner.mockResolvedValue({ id: "owner" });
+    mocks.update.mockResolvedValue({
+      defaultLocale: "en",
+      defaultTextModel: "",
+      defaultImageModel: "",
+      defaultVideoModel: "",
+    });
+    mocks.getProviderStatus.mockResolvedValue({});
+    mocks.listLocalModelInstallStatuses.mockResolvedValue([]);
+  });
+
+  it("fails closed without reading split settings/config state while restore is paused", async () => {
+    const exclusive = await acquireWorkspaceExclusive("restore");
+    try {
+      const response = await GET();
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({ code: "workspace_busy" });
+      expect(mocks.getLocalWorkspacePreferences).not.toHaveBeenCalled();
+      expect(mocks.getProviderStatus).not.toHaveBeenCalled();
+    } finally {
+      exclusive.release();
+    }
+  });
+
+  it("rejects a forged local id that is absent from installed inventory", async () => {
+    const response = await patch("local:forged-model");
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "invalid_model" });
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects a BYOK id that differs from the provider's configured text model", async () => {
+    mocks.getProviderStatus.mockResolvedValue({ openai: { configured: true, source: "keychain" } });
+    mocks.getByokConnectionMeta.mockReturnValue({
+      endpoint: "https://api.openai.com/v1",
+      models: { text: "gpt-5.6" },
+      updatedAt: new Date(0).toISOString(),
+    });
+    const response = await patch("byok:openai:forged-model");
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "invalid_model" });
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects an exact BYOK connection whose provider is not currently configured", async () => {
+    mocks.getProviderStatus.mockResolvedValue({ openai: { configured: false, source: null } });
+    mocks.getByokConnectionMeta.mockReturnValue({
+      endpoint: "https://api.openai.com/v1",
+      models: { text: "gpt-5.6" },
+      updatedAt: new Date(0).toISOString(),
+    });
+    const response = await patch("byok:openai:gpt-5.6");
+    expect(response.status).toBe(400);
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("accepts only an installed planner model's exact local id", async () => {
+    mocks.listLocalModelInstallStatuses.mockResolvedValue([
+      { id: "qwen", installed: true, capability: "planner-llm" },
+    ]);
+    mocks.update.mockResolvedValue({
+      defaultLocale: "en",
+      defaultTextModel: "local:qwen",
+      defaultImageModel: "",
+      defaultVideoModel: "",
+    });
+    const response = await patch("local:qwen");
+    expect(response.status).toBe(200);
+    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: { defaultTextModel: "local:qwen" },
+    }));
+  });
+});

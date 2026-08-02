@@ -32,10 +32,10 @@ const PNG_ONLY = new Set(["image/png"]);
 const MAX_PLATFORM_EXPORTS = 12;
 
 export async function POST(request: NextRequest, { params }: Params) {
-  return withSharedMutationLease(async () => {
   let jobId: string | null = null;
   try {
     const user = await requireLocalWorkspaceOwner();
+    return await withSharedMutationLease(async () => {
     const { id } = await params;
     const session = await requireWritableCanvasSession(id, user.id);
     assertRequestContentLength(request.headers, getMaxUploadBytesPerFile() + 128 * 1024);
@@ -150,7 +150,7 @@ export async function POST(request: NextRequest, { params }: Params) {
       throw error;
     });
 
-    return NextResponse.json({
+      return NextResponse.json({
       exports: createdAssets.map((asset, index) => {
         const output = outputs[index]!;
         const extension = asset.mimeType === "image/jpeg"
@@ -164,6 +164,7 @@ export async function POST(request: NextRequest, { params }: Params) {
           downloadName: `lunery-canvas-${output.presetId}.${extension}`,
         };
       }),
+      });
     });
   } catch (error) {
     if (jobId) {
@@ -171,5 +172,4 @@ export async function POST(request: NextRequest, { params }: Params) {
     }
     return jsonError(error);
   }
-  });
 }

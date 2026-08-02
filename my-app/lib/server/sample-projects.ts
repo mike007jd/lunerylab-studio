@@ -4,6 +4,7 @@ import { prisma } from "@/lib/server/prisma";
 import {
   deleteStoredFile,
   restoreStoredFile,
+  writeFilesOrCleanup,
   writeGeneratedImage,
 } from "@/lib/server/storage";
 import { normalizeLocale } from "@/lib/i18n/locale";
@@ -103,8 +104,8 @@ async function seedOneSample(userId: string, def: SampleProjectDef, t: SampleTra
   // references the storagePath), so we cannot move it inside the tx. To avoid
   // orphan files on rollback, clean up the just-written files if the tx
   // throws — the success path leaves them in place.
-  const copied = await Promise.all(
-    def.layers.map((layer) => copySampleImageToStorage(layer.source))
+  const copied = await writeFilesOrCleanup(
+    def.layers.map((layer) => () => copySampleImageToStorage(layer.source)),
   );
 
   try {

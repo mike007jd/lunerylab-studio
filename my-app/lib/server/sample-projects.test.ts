@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   userSettingsFindUnique: vi.fn(),
   transaction: vi.fn(),
   writeGeneratedImage: vi.fn(),
+  writeFilesOrCleanup: vi.fn(),
   deleteStoredFile: vi.fn(),
   getPlainT: vi.fn(),
 }));
@@ -22,7 +23,10 @@ vi.mock("node:fs", () => ({
 vi.mock("@/lib/sample-data", () => ({
   SAMPLE_PROJECTS: [{
     id: "built-in-one",
-    layers: [{ source: "samples/coffee-scene.webp", x: 0, y: 0, width: 100, height: 100 }],
+    layers: [
+      { source: "samples/coffee-scene.webp", x: 0, y: 0, width: 100, height: 100 },
+      { source: "samples/ceramic-vase.webp", x: 100, y: 0, width: 100, height: 100 },
+    ],
   }],
   SAMPLE_SOURCE_MIME_TYPE: "image/webp",
 }));
@@ -32,6 +36,7 @@ vi.mock("@/lib/i18n/plain", () => ({
 vi.mock("@/lib/server/storage", () => ({
   writeGeneratedImage: mocks.writeGeneratedImage,
   deleteStoredFile: mocks.deleteStoredFile,
+  writeFilesOrCleanup: mocks.writeFilesOrCleanup,
   restoreStoredFile: vi.fn(),
 }));
 vi.mock("@/lib/server/prisma", () => ({
@@ -65,6 +70,20 @@ beforeEach(() => {
     byteSize: 6,
     width: 100,
     height: 100,
+  });
+  mocks.writeFilesOrCleanup.mockImplementation(async (writers: Array<() => Promise<{
+    storagePath: string;
+  }>>) => {
+    const settled = await Promise.allSettled(writers.map((writer) => writer()));
+    const written = settled.flatMap((result) =>
+      result.status === "fulfilled" ? [result.value] : []);
+    const failure = settled.find((result): result is PromiseRejectedResult =>
+      result.status === "rejected");
+    if (failure) {
+      await Promise.allSettled(written.map((file) => mocks.deleteStoredFile(file.storagePath)));
+      throw failure.reason;
+    }
+    return written;
   });
   mocks.transaction.mockImplementation(async (operation: (tx: unknown) => unknown) => operation({
     project: { create: mocks.projectCreate },
@@ -112,5 +131,31 @@ describe("built-in project template initialization", () => {
 
     await expect(ensureBuiltInProjectTemplates("owner-1")).resolves.toBeUndefined();
     expect(mocks.deleteStoredFile).toHaveBeenCalledWith("generated/sample.webp");
+  });
+
+  it("cleans the first file when a later sample-layer write fails, then retries once", async () => {
+    mocks.writeGeneratedImage
+      .mockResolvedValueOnce({
+        storagePath: "generated/first.webp",
+        mimeType: "image/webp",
+        byteSize: 5,
+        width: 100,
+        height: 100,
+      })
+      .mockRejectedValueOnce(new Error("second write failed"));
+
+    await expect(ensureBuiltInProjectTemplates("owner-1")).resolves.toBeUndefined();
+    expect(mocks.deleteStoredFile).toHaveBeenCalledWith("generated/first.webp");
+    expect(mocks.transaction).not.toHaveBeenCalled();
+
+    mocks.writeGeneratedImage.mockResolvedValue({
+      storagePath: "generated/retry.webp",
+      mimeType: "image/webp",
+      byteSize: 5,
+      width: 100,
+      height: 100,
+    });
+    await ensureBuiltInProjectTemplates("owner-1");
+    expect(mocks.projectCreate).toHaveBeenCalledTimes(1);
   });
 });

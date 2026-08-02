@@ -83,6 +83,10 @@ async function catalogModelStatus(entry: HfModelEntry): Promise<LocalModelInstal
   return {
     id: entry.id,
     imported: false,
+    capability: entry.capability,
+    runtimeTarget: entry.runtimeTarget,
+    format: entry.format,
+    fileName: entry.fileName,
     installed,
     partial: !installed && (installedFiles > 0 || partialFiles > 0),
     installedFiles,

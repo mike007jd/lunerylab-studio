@@ -103,7 +103,6 @@ function assertGenerationRequestActive(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  return withSharedMutationLease(async () => {
   const telemetry = createRouteTelemetry("/api/generate/images", request);
   telemetry.start();
 
@@ -112,6 +111,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const user = await requireLocalWorkspaceOwner();
+    return await withSharedMutationLease(async () => {
 
     assertRequestContentLength(request.headers, getMaxUploadBytesPerFile() * 4 + 128 * 1024);
     const formData = await parseFormData(request);
@@ -343,7 +343,8 @@ export async function POST(request: NextRequest) {
     });
     await finishSdProgress(runId, "completed");
     telemetry.done(response.status);
-    return response;
+      return response;
+    });
   } catch (error) {
     if (runId) {
       const canceled =
@@ -357,7 +358,8 @@ export async function POST(request: NextRequest) {
     telemetry.failed(error);
     return jsonError(error);
   } finally {
-    await ensureAppState();
+    // No job exists when shared admission was rejected (restore/exclusive
+    // pending). Do not run a warmup write outside the lease in that path.
+    if (jobId) await ensureAppState();
   }
-  });
 }

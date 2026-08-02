@@ -2,6 +2,7 @@ import { Prisma, PrismaClient } from "@prisma/client";
 import {
   hasWorkspaceMutationAuthority,
   withSharedMutationLease,
+  withSharedWorkspaceRead,
 } from "@/lib/server/workspace-operation-gate";
 
 export const REQUIRED_GENERATION_JOB_FIELDS = ["type", "videoDuration"] as const;
@@ -112,8 +113,11 @@ function createPrismaClient(): PrismaClient {
     query: {
       $allModels: {
         async $allOperations({ operation, args, query }) {
-          if (READ_OPERATIONS.has(operation) || hasWorkspaceMutationAuthority()) {
+          if (hasWorkspaceMutationAuthority()) {
             return query(args);
+          }
+          if (READ_OPERATIONS.has(operation)) {
+            return withSharedWorkspaceRead(() => query(args));
           }
           return withSharedMutationLease(() => query(args));
         },

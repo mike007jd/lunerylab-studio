@@ -195,6 +195,16 @@ export async function withSharedMutationLease<T>(work: () => Promise<T>): Promis
 }
 
 /**
+ * Hold a stable workspace snapshot across a logical read that can span both
+ * PGlite and profile files. Callers must finish cold-start reconciliation
+ * before entering, otherwise owner initialization could request exclusive
+ * authority while this shared read is waiting on itself.
+ */
+export async function withSharedWorkspaceRead<T>(work: () => Promise<T>): Promise<T> {
+  return withSharedMutationLease(work);
+}
+
+/**
  * Synchronous shared admission for sync config writers (provider metadata).
  * Re-entrant when async context already holds authority.
  */

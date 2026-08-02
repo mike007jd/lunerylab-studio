@@ -260,8 +260,6 @@ export async function POST(request: NextRequest) {
       if (!appStateEnsured) {
         if (videoAdmission) {
           await runWithDetachedVideoAdmission(videoAdmission, ensureAppState);
-        } else {
-          await ensureAppState();
         }
       }
     } finally {
