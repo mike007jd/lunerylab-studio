@@ -760,7 +760,7 @@ mod unix {
             capture_roots, execute, open_root_with_roots, open_target, ProfileFsRequest,
             ProfileFsRoot, BEFORE_RENAME_HOOK,
         };
-        use crate::profile::ProfileDirs;
+        use crate::{profile::ProfileDirs, test_global_lock};
         use std::ffi::CString;
         use std::fs;
         use std::io::{Seek, SeekFrom, Write};
@@ -887,6 +887,7 @@ mod unix {
 
         #[test]
         fn rename_uses_captured_directory_descriptors_across_final_seam_swap() {
+            let _g = test_global_lock();
             let profile = temp_root("seam");
             let models = profile.join("models");
             let inside = models.join("runtime");
@@ -924,6 +925,8 @@ mod unix {
                 fs::read(models.join("held/model.gguf.staged")).expect("held rename"),
                 b"inside"
             );
+            std::env::remove_var("LUNERY_HOME");
+            std::env::remove_var("LUNERY_MODELS_DIR");
             let _ = fs::remove_dir_all(profile);
             let _ = fs::remove_dir_all(outside);
         }
