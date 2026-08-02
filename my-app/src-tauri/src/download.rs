@@ -191,6 +191,12 @@ enum DownloadReservation {
     Canceled,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DownloadReservationGuards {
+    destination_delete_leased: bool,
+    canceled_before_reservation: bool,
+}
+
 impl DownloadJob {
     pub(crate) fn snapshot(&self) -> JobSnapshot {
         JobSnapshot {
@@ -375,8 +381,10 @@ impl DownloadState {
             request_identity,
             cancel,
             tx,
-            deletion_leases.contains_key(&destination),
-            canceled_before_reservation,
+            DownloadReservationGuards {
+                destination_delete_leased: deletion_leases.contains_key(&destination),
+                canceled_before_reservation,
+            },
         )
     }
 
@@ -994,8 +1002,16 @@ fn reserve_download_job(
     cancel: Arc<DownloadCancel>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
 ) -> Result<(), String> {
-    reserve_download_job_for_request(jobs, job_id, destination, None, cancel, tx, false, false)
-        .map(|_| ())
+    reserve_download_job_for_request(
+        jobs,
+        job_id,
+        destination,
+        None,
+        cancel,
+        tx,
+        DownloadReservationGuards::default(),
+    )
+    .map(|_| ())
 }
 
 fn reserve_download_job_for_request(
@@ -1005,8 +1021,7 @@ fn reserve_download_job_for_request(
     request_identity: Option<DownloadRequestIdentity>,
     cancel: Arc<DownloadCancel>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
-    destination_delete_leased: bool,
-    canceled_before_reservation: bool,
+    guards: DownloadReservationGuards,
 ) -> Result<DownloadReservation, String> {
     prune_download_history(jobs, Instant::now());
     if let Some(existing) = jobs.get(job_id) {
@@ -1015,23 +1030,23 @@ fn reserve_download_job_for_request(
         }
         return Err("Job ID conflicts with a different download request".to_string());
     }
-    if destination_delete_leased && !canceled_before_reservation {
+    if guards.destination_delete_leased && !guards.canceled_before_reservation {
         return Err("Model file is being deleted".to_string());
     }
-    if !canceled_before_reservation
+    if !guards.canceled_before_reservation
         && jobs
             .values()
             .any(|job| job.owns_destination && job.destination == destination)
     {
         return Err("Download destination already has an active job".to_string());
     }
-    if canceled_before_reservation {
+    if guards.canceled_before_reservation {
         cancel.request();
     }
     jobs.insert(
         job_id.to_string(),
         DownloadJob {
-            status: if canceled_before_reservation {
+            status: if guards.canceled_before_reservation {
                 "canceled".to_string()
             } else {
                 "queued".to_string()
@@ -1040,14 +1055,14 @@ fn reserve_download_job_for_request(
             total: 0,
             error: None,
             destination,
-            owns_destination: !canceled_before_reservation,
-            finished_at: canceled_before_reservation.then(Instant::now),
+            owns_destination: !guards.canceled_before_reservation,
+            finished_at: guards.canceled_before_reservation.then(Instant::now),
             request_identity,
             cancel,
             tx,
         },
     );
-    Ok(if canceled_before_reservation {
+    Ok(if guards.canceled_before_reservation {
         DownloadReservation::Canceled
     } else {
         DownloadReservation::Created
