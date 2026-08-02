@@ -38,13 +38,24 @@ function assertWorkspaceApiAllowed(): void {
   });
 }
 
-// Module-level guard so the owner-create + template initialization runs once
-// per process, even under concurrent first-boot requests. React's `cache()`
-// dedupes per-render, but two simultaneous requests get two render trees and
-// can both pass the `existing` check before either creates the row — the
-// P2002 race below catches that for the User row. The Promise pattern also
-// prevents concurrent template initialization in the same process.
-let ensurePromise: Promise<void> | null = null;
+interface LocalWorkspaceOwnerRuntime {
+  ensurePromise: Promise<void> | null;
+}
+
+const LOCAL_WORKSPACE_OWNER_RUNTIME = "__luneryLocalWorkspaceOwnerRuntimeV1" as const;
+const processGlobal = globalThis as typeof globalThis & {
+  [LOCAL_WORKSPACE_OWNER_RUNTIME]?: LocalWorkspaceOwnerRuntime;
+};
+const runtime = processGlobal[LOCAL_WORKSPACE_OWNER_RUNTIME] ?? { ensurePromise: null };
+processGlobal[LOCAL_WORKSPACE_OWNER_RUNTIME] = runtime;
+
+// Next can compile callers into separate server bundles. A module-level guard
+// is duplicated across those bundles, so concurrent first-boot requests can
+// still overlap owner recovery and PGlite template transactions. Keep the
+// single-flight on globalThis, beside the other process-wide workspace gates.
+export function resetLocalWorkspaceOwnerForTests(): void {
+  runtime.ensurePromise = null;
+}
 
 async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
   // Crash recovery must finish before any owner/bootstrap query so workspace
@@ -96,15 +107,15 @@ async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
 }
 
 export const ensureLocalWorkspaceOwner = cache(async (): Promise<void> => {
-  if (!ensurePromise) {
-    ensurePromise = ensureLocalWorkspaceOwnerOnce().catch((err) => {
+  if (!runtime.ensurePromise) {
+    runtime.ensurePromise = ensureLocalWorkspaceOwnerOnce().catch((err) => {
       // Reset on failure so the next request can retry — without this, a
       // transient first-boot DB hiccup would permanently brick the workspace.
-      ensurePromise = null;
+      runtime.ensurePromise = null;
       throw err;
     });
   }
-  return ensurePromise;
+  return runtime.ensurePromise;
 });
 
 export async function requireLocalWorkspaceOwner(): Promise<LocalWorkspaceOwner> {

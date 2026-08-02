@@ -44,7 +44,7 @@ vi.mock("@/lib/server/local-model-files", () => ({
   reconcileStagedManagedModelFiles: mocks.reconcileStagedManagedModelFiles,
 }));
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
   mocks.isDesktopRuntime.mockReturnValue(true);
@@ -55,6 +55,10 @@ beforeEach(() => {
   mocks.reconcileStagedManagedModelFiles.mockResolvedValue(0);
   mocks.assetFindMany.mockResolvedValue([]);
   mocks.userCreate.mockResolvedValue({ id: "owner" });
+  const { resetLocalWorkspaceOwnerForTests } = await import(
+    "@/lib/server/local-workspace-owner"
+  );
+  resetLocalWorkspaceOwnerForTests();
 });
 
 afterEach(() => {
@@ -101,6 +105,31 @@ describe("local workspace owner initialization", () => {
     ]);
 
     expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
+    expect(mocks.userFindUnique).toHaveBeenCalledTimes(1);
+    expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares the first-boot single-flight across separately compiled module instances", async () => {
+    const reconciliation = { release: null as (() => void) | null };
+    mocks.ensureWorkspaceRestoreReconciled.mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        reconciliation.release = resolve;
+      }),
+    );
+    mocks.userFindUnique.mockResolvedValue({ id: "owner" });
+    const firstModule = await import("@/lib/server/local-workspace-owner");
+
+    const firstInitialization = firstModule.ensureLocalWorkspaceOwner();
+    await vi.waitFor(() => {
+      expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
+    });
+    vi.resetModules();
+    const secondModule = await import("@/lib/server/local-workspace-owner");
+    const secondInitialization = secondModule.ensureLocalWorkspaceOwner();
+
+    expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
+    reconciliation.release?.();
+    await Promise.all([firstInitialization, secondInitialization]);
     expect(mocks.userFindUnique).toHaveBeenCalledTimes(1);
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledTimes(1);
   });
