@@ -262,6 +262,7 @@ jobs:
           ## Install
 
           - **macOS (Apple Silicon)** — download the `.dmg`, open it, and drag Lunery Lab Studio to Applications, then launch it normally. The build is signed with an Apple Developer ID and notarized.
+
           Verify your download against `SHA256SUMS.txt`.
 
           Local-first and account-less: bring your own local models or provider keys.

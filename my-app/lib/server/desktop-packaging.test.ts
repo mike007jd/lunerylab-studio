@@ -36,7 +36,7 @@ describe("desktop installer packaging", () => {
     }
   });
 
-  it("routes each platform through one controlled packaging entrypoint", () => {
+  it("keeps the supported release target on one controlled packaging entrypoint", () => {
     const packageJson = JSON.parse(source("package.json"));
     const tauri = JSON.parse(source("src-tauri/tauri.conf.json"));
     const build = source("scripts/desktop-build.mjs");
@@ -45,10 +45,11 @@ describe("desktop installer packaging", () => {
     expect(packageJson.scripts["desktop:build"]).toBe("node scripts/desktop-build.mjs");
     expect(packageJson.scripts["desktop:build:local"]).toBe("node scripts/desktop-build-local.mjs");
     expect(tauri.bundle.targets).toEqual(["app"]);
-    expect(build).toContain('runTauri(["--bundles", "nsis"]');
     expect(build).toContain('const tauriArgs = ["--bundles", "app"]');
     expect(build).toContain("createMacDmg");
     expect(build).toContain("verifyMacDmg");
+    expect(build).toContain("currently supported only on macOS");
+    expect(build).not.toContain('"--bundles", "nsis"');
     expect(localBuild).toContain('"--local-unsigned"');
   });
 
@@ -149,7 +150,8 @@ describe("desktop installer packaging", () => {
 
     expect(workflow).toContain("run: pnpm desktop:build");
     expect(workflow).toContain("runner: macos-latest");
-    expect(workflow).toContain("runner: windows-latest");
+    expect(workflow).not.toContain("runner: windows-latest");
+    expect(workflow).not.toContain("Lunery-Lab-Studio-Windows-x64.exe");
     // Hosted runners import the Developer ID certificate into an ephemeral
     // keychain under RUNNER_TEMP and delete the decoded .p12 before building.
     expect(workflow).toContain("Import Apple Developer certificate into a temporary keychain");

@@ -217,7 +217,7 @@ export async function POST(request: NextRequest) {
           );
         }
         return queuedImportResponse(existing, { recovered: true });
-      } catch (error) {
+      } catch {
         const observed = await probeBridgeDownloadJob(bridge, existing.jobId);
         if (observed.outcome === "observed") {
           return queuedImportResponse(existing, { recovered: true });
