@@ -421,7 +421,7 @@ describe("desktop status cache revision", () => {
       .fn()
       .mockResolvedValueOnce(
         Response.json({
-          providers: [{ id: "openai", configured: false, keychain_status: "missing" }],
+          providers: [{ id: "openai", configured: false, keychain_status: "absent" }],
           local_runtimes: [],
         }),
       )
@@ -476,7 +476,7 @@ describe("desktop status cache revision", () => {
       "fetch",
       vi.fn(async () =>
         Response.json({
-          providers: [{ id: "openai", configured: true, keychain_status: "unavailable" }],
+          providers: [{ id: "openai", configured: true, keychain_status: "unknown" }],
           local_runtimes: [],
         }),
       ),
@@ -486,24 +486,32 @@ describe("desktop status cache revision", () => {
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set(["openai"]));
   });
 
-  it("does not treat a purely keychain-backed unavailable provider as configured", async () => {
+  it("does not negative-cache unknown keychain presence", async () => {
     const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-status-keychain-only-"));
     temporaryDirs.push(runtimeDir);
     vi.stubEnv("LUNERY_RUNTIME_DIR", runtimeDir);
     vi.stubEnv("LUNERY_DESKTOP_BRIDGE_URL", "http://127.0.0.1:49100");
     vi.stubEnv("LUNERY_DESKTOP_BRIDGE_TOKEN", "test-token");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
         Response.json({
-          providers: [{ id: "openai", configured: false, keychain_status: "unavailable" }],
+          providers: [{ id: "openai", configured: false, keychain_status: "unknown" }],
           local_runtimes: [],
         }),
-      ),
-    );
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          providers: [{ id: "openai", configured: true, keychain_status: "present" }],
+          local_runtimes: [],
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
 
     bumpDesktopStatusRevision();
     await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set());
+    await expect(fetchConfiguredProviderIds()).resolves.toEqual(new Set(["openai"]));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("always refreshes dynamic local runtime state", async () => {
