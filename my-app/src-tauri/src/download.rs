@@ -2,14 +2,137 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
 
-use crate::get_http_client;
+use crate::get_http_client_with_connect_timeout;
 use crate::profile::profile_models_root_path;
+
+/// Wakeable process-local cancellation for download jobs.
+///
+/// Uses a `watch` channel (not `Notify::notify_waiters`) so a cancel that races
+/// between the flag check and the waiter registration cannot lose the wakeup.
+/// Waiters blocked on headers, body/read-idle, on-disk hashing, or final flush
+/// observe cancellation deterministically.
+#[derive(Debug)]
+pub(crate) struct DownloadCancel {
+    tx: watch::Sender<bool>,
+}
+
+impl Default for DownloadCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DownloadCancel {
+    pub(crate) fn new() -> Self {
+        let (tx, _) = watch::channel(false);
+        Self { tx }
+    }
+
+    pub(crate) fn request(&self) {
+        // `send` drops the value when there are no active receivers. Jobs can
+        // be canceled between awaited operations, so retain the flag even
+        // when no waiter is currently subscribed.
+        self.tx.send_replace(true);
+    }
+
+    pub(crate) fn is_canceled(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut rx = self.tx.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
+        // Sender dropped — treat as canceled so waiters cannot hang forever.
+    }
+}
+
+/// Artifact policy around the non-preemptible OS rename:
+/// - cancel observed **before** rename begins → keep `.part`, terminal `canceled`
+/// - cancel observed **after** successful rename → keep verified dest, terminal
+///   `canceled` (never transition to `ready`)
+///
+/// Rename itself cannot be preempted once the OS op begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinalizeDecision {
+    /// Still cancelable; leave `.part` in place and mark canceled.
+    CancelKeepPart,
+    /// Proceed to the OS rename (not cancel-preemptible once started).
+    ProceedRename,
+    /// Rename already succeeded; cancel wins over ready.
+    CancelKeepDest,
+    /// Rename succeeded and cancel was not observed — mark ready.
+    MarkReady,
+}
+
+pub(crate) fn finalize_decision_before_rename(canceled: bool) -> FinalizeDecision {
+    if canceled {
+        FinalizeDecision::CancelKeepPart
+    } else {
+        FinalizeDecision::ProceedRename
+    }
+}
+
+pub(crate) fn finalize_decision_after_rename(canceled: bool) -> FinalizeDecision {
+    if canceled {
+        FinalizeDecision::CancelKeepDest
+    } else {
+        FinalizeDecision::MarkReady
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DownloadTimeouts {
+    pub(crate) connect: Duration,
+    pub(crate) headers: Duration,
+    pub(crate) read_idle: Duration,
+}
+
+impl Default for DownloadTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(30),
+            headers: Duration::from_secs(60),
+            read_idle: Duration::from_secs(60),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitOutcome<T> {
+    Ready(T),
+    Canceled,
+    TimedOut,
+}
+
+async fn race_cancel_timeout<T, F>(
+    cancel: &DownloadCancel,
+    timeout: Duration,
+    fut: F,
+) -> WaitOutcome<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => WaitOutcome::Canceled,
+        _ = tokio::time::sleep(timeout) => WaitOutcome::TimedOut,
+        value = fut => WaitOutcome::Ready(value),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Download state (managed by Tauri + shared with bridge handler)
@@ -29,11 +152,18 @@ pub(crate) struct DownloadJob {
     pub(crate) total: u64,
     pub(crate) error: Option<String>,
     pub(crate) destination: PathBuf,
-    owns_destination: bool,
-    finished_at: Option<Instant>,
-    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) owns_destination: bool,
+    pub(crate) finished_at: Option<Instant>,
+    pub(crate) cancel: Arc<DownloadCancel>,
     /// Broadcast channel sender — SSE bridge subscribers drain from a receiver.
     pub(crate) tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DownloadCancelRequest {
+    Accepted,
+    NotFound,
+    Terminal,
 }
 
 impl DownloadJob {
@@ -58,6 +188,8 @@ struct DestinationDeleteLease {
 pub struct DownloadState(
     pub(crate) Mutex<HashMap<String, DownloadJob>>,
     Mutex<HashMap<PathBuf, DestinationDeleteLease>>,
+    Mutex<usize>,
+    Condvar,
 );
 
 const TERMINAL_HISTORY_TTL: Duration = Duration::from_secs(10 * 60);
@@ -65,11 +197,68 @@ const MAX_TERMINAL_HISTORY: usize = 128;
 const DESTINATION_DELETE_LEASE_TTL: Duration = Duration::from_secs(60);
 
 impl DownloadState {
+    pub(crate) fn begin_background_task(&self) {
+        let mut active = self
+            .2
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active += 1;
+    }
+
+    pub(crate) fn finish_background_task(&self) {
+        let mut active = self
+            .2
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active.saturating_sub(1);
+        self.3.notify_all();
+    }
+
+    pub(crate) fn request_cancel_all_active(&self) {
+        let jobs = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for job in jobs.values() {
+            if !is_terminal_download_status(&job.status) {
+                job.cancel.request();
+            }
+        }
+    }
+
+    pub(crate) fn request_cancel_job(&self, job_id: &str) -> DownloadCancelRequest {
+        let jobs = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(job) = jobs.get(job_id) else {
+            return DownloadCancelRequest::NotFound;
+        };
+        if is_terminal_download_status(&job.status) {
+            return DownloadCancelRequest::Terminal;
+        }
+        // Linearizes with update_job_status, which holds this same mutex while
+        // folding any later ready/error commit into canceled.
+        job.cancel.request();
+        DownloadCancelRequest::Accepted
+    }
+
+    pub(crate) fn wait_for_background_tasks(&self) {
+        let active = self
+            .2
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self
+            .3
+            .wait_while(active, |count| *count > 0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
     fn reserve_job(
         &self,
         job_id: &str,
         destination: PathBuf,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<DownloadCancel>,
         tx: tokio::sync::broadcast::Sender<JobSnapshot>,
     ) -> Result<(), String> {
         let now = Instant::now();
@@ -189,12 +378,18 @@ pub(crate) fn hf_download_start_inner(
 
     // Set up a broadcast channel for SSE progress ticks (capacity 64 frames).
     let (tx, _) = tokio::sync::broadcast::channel::<JobSnapshot>(64);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(DownloadCancel::new());
 
     state.reserve_job(&job_id, destination, Arc::clone(&cancel), tx.clone())?;
+    state.begin_background_task();
 
     let state_clone = Arc::clone(&state);
     tauri::async_runtime::spawn(async move {
+        let _completion = DownloadTaskCompletionGuard {
+            job_id: job_id.clone(),
+            state: Arc::clone(&state_clone),
+            tx: tx.clone(),
+        };
         run_download_task(DownloadTask {
             url,
             dest,
@@ -204,11 +399,38 @@ pub(crate) fn hf_download_start_inner(
             state: state_clone,
             tx,
             cancel,
+            timeouts: DownloadTimeouts::default(),
+            #[cfg(test)]
+            hash_test_hook: None,
         })
         .await;
     });
 
     Ok(())
+}
+
+struct DownloadTaskCompletionGuard {
+    job_id: String,
+    state: Arc<DownloadState>,
+    tx: tokio::sync::broadcast::Sender<JobSnapshot>,
+}
+
+impl Drop for DownloadTaskCompletionGuard {
+    fn drop(&mut self) {
+        // Normal paths already committed a terminal state. If an async task
+        // panics or returns early while still active, fail it closed so bridge
+        // shutdown cannot wait forever on an orphaned destination owner.
+        update_job_status(
+            &self.state,
+            &self.job_id,
+            &self.tx,
+            "error",
+            0,
+            0,
+            Some("Download task stopped unexpectedly.".to_string()),
+        );
+        self.state.finish_background_task();
+    }
 }
 
 fn is_terminal_download_status(status: &str) -> bool {
@@ -243,7 +465,7 @@ fn reserve_download_job(
     jobs: &mut HashMap<String, DownloadJob>,
     job_id: &str,
     destination: PathBuf,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<DownloadCancel>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
 ) -> Result<(), String> {
     prune_download_history(jobs, Instant::now());
@@ -416,7 +638,41 @@ struct DownloadTask {
     job_id: String,
     state: Arc<DownloadState>,
     tx: tokio::sync::broadcast::Sender<JobSnapshot>,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<DownloadCancel>,
+    timeouts: DownloadTimeouts,
+    #[cfg(test)]
+    hash_test_hook: Option<Arc<HashReadTestHook>>,
+}
+
+#[cfg(test)]
+struct HashReadTestHook {
+    first_chunk: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl HashReadTestHook {
+    fn new() -> Self {
+        Self {
+            first_chunk: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn pause_after_first_chunk(&self) {
+        self.first_chunk.notify_one();
+        self.resume.notified().await;
+    }
+}
+
+async fn mark_download_canceled(
+    state: &Arc<DownloadState>,
+    job_id: &str,
+    tx: &tokio::sync::broadcast::Sender<JobSnapshot>,
+    received: u64,
+    total: u64,
+) {
+    update_job_status(state, job_id, tx, "canceled", received, total, None);
 }
 
 async fn run_download_task(task: DownloadTask) {
@@ -429,12 +685,34 @@ async fn run_download_task(task: DownloadTask) {
         state,
         tx,
         cancel,
+        timeouts,
+        #[cfg(test)]
+        hash_test_hook,
     } = task;
     let dest_path = PathBuf::from(&dest);
+    if cancel.is_canceled() {
+        mark_download_canceled(&state, &job_id, &tx, 0, 0).await;
+        return;
+    }
     if dest_path.is_file() {
         let existing_dest_bytes = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
         let linked_etag = if sha256.is_none() {
-            fetch_hf_linked_etag(&url).await.ok().flatten()
+            match race_cancel_timeout(&cancel, timeouts.headers, fetch_hf_linked_etag(&url)).await {
+                WaitOutcome::Ready(Ok(value)) => value,
+                WaitOutcome::Ready(Err(_)) => None,
+                WaitOutcome::Canceled => {
+                    mark_download_canceled(
+                        &state,
+                        &job_id,
+                        &tx,
+                        existing_dest_bytes,
+                        existing_dest_bytes,
+                    )
+                    .await;
+                    return;
+                }
+                WaitOutcome::TimedOut => None,
+            }
         } else {
             None
         };
@@ -447,8 +725,27 @@ async fn run_download_task(task: DownloadTask) {
             );
             return;
         }
-        match sha256_file_from_disk(&dest_path).await {
+        match sha256_file_from_disk_cancellable(
+            &dest_path,
+            &cancel,
+            timeouts.read_idle,
+            #[cfg(test)]
+            hash_test_hook.as_deref(),
+        )
+        .await
+        {
             Ok(actual) => {
+                if cancel.is_canceled() {
+                    mark_download_canceled(
+                        &state,
+                        &job_id,
+                        &tx,
+                        existing_dest_bytes,
+                        existing_dest_bytes,
+                    )
+                    .await;
+                    return;
+                }
                 match compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref()) {
                     Ok(()) => {
                         update_job_status(
@@ -474,6 +771,17 @@ async fn run_download_task(task: DownloadTask) {
                     }
                 }
             }
+            Err(err) if cancel.is_canceled() || err.kind() == std::io::ErrorKind::Interrupted => {
+                mark_download_canceled(
+                    &state,
+                    &job_id,
+                    &tx,
+                    existing_dest_bytes,
+                    existing_dest_bytes,
+                )
+                .await;
+                return;
+            }
             Err(err) => {
                 set_job_error(
                     &state,
@@ -496,7 +804,7 @@ async fn run_download_task(task: DownloadTask) {
     // Build the HTTP request with optional Range header.
     // E6: Use the process-wide shared client (connection-pool reuse across concurrent
     // downloads). Falls back to inline build on first-init race; error path unchanged.
-    let client = match get_http_client() {
+    let client = match get_http_client_with_connect_timeout(timeouts.connect) {
         Ok(c) => c,
         Err(err) => {
             set_job_error(&state, &job_id, &tx, &format!("HTTP client error: {err}"));
@@ -509,10 +817,23 @@ async fn run_download_task(task: DownloadTask) {
         request = request.header("Range", format!("bytes={existing_bytes}-"));
     }
 
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(err) => {
+    let response = match race_cancel_timeout(&cancel, timeouts.headers, request.send()).await {
+        WaitOutcome::Ready(Ok(r)) => r,
+        WaitOutcome::Ready(Err(err)) => {
             set_job_error(&state, &job_id, &tx, &format!("Request failed: {err}"));
+            return;
+        }
+        WaitOutcome::Canceled => {
+            mark_download_canceled(&state, &job_id, &tx, existing_bytes, 0).await;
+            return;
+        }
+        WaitOutcome::TimedOut => {
+            set_job_error(
+                &state,
+                &job_id,
+                &tx,
+                "Timed out waiting for download response headers.",
+            );
             return;
         }
     };
@@ -571,8 +892,24 @@ async fn run_download_task(task: DownloadTask) {
                     );
                     return;
                 }
-                let actual = match sha256_file_from_disk(&part_path).await {
+                let actual = match sha256_file_from_disk_cancellable(
+                    &part_path,
+                    &cancel,
+                    timeouts.read_idle,
+                    #[cfg(test)]
+                    hash_test_hook.as_deref(),
+                )
+                .await
+                {
                     Ok(digest) => digest,
+                    Err(err)
+                        if cancel.is_canceled()
+                            || err.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        mark_download_canceled(&state, &job_id, &tx, existing_bytes, remote_total)
+                            .await;
+                        return;
+                    }
                     Err(err) => {
                         let primary = format!("Could not verify completed partial download: {err}");
                         let message =
@@ -581,6 +918,11 @@ async fn run_download_task(task: DownloadTask) {
                         return;
                     }
                 };
+                if cancel.is_canceled() {
+                    mark_download_canceled(&state, &job_id, &tx, existing_bytes, remote_total)
+                        .await;
+                    return;
+                }
                 if let Err(message) =
                     compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref())
                 {
@@ -588,7 +930,23 @@ async fn run_download_task(task: DownloadTask) {
                     set_job_error(&state, &job_id, &tx, &message);
                     return;
                 }
+                if matches!(
+                    finalize_decision_before_rename(cancel.is_canceled()),
+                    FinalizeDecision::CancelKeepPart
+                ) {
+                    mark_download_canceled(&state, &job_id, &tx, existing_bytes, remote_total)
+                        .await;
+                    return;
+                }
                 if let Err(err) = tokio::fs::rename(&part_path, &dest).await {
+                    if matches!(
+                        finalize_decision_before_rename(cancel.is_canceled()),
+                        FinalizeDecision::CancelKeepPart
+                    ) {
+                        mark_download_canceled(&state, &job_id, &tx, existing_bytes, remote_total)
+                            .await;
+                        return;
+                    }
                     set_job_error(
                         &state,
                         &job_id,
@@ -597,15 +955,28 @@ async fn run_download_task(task: DownloadTask) {
                     );
                     return;
                 }
-                update_job_status(
-                    &state,
-                    &job_id,
-                    &tx,
-                    "ready",
-                    existing_bytes,
-                    remote_total,
-                    None,
-                );
+                match finalize_decision_after_rename(cancel.is_canceled()) {
+                    FinalizeDecision::CancelKeepDest => {
+                        // Rename succeeded under cancel: keep verified dest, never ready.
+                        mark_download_canceled(&state, &job_id, &tx, existing_bytes, remote_total)
+                            .await;
+                    }
+                    FinalizeDecision::MarkReady => {
+                        update_job_status(
+                            &state,
+                            &job_id,
+                            &tx,
+                            "ready",
+                            existing_bytes,
+                            remote_total,
+                            None,
+                        );
+                    }
+                    FinalizeDecision::CancelKeepPart | FinalizeDecision::ProceedRename => {
+                        mark_download_canceled(&state, &job_id, &tx, existing_bytes, remote_total)
+                            .await;
+                    }
+                }
                 return;
             }
             PartialDownloadState::Oversized => {
@@ -780,7 +1151,7 @@ async fn run_download_task(task: DownloadTask) {
     let mut stream = response.bytes_stream();
 
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_canceled() {
             if let Err(err) = file.flush().await {
                 let primary = format!("Could not preserve canceled partial download: {err}");
                 drop(file);
@@ -788,14 +1159,46 @@ async fn run_download_task(task: DownloadTask) {
                 set_job_error(&state, &job_id, &tx, &message);
                 return;
             }
-            update_job_status(&state, &job_id, &tx, "canceled", received, total, None);
+            mark_download_canceled(&state, &job_id, &tx, received, total).await;
             // Leave the .part file in place for future resume.
             return;
         }
 
-        match stream.next().await {
-            Some(Ok(chunk)) => {
-                // chunk is bytes::Bytes (owned, Sized)
+        let next = race_cancel_timeout(&cancel, timeouts.read_idle, stream.next()).await;
+        match next {
+            WaitOutcome::Canceled => {
+                if let Err(err) = file.flush().await {
+                    let primary = format!("Could not preserve canceled partial download: {err}");
+                    drop(file);
+                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    set_job_error(&state, &job_id, &tx, &message);
+                    return;
+                }
+                mark_download_canceled(&state, &job_id, &tx, received, total).await;
+                return;
+            }
+            WaitOutcome::TimedOut => {
+                if let Err(flush_err) = file.flush().await {
+                    let primary = format!(
+                        "Read idle timeout. Partial download could not be preserved: {flush_err}"
+                    );
+                    drop(file);
+                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+                    set_job_error(&state, &job_id, &tx, &message);
+                    return;
+                }
+                update_job_status(
+                    &state,
+                    &job_id,
+                    &tx,
+                    "error",
+                    received,
+                    total,
+                    Some("Read idle timeout. Partial download kept for retry.".to_string()),
+                );
+                return;
+            }
+            WaitOutcome::Ready(Some(Ok(chunk))) => {
                 if let Err(err) = file.write_all(chunk.as_ref()).await {
                     let primary = format!("Write error: {err}");
                     drop(file);
@@ -807,13 +1210,12 @@ async fn run_download_task(task: DownloadTask) {
                 if let Some(ref mut h) = hasher {
                     h.update(chunk.as_ref());
                 }
-                // Throttle progress ticks to ~250 ms.
                 if last_tick.elapsed() >= Duration::from_millis(250) {
                     update_job_status(&state, &job_id, &tx, "downloading", received, total, None);
                     last_tick = Instant::now();
                 }
             }
-            Some(Err(ref err)) => {
+            WaitOutcome::Ready(Some(Err(ref err))) => {
                 if let Err(flush_err) = file.flush().await {
                     let primary = format!(
                         "Stream error: {err}. Partial download could not be preserved: {flush_err}"
@@ -836,19 +1238,44 @@ async fn run_download_task(task: DownloadTask) {
                 );
                 return;
             }
-            None => break, // stream exhausted
+            WaitOutcome::Ready(None) => break,
         }
     }
 
-    // Flush and close the file.
-    if let Err(err) = file.flush().await {
-        let primary = format!("Flush error: {err}");
-        drop(file);
-        let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
-        set_job_error(&state, &job_id, &tx, &message);
+    // Final flush is itself cancel/timeout-raced: a stalling flush must not
+    // ignore cancellation or hang past the read-idle budget.
+    match race_cancel_timeout(&cancel, timeouts.read_idle, file.flush()).await {
+        WaitOutcome::Canceled => {
+            drop(file);
+            mark_download_canceled(&state, &job_id, &tx, received, total).await;
+            return;
+        }
+        WaitOutcome::TimedOut => {
+            drop(file);
+            let primary = "Timed out flushing download to disk.";
+            let message = cleanup_failed_download(&part_path, primary, "Part file").await;
+            set_job_error(&state, &job_id, &tx, &message);
+            return;
+        }
+        WaitOutcome::Ready(Err(err)) => {
+            let primary = format!("Flush error: {err}");
+            drop(file);
+            let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
+            set_job_error(&state, &job_id, &tx, &message);
+            return;
+        }
+        WaitOutcome::Ready(Ok(())) => {
+            drop(file);
+        }
+    }
+
+    if matches!(
+        finalize_decision_before_rename(cancel.is_canceled()),
+        FinalizeDecision::CancelKeepPart
+    ) {
+        mark_download_canceled(&state, &job_id, &tx, received, total).await;
         return;
     }
-    drop(file);
 
     // SHA-256 verification. When the catalog supplies an expected digest, OR
     // the HF response carried an x-linked-etag, the complete file must be
@@ -866,16 +1293,41 @@ async fn run_download_task(task: DownloadTask) {
                     .map(|b| format!("{b:02x}"))
                     .collect::<String>()
             }
-            None => match sha256_file_from_disk(&part_path).await {
-                Ok(digest) => digest,
-                Err(err) => {
-                    let primary = format!("Could not verify download integrity: {err}");
-                    let message = cleanup_failed_download(&part_path, &primary, "Part file").await;
-                    set_job_error(&state, &job_id, &tx, &message);
-                    return;
+            None => {
+                match sha256_file_from_disk_cancellable(
+                    &part_path,
+                    &cancel,
+                    timeouts.read_idle,
+                    #[cfg(test)]
+                    hash_test_hook.as_deref(),
+                )
+                .await
+                {
+                    Ok(digest) => digest,
+                    Err(err)
+                        if cancel.is_canceled()
+                            || err.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        mark_download_canceled(&state, &job_id, &tx, received, total).await;
+                        return;
+                    }
+                    Err(err) => {
+                        let primary = format!("Could not verify download integrity: {err}");
+                        let message =
+                            cleanup_failed_download(&part_path, &primary, "Part file").await;
+                        set_job_error(&state, &job_id, &tx, &message);
+                        return;
+                    }
                 }
-            },
+            }
         };
+        if matches!(
+            finalize_decision_before_rename(cancel.is_canceled()),
+            FinalizeDecision::CancelKeepPart
+        ) {
+            mark_download_canceled(&state, &job_id, &tx, received, total).await;
+            return;
+        }
         if let Err(message) =
             compare_download_hashes(&actual, sha256.as_deref(), linked_etag.as_deref())
         {
@@ -885,8 +1337,26 @@ async fn run_download_task(task: DownloadTask) {
         }
     }
 
-    // Rename .part → dest.
+    if matches!(
+        finalize_decision_before_rename(cancel.is_canceled()),
+        FinalizeDecision::CancelKeepPart
+    ) {
+        // Cancellation before rename: preserve `.part` for resume; never ready.
+        mark_download_canceled(&state, &job_id, &tx, received, total).await;
+        return;
+    }
+
+    // Rename .part → dest. Once the OS rename begins it cannot be preempted;
+    // cancel observed afterwards keeps the verified destination but the job
+    // remains canceled and can never transition to ready.
     if let Err(err) = tokio::fs::rename(&part_path, &dest).await {
+        if matches!(
+            finalize_decision_before_rename(cancel.is_canceled()),
+            FinalizeDecision::CancelKeepPart
+        ) {
+            mark_download_canceled(&state, &job_id, &tx, received, total).await;
+            return;
+        }
         set_job_error(
             &state,
             &job_id,
@@ -895,25 +1365,94 @@ async fn run_download_task(task: DownloadTask) {
         );
         return;
     }
-
-    // Mark as ready.
-    update_job_status(&state, &job_id, &tx, "ready", received, total, None);
+    match finalize_decision_after_rename(cancel.is_canceled()) {
+        FinalizeDecision::CancelKeepDest => {
+            mark_download_canceled(&state, &job_id, &tx, received, total).await;
+        }
+        FinalizeDecision::MarkReady => {
+            update_job_status(&state, &job_id, &tx, "ready", received, total, None);
+        }
+        FinalizeDecision::CancelKeepPart | FinalizeDecision::ProceedRename => {
+            // Unreachable after a successful rename.
+            mark_download_canceled(&state, &job_id, &tx, received, total).await;
+        }
+    }
 }
 
 /// Compute the SHA-256 of a file by streaming it from disk in 1 MiB chunks.
 /// Used to verify resumed downloads, where the already-downloaded bytes never
 /// pass through the in-memory streaming hasher.
+#[cfg(test)]
 async fn sha256_file_from_disk(path: &std::path::Path) -> Result<String, std::io::Error> {
-    use tokio::io::AsyncReadExt;
+    sha256_file_from_disk_cancellable(
+        path,
+        &DownloadCancel::new(),
+        Duration::from_secs(3600),
+        None,
+    )
+    .await
+}
+
+async fn sha256_file_from_disk_cancellable(
+    path: &std::path::Path,
+    cancel: &DownloadCancel,
+    read_idle: Duration,
+    #[cfg(test)] test_hook: Option<&HashReadTestHook>,
+) -> Result<String, std::io::Error> {
     let mut file = tokio::fs::File::open(path).await?;
+    sha256_reader_cancellable(
+        &mut file,
+        cancel,
+        read_idle,
+        #[cfg(test)]
+        test_hook,
+    )
+    .await
+}
+
+async fn sha256_reader_cancellable<R>(
+    reader: &mut R,
+    cancel: &DownloadCancel,
+    read_idle: Duration,
+    #[cfg(test)] mut test_hook: Option<&HashReadTestHook>,
+) -> Result<String, std::io::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
-        let read = file.read(&mut buf).await?;
+        if cancel.is_canceled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "download canceled during hashing",
+            ));
+        }
+        let read = match race_cancel_timeout(cancel, read_idle, reader.read(&mut buf)).await {
+            WaitOutcome::Ready(Ok(n)) => n,
+            WaitOutcome::Ready(Err(err)) => return Err(err),
+            WaitOutcome::Canceled => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "download canceled during hashing",
+                ))
+            }
+            WaitOutcome::TimedOut => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "read idle timeout during hashing",
+                ))
+            }
+        };
         if read == 0 {
             break;
         }
         hasher.update(&buf[..read]);
+        #[cfg(test)]
+        if let Some(hook) = test_hook.take() {
+            hook.pause_after_first_chunk().await;
+        }
     }
     let result = hasher.finalize();
     Ok(result
@@ -1037,6 +1576,21 @@ async fn cleanup_failed_download(path: &Path, primary: &str, label: &str) -> Str
     cleanup_result_message(primary, label, tokio::fs::remove_file(path).await)
 }
 
+/// Terminal status transitions are monotonic. Once a job is ready/error/canceled
+/// it never leaves that state, and canceled can never become ready.
+pub(crate) fn can_commit_download_status(current: &str, next: &str) -> bool {
+    if current == next {
+        return true;
+    }
+    if is_terminal_download_status(current) {
+        return false;
+    }
+    if current == "canceled" && next == "ready" {
+        return false;
+    }
+    true
+}
+
 pub(crate) fn update_job_status(
     state: &Arc<DownloadState>,
     job_id: &str,
@@ -1046,26 +1600,40 @@ pub(crate) fn update_job_status(
     total: u64,
     error: Option<String>,
 ) {
-    let snapshot = JobSnapshot {
-        status: status.to_string(),
-        received,
-        total,
-        error: error.clone(),
-    };
-    if let Ok(mut guard) = state.0.lock() {
+    let committed = if let Ok(mut guard) = state.0.lock() {
         if let Some(job) = guard.get_mut(job_id) {
-            job.status = status.to_string();
-            job.received = received;
-            job.total = total;
-            job.error = error;
-            if is_terminal_download_status(status) {
-                job.owns_destination = false;
-                job.finished_at = Some(Instant::now());
+            if !can_commit_download_status(&job.status, status) {
+                None
+            } else if job.cancel.is_canceled() && !is_terminal_download_status(status) {
+                // Ignore late progress after an accepted cancel. The worker
+                // still owns the destination until it reaches a real terminal
+                // branch and commits canceled below.
+                None
+            } else {
+                let cancel_wins = job.cancel.is_canceled()
+                    && matches!(status, "ready" | "error")
+                    && !is_terminal_download_status(&job.status);
+                let committed_status = if cancel_wins { "canceled" } else { status };
+                job.status = committed_status.to_string();
+                job.received = received;
+                job.total = total;
+                job.error = if cancel_wins { None } else { error };
+                if is_terminal_download_status(committed_status) {
+                    job.owns_destination = false;
+                    job.finished_at = Some(Instant::now());
+                }
+                Some(job.snapshot())
             }
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    // Broadcast only committed snapshots.
+    if let Some(snapshot) = committed {
+        let _ = tx.send(snapshot);
     }
-    // Broadcast — ignore send errors (no active SSE subscriber is fine).
-    let _ = tx.send(snapshot);
 }
 
 pub(crate) fn set_job_error(
@@ -1080,19 +1648,49 @@ pub(crate) fn set_job_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_partial_download, cleanup_result_message, compare_download_hashes,
+        can_commit_download_status, classify_partial_download, cleanup_result_message,
+        compare_download_hashes, finalize_decision_after_rename, finalize_decision_before_rename,
         linked_etag_from_headers, parse_content_range_total, reserve_download_job,
-        run_download_task, sha256_file_from_disk, update_job_status, validate_hf_download_dest,
-        DownloadJob, DownloadState, DownloadTask, PartialDownloadState, MAX_TERMINAL_HISTORY,
+        run_download_task, sha256_file_from_disk, sha256_reader_cancellable, update_job_status,
+        validate_hf_download_dest, DownloadCancel, DownloadCancelRequest, DownloadJob,
+        DownloadState, DownloadTask, DownloadTimeouts, FinalizeDecision, HashReadTestHook,
+        PartialDownloadState, MAX_TERMINAL_HISTORY,
     };
     use crate::test_global_lock;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use sha2::{Digest, Sha256};
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::pin::Pin;
+    use std::sync::{Arc, Barrier};
+    use std::task::{Context, Poll};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::sync::oneshot;
+
+    struct OneChunkThenPending {
+        emitted: bool,
+        first_chunk: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for OneChunkThenPending {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.emitted {
+                self.emitted = true;
+                buf.put_slice(b"first hash chunk");
+                if let Some(first_chunk) = self.first_chunk.take() {
+                    let _ = first_chunk.send(());
+                }
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        }
+    }
 
     fn unique_test_path(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -1123,7 +1721,7 @@ mod tests {
             .reserve_job(
                 "blocked-job",
                 destination.clone(),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(DownloadCancel::new()),
                 tx.clone(),
             )
             .is_err());
@@ -1133,7 +1731,7 @@ mod tests {
             .reserve_job(
                 "allowed-job",
                 destination,
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(DownloadCancel::new()),
                 tx,
             )
             .expect("released lease allows a new download");
@@ -1275,7 +1873,7 @@ mod tests {
                     &mut jobs,
                     "first",
                     destination.clone(),
-                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(DownloadCancel::new()),
                     first_tx.clone(),
                 )
                 .expect("first reservation should succeed");
@@ -1288,7 +1886,7 @@ mod tests {
                     &mut jobs,
                     "second",
                     destination.clone(),
-                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(DownloadCancel::new()),
                     blocked_tx,
                 )
                 .expect_err("same active destination must be rejected")
@@ -1306,7 +1904,7 @@ mod tests {
                 &mut jobs,
                 "second",
                 destination,
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(DownloadCancel::new()),
                 released_tx,
             )
             .expect("terminal job should release destination ownership");
@@ -1326,7 +1924,7 @@ mod tests {
                     &mut jobs,
                     &job_id,
                     unique_test_path(&format!("terminal-{index}.gguf")),
-                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(DownloadCancel::new()),
                     tx.clone(),
                 )
                 .expect("reserve terminal fixture");
@@ -1340,7 +1938,7 @@ mod tests {
             &mut jobs,
             "active",
             unique_test_path("active-history-bound.gguf"),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(DownloadCancel::new()),
             active_tx,
         )
         .expect("trigger terminal history pruning");
@@ -1360,7 +1958,7 @@ mod tests {
             .expect("hash existing dest");
         let state = Arc::new(DownloadState::default());
         let (tx, _) = tokio::sync::broadcast::channel(8);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(DownloadCancel::new());
         let job_id = "existing-complete-dest".to_string();
         {
             let mut guard = state.0.lock().expect("download state lock");
@@ -1388,7 +1986,9 @@ mod tests {
             job_id: job_id.clone(),
             state: Arc::clone(&state),
             tx,
-            cancel,
+            cancel: Arc::clone(&cancel),
+            timeouts: DownloadTimeouts::default(),
+            hash_test_hook: None,
         })
         .await;
 
@@ -1426,7 +2026,7 @@ mod tests {
             .expect("write existing dest");
         let state = Arc::new(DownloadState::default());
         let (tx, _) = tokio::sync::broadcast::channel(8);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(DownloadCancel::new());
         let job_id = "existing-unverified-dest".to_string();
         {
             let mut guard = state.0.lock().expect("download state lock");
@@ -1454,7 +2054,9 @@ mod tests {
             job_id: job_id.clone(),
             state: Arc::clone(&state),
             tx,
-            cancel,
+            cancel: Arc::clone(&cancel),
+            timeouts: DownloadTimeouts::default(),
+            hash_test_hook: None,
         })
         .await;
         server.join().expect("metadata server should finish");
@@ -1487,7 +2089,7 @@ mod tests {
             .expect("write existing dest");
         let state = Arc::new(DownloadState::default());
         let (tx, _) = tokio::sync::broadcast::channel(8);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(DownloadCancel::new());
         let job_id = "existing-mismatched-dest".to_string();
         {
             let mut guard = state.0.lock().expect("download state lock");
@@ -1516,6 +2118,8 @@ mod tests {
             state: Arc::clone(&state),
             tx,
             cancel,
+            timeouts: DownloadTimeouts::default(),
+            hash_test_hook: None,
         })
         .await;
 
@@ -1554,7 +2158,7 @@ mod tests {
         let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.to_string_lossy()));
         let state = Arc::new(DownloadState::default());
         let (tx, _) = tokio::sync::broadcast::channel(8);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(DownloadCancel::new());
         let job_id = "stream-error-keeps-partial".to_string();
         {
             let mut guard = state.0.lock().expect("download state lock");
@@ -1583,6 +2187,8 @@ mod tests {
             state: Arc::clone(&state),
             tx,
             cancel,
+            timeouts: DownloadTimeouts::default(),
+            hash_test_hook: None,
         })
         .await;
         server.join().expect("test server thread should finish");
@@ -1606,6 +2212,539 @@ mod tests {
             b"partial"
         );
 
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[test]
+    fn terminal_status_transitions_are_monotonic_and_canceled_never_becomes_ready() {
+        assert!(can_commit_download_status("downloading", "ready"));
+        assert!(can_commit_download_status("downloading", "canceled"));
+        assert!(!can_commit_download_status("canceled", "ready"));
+        assert!(!can_commit_download_status("ready", "canceled"));
+        assert!(!can_commit_download_status("error", "ready"));
+        assert!(can_commit_download_status("canceled", "canceled"));
+
+        let state = Arc::new(DownloadState::default());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        {
+            let mut jobs = state.0.lock().unwrap();
+            reserve_download_job(
+                &mut jobs,
+                "mono",
+                unique_test_path("mono.bin"),
+                Arc::clone(&cancel),
+                tx.clone(),
+            )
+            .unwrap();
+        }
+        update_job_status(&state, "mono", &tx, "canceled", 1, 2, None);
+        update_job_status(&state, "mono", &tx, "ready", 2, 2, None);
+        let status = state.0.lock().unwrap().get("mono").unwrap().status.clone();
+        assert_eq!(status, "canceled");
+        assert_eq!(rx.try_recv().unwrap().status, "canceled");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancel_ack_and_terminal_commit_are_linearizable_under_race() {
+        for iteration in 0..100 {
+            let state = Arc::new(DownloadState::default());
+            let (tx, _) = tokio::sync::broadcast::channel(8);
+            let cancel = Arc::new(DownloadCancel::new());
+            let job_id = format!("cancel-ready-race-{iteration}");
+            state.0.lock().unwrap().insert(
+                job_id.clone(),
+                DownloadJob {
+                    status: "downloading".to_string(),
+                    received: 1,
+                    total: 2,
+                    error: None,
+                    destination: unique_test_path("cancel-ready-race.bin"),
+                    owns_destination: true,
+                    finished_at: None,
+                    cancel,
+                    tx: tx.clone(),
+                },
+            );
+            let barrier = Arc::new(Barrier::new(3));
+            let cancel_state = Arc::clone(&state);
+            let cancel_job = job_id.clone();
+            let cancel_barrier = Arc::clone(&barrier);
+            let cancel_thread = std::thread::spawn(move || {
+                cancel_barrier.wait();
+                cancel_state.request_cancel_job(&cancel_job)
+            });
+            let ready_state = Arc::clone(&state);
+            let ready_job = job_id.clone();
+            let ready_tx = tx.clone();
+            let ready_barrier = Arc::clone(&barrier);
+            let ready_thread = std::thread::spawn(move || {
+                ready_barrier.wait();
+                update_job_status(&ready_state, &ready_job, &ready_tx, "ready", 2, 2, None);
+            });
+            barrier.wait();
+            let cancel_result = cancel_thread.join().expect("cancel thread");
+            ready_thread.join().expect("ready thread");
+            let status = state.0.lock().unwrap().get(&job_id).unwrap().status.clone();
+            match cancel_result {
+                DownloadCancelRequest::Accepted => assert_eq!(status, "canceled"),
+                DownloadCancelRequest::Terminal => assert_eq!(status, "ready"),
+                DownloadCancelRequest::NotFound => panic!("reserved job disappeared"),
+            }
+        }
+    }
+
+    #[test]
+    fn late_progress_after_cancel_keeps_destination_owned_until_terminal() {
+        let state = Arc::new(DownloadState::default());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        state.0.lock().unwrap().insert(
+            "cancel-ownership".to_string(),
+            DownloadJob {
+                status: "downloading".to_string(),
+                received: 1,
+                total: 3,
+                error: None,
+                destination: unique_test_path("cancel-ownership.bin"),
+                owns_destination: true,
+                finished_at: None,
+                cancel,
+                tx: tx.clone(),
+            },
+        );
+        assert_eq!(
+            state.request_cancel_job("cancel-ownership"),
+            DownloadCancelRequest::Accepted
+        );
+        update_job_status(&state, "cancel-ownership", &tx, "downloading", 2, 3, None);
+        {
+            let jobs = state.0.lock().unwrap();
+            let job = jobs.get("cancel-ownership").unwrap();
+            assert_eq!(job.status, "downloading");
+            assert_eq!(job.received, 1, "late progress is ignored");
+            assert!(job.owns_destination);
+        }
+        assert!(rx.try_recv().is_err());
+
+        // Even if the worker reaches an error/ready branch, accepted cancel is
+        // the linearized terminal result and only now releases ownership.
+        update_job_status(
+            &state,
+            "cancel-ownership",
+            &tx,
+            "error",
+            2,
+            3,
+            Some("late error".to_string()),
+        );
+        let jobs = state.0.lock().unwrap();
+        let job = jobs.get("cancel-ownership").unwrap();
+        assert_eq!(job.status, "canceled");
+        assert!(!job.owns_destination);
+        assert_eq!(rx.try_recv().expect("terminal snapshot").status, "canceled");
+    }
+
+    #[tokio::test]
+    async fn cancel_wakes_header_wait_before_body_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            let _ = accepted_tx.send(());
+            // Keep the TCP connection open without waiting for request bytes.
+            // recv_timeout bounds the test server even if the client regresses.
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+
+        let dest_path = unique_test_path("cancel-headers.bin");
+        let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.to_string_lossy()));
+        let state = Arc::new(DownloadState::default());
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        let job_id = "cancel-headers".to_string();
+        {
+            let mut jobs = state.0.lock().unwrap();
+            jobs.insert(
+                job_id.clone(),
+                DownloadJob {
+                    status: "queued".to_string(),
+                    received: 0,
+                    total: 0,
+                    error: None,
+                    destination: dest_path.clone(),
+                    owns_destination: true,
+                    finished_at: None,
+                    cancel: Arc::clone(&cancel),
+                    tx: tx.clone(),
+                },
+            );
+        }
+
+        let task = tokio::spawn(run_download_task(DownloadTask {
+            url: format!("http://{addr}/slow"),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path,
+            sha256: Some("a".repeat(64)),
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
+            tx,
+            cancel: Arc::clone(&cancel),
+            timeouts: DownloadTimeouts {
+                connect: Duration::from_secs(2),
+                headers: Duration::from_secs(2),
+                read_idle: Duration::from_millis(200),
+            },
+            hash_test_hook: None,
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("client must connect before cancellation")
+            .expect("accept signal");
+        cancel.request();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("header wait must be canceled promptly")
+            .expect("download task join");
+
+        let status = state.0.lock().unwrap().get(&job_id).unwrap().status.clone();
+        assert_eq!(status, "canceled");
+        let _ = release_tx.send(());
+        server.join().expect("bounded test server must finish");
+        let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[tokio::test]
+    async fn cancel_wakes_stalled_body_chunk_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let body = b"hello-world-bytes";
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(body);
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let digest_for_server = digest.clone();
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("request read timeout");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Linked-ETag: \"{digest_for_server}\"\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).expect("headers");
+            stream.write_all(&body[..5]).expect("first chunk");
+            let _ = stream.flush();
+            let _ = stalled_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+
+        let dest_path = unique_test_path("cancel-body.bin");
+        let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.to_string_lossy()));
+        let state = Arc::new(DownloadState::default());
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        let job_id = "cancel-body".to_string();
+        {
+            let mut jobs = state.0.lock().unwrap();
+            jobs.insert(
+                job_id.clone(),
+                DownloadJob {
+                    status: "queued".to_string(),
+                    received: 0,
+                    total: 0,
+                    error: None,
+                    destination: dest_path.clone(),
+                    owns_destination: true,
+                    finished_at: None,
+                    cancel: Arc::clone(&cancel),
+                    tx: tx.clone(),
+                },
+            );
+        }
+
+        let task = tokio::spawn(run_download_task(DownloadTask {
+            url: format!("http://{addr}/model.bin"),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path: part_path.clone(),
+            sha256: Some(digest),
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
+            tx,
+            cancel: Arc::clone(&cancel),
+            timeouts: DownloadTimeouts {
+                connect: Duration::from_secs(2),
+                headers: Duration::from_secs(2),
+                read_idle: Duration::from_secs(2),
+            },
+            hash_test_hook: None,
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), stalled_rx)
+            .await
+            .expect("body must enter a stalled-chunk wait")
+            .expect("stall signal");
+        cancel.request();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("body wait must be canceled promptly")
+            .expect("download task join");
+
+        let status = state.0.lock().unwrap().get(&job_id).unwrap().status.clone();
+        assert_eq!(status, "canceled");
+        assert!(!can_commit_download_status(&status, "ready"));
+        let _ = release_tx.send(());
+        server.join().expect("bounded test server must finish");
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[test]
+    fn finalize_decision_seam_preserves_part_or_dest_never_ready_after_cancel() {
+        assert_eq!(
+            finalize_decision_before_rename(true),
+            FinalizeDecision::CancelKeepPart
+        );
+        assert_eq!(
+            finalize_decision_before_rename(false),
+            FinalizeDecision::ProceedRename
+        );
+        assert_eq!(
+            finalize_decision_after_rename(true),
+            FinalizeDecision::CancelKeepDest
+        );
+        assert_eq!(
+            finalize_decision_after_rename(false),
+            FinalizeDecision::MarkReady
+        );
+        assert!(!can_commit_download_status("canceled", "ready"));
+    }
+
+    #[tokio::test]
+    async fn cancel_wakeup_is_race_free_under_stress() {
+        // Regression for Notify::notify_waiters lost-wakeup: watch-based cancel
+        // must wake every waiter even when request races the subscribe/check.
+        for _ in 0..200 {
+            let cancel = Arc::new(DownloadCancel::new());
+            let cancel_wait = Arc::clone(&cancel);
+            let waiter = tokio::spawn(async move {
+                cancel_wait.cancelled().await;
+            });
+            // Yield so the waiter is likely parked in changed().await, then cancel.
+            tokio::task::yield_now().await;
+            cancel.request();
+            tokio::time::timeout(Duration::from_millis(200), waiter)
+                .await
+                .expect("cancel must wake waiter without lost wakeup")
+                .expect("waiter join");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_during_on_disk_hash_interrupts_deterministically() {
+        let (first_chunk_tx, first_chunk_rx) = oneshot::channel();
+        let mut reader = OneChunkThenPending {
+            emitted: false,
+            first_chunk: Some(first_chunk_tx),
+        };
+        let cancel = Arc::new(DownloadCancel::new());
+        let cancel_for_hash = Arc::clone(&cancel);
+        let hash = tokio::spawn(async move {
+            sha256_reader_cancellable(&mut reader, &cancel_for_hash, Duration::from_secs(5), None)
+                .await
+        });
+
+        first_chunk_rx
+            .await
+            .expect("hash reader must signal after its first chunk");
+        cancel.request();
+        let err = tokio::time::timeout(Duration::from_secs(1), hash)
+            .await
+            .expect("hash cancellation must be prompt")
+            .expect("hash task join")
+            .expect_err("hash must interrupt");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(cancel.is_canceled());
+    }
+
+    #[tokio::test]
+    async fn cancel_during_hash_stage_of_existing_dest_marks_canceled_not_ready() {
+        let dest_path = unique_test_path("hash-stage-cancel.bin");
+        let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.to_string_lossy()));
+        let payload = b"existing destination hash fixture";
+        tokio::fs::write(&dest_path, payload)
+            .await
+            .expect("write existing destination");
+        let expected = {
+            let mut hasher = Sha256::new();
+            hasher.update(payload);
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let state = Arc::new(DownloadState::default());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        let job_id = "hash-stage-cancel".to_string();
+        {
+            let mut jobs = state.0.lock().unwrap();
+            jobs.insert(
+                job_id.clone(),
+                DownloadJob {
+                    status: "queued".to_string(),
+                    received: 0,
+                    total: 0,
+                    error: None,
+                    destination: dest_path.clone(),
+                    owns_destination: true,
+                    finished_at: None,
+                    cancel: Arc::clone(&cancel),
+                    tx: tx.clone(),
+                },
+            );
+        }
+        let hook = Arc::new(HashReadTestHook::new());
+        let task = tokio::spawn(run_download_task(DownloadTask {
+            url: "https://huggingface.co/org/repo/resolve/main/model.gguf".to_string(),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path: part_path.clone(),
+            sha256: Some(expected),
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
+            tx: tx.clone(),
+            cancel: Arc::clone(&cancel),
+            timeouts: DownloadTimeouts::default(),
+            hash_test_hook: Some(Arc::clone(&hook)),
+        }));
+        hook.first_chunk.notified().await;
+        cancel.request();
+        hook.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("production existing-destination hash must cancel promptly")
+            .expect("download task join");
+        let status = state.0.lock().unwrap().get(&job_id).unwrap().status.clone();
+        assert_eq!(status, "canceled");
+        assert_eq!(rx.try_recv().expect("canceled snapshot").status, "canceled");
+        assert!(rx.try_recv().is_err());
+        assert!(!can_commit_download_status(&status, "ready"));
+        assert!(
+            dest_path.exists(),
+            "cancel preserves the existing destination"
+        );
+        let _ = std::fs::remove_file(&dest_path);
+        let _ = std::fs::remove_file(&part_path);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_416_completed_part_hash_keeps_part_and_never_ready() {
+        let dest_path = unique_test_path("hash-416-dest.bin");
+        let part_path = std::path::PathBuf::from(format!("{}.part", dest_path.to_string_lossy()));
+        let payload = b"completed resumed part fixture";
+        tokio::fs::write(&part_path, payload)
+            .await
+            .expect("write completed part");
+        let expected = {
+            let mut hasher = Sha256::new();
+            hasher.update(payload);
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 416 server");
+        let addr = listener.local_addr().expect("416 address");
+        let total = payload.len();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept 416 request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("request timeout");
+            let mut request = [0u8; 2048];
+            let read = stream.read(&mut request).expect("read range request");
+            assert!(String::from_utf8_lossy(&request[..read])
+                .to_ascii_lowercase()
+                .contains("range: bytes="));
+            let response = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write 416 response");
+        });
+
+        let state = Arc::new(DownloadState::default());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        let job_id = "hash-416-cancel".to_string();
+        state.0.lock().unwrap().insert(
+            job_id.clone(),
+            DownloadJob {
+                status: "queued".to_string(),
+                received: payload.len() as u64,
+                total: payload.len() as u64,
+                error: None,
+                destination: dest_path.clone(),
+                owns_destination: true,
+                finished_at: None,
+                cancel: Arc::clone(&cancel),
+                tx: tx.clone(),
+            },
+        );
+        let hook = Arc::new(HashReadTestHook::new());
+        let task = tokio::spawn(run_download_task(DownloadTask {
+            url: format!("http://{addr}/model.bin"),
+            dest: dest_path.to_string_lossy().to_string(),
+            part_path: part_path.clone(),
+            sha256: Some(expected),
+            job_id: job_id.clone(),
+            state: Arc::clone(&state),
+            tx,
+            cancel: Arc::clone(&cancel),
+            timeouts: DownloadTimeouts {
+                connect: Duration::from_secs(1),
+                headers: Duration::from_secs(1),
+                read_idle: Duration::from_secs(1),
+            },
+            hash_test_hook: Some(Arc::clone(&hook)),
+        }));
+        hook.first_chunk.notified().await;
+        cancel.request();
+        hook.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("416 hash must cancel promptly")
+            .expect("download task join");
+        server.join().expect("bounded 416 server");
+
+        let snapshot = state.0.lock().unwrap().get(&job_id).unwrap().snapshot();
+        assert_eq!(snapshot.status, "canceled");
+        assert_eq!(rx.try_recv().expect("terminal snapshot").status, "canceled");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            part_path.exists(),
+            "canceled completed part remains resumable"
+        );
+        assert!(!dest_path.exists());
         let _ = std::fs::remove_file(&part_path);
         let _ = std::fs::remove_file(&dest_path);
     }

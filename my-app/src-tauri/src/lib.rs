@@ -23,7 +23,10 @@ use crate::engine_sd::{bridge_stop_sd, sd_binary_path};
 use crate::external_apps::{is_lmstudio_installed, is_ollama_installed};
 use crate::hardware::{cached_accel, detect_hardware, probe_local_runtime, AccelInfo};
 use crate::http_bridge::{start_desktop_bridge, DesktopBridgeServer, WorkspaceResetHandler};
-use crate::profile::{ensure_profile_dirs, profile_dirs, ProfileDirs, ProfileStorageDirs};
+use crate::profile::{
+    acquire_profile_advisory_lock, ensure_profile_dirs, profile_dirs, ProfileDirs,
+    ProfileStorageDirs,
+};
 use crate::secrets::{delete_provider_secret, keychain_secret_state, save_provider_secret};
 #[cfg(not(debug_assertions))]
 use crate::security::bridge_token;
@@ -34,7 +37,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(not(debug_assertions))]
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 #[cfg(not(debug_assertions))]
 use std::io::Read;
 use std::io::Write;
@@ -59,19 +62,26 @@ use tauri::{AppHandle, Emitter, Manager, State};
 // ---------------------------------------------------------------------------
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-fn get_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    // Fast path: already initialized.
-    if let Some(c) = HTTP_CLIENT.get() {
-        return Ok(c.clone());
+pub(crate) fn get_http_client_with_connect_timeout(
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    // Shared client uses the production connect bound. Tests that inject a
+    // shorter connect timeout build an ephemeral client instead.
+    if connect_timeout == Duration::from_secs(30) {
+        if let Some(c) = HTTP_CLIENT.get() {
+            return Ok(c.clone());
+        }
+        let candidate = reqwest::Client::builder()
+            .user_agent("Lunery Lab Desktop/1.0")
+            .connect_timeout(connect_timeout)
+            .build()?;
+        let _ = HTTP_CLIENT.set(candidate);
+        return Ok(HTTP_CLIENT.get().expect("OnceLock set above").clone());
     }
-    // Build a candidate (only happens once; concurrent first-downloads race here).
-    let candidate = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent("Lunery Lab Desktop/1.0")
-        .build()?;
-    // set() returns Err(candidate) if another thread already set it — discard ours.
-    let _ = HTTP_CLIENT.set(candidate);
-    // Either we just set it or another thread did; either way it's initialized now.
-    Ok(HTTP_CLIENT.get().expect("OnceLock set above").clone())
+        .connect_timeout(connect_timeout)
+        .build()
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +98,9 @@ struct DesktopServerState {
     pid_lockfile: Mutex<Option<PathBuf>>,
     dev_bridge_file: Mutex<Option<PathBuf>>,
     dev_bridge_server: Mutex<Option<DesktopBridgeServer>>,
+    /// OS advisory lock for the resolved profile. Held for the app lifetime;
+    /// the lock file itself is persistent and must not be unlinked on unlock.
+    profile_lock: Mutex<Option<File>>,
     runtime_operation: AtomicU8,
     /// Flipped by `shutdown` so the local-runtime watcher thread exits cleanly
     /// on app shutdown instead of being a daemon leak. The watcher reads this
@@ -97,12 +110,10 @@ struct DesktopServerState {
 
 impl DesktopServerState {
     fn stop_runtime(&self) {
-        // Prefer stopping embedded engines before joining the bridge listener so
-        // in-flight generate workers cannot keep teardown waiting.
-        bridge_stop_llama();
-        bridge_stop_mlx();
-        bridge_stop_sd();
-
+        // Bridge shutdown revokes admission first, then interrupts long work /
+        // advances the SD epoch, then drains accepted workers. Stop the other
+        // embedded engines around the same boundary so queued work cannot spawn
+        // after teardown.
         let bridge_server = self
             .bridge_server
             .lock()
@@ -111,6 +122,9 @@ impl DesktopServerState {
         if let Some(bridge_server) = bridge_server {
             bridge_server.shutdown();
         }
+        bridge_stop_llama();
+        bridge_stop_mlx();
+        bridge_stop_sd();
 
         let mut child_guard = self
             .child
@@ -176,6 +190,19 @@ impl DesktopServerState {
             dev_bridge_server.shutdown();
         }
     }
+}
+
+fn acquire_profile_lock_for_startup(
+    state: &DesktopServerState,
+    profile: &ProfileDirs,
+) -> Result<(), String> {
+    let profile_lock = acquire_profile_advisory_lock(profile)?;
+    let mut guard = state
+        .profile_lock
+        .lock()
+        .map_err(|_| "Desktop profile lock holder is poisoned".to_string())?;
+    *guard = Some(profile_lock);
+    Ok(())
 }
 
 fn terminate_desktop_process(child: &mut Child, process_group: Option<u32>) {
@@ -1411,10 +1438,10 @@ fn request_desktop_workspace_reset(
     #[cfg(debug_assertions)]
     {
         let _ = (app, download_state);
-        return Err(
+        Err(
             "Workspace reset is available in packaged Studio builds; development runtime data must be reset by its owner"
                 .to_string(),
-        );
+        )
     }
 
     #[cfg(not(debug_assertions))]
@@ -1529,12 +1556,39 @@ pub fn run() {
     // the same logical manager from the user's perspective.
     let _ = RESIDENCY_GLOBAL.set(Arc::clone(&residency));
     let builder = tauri::Builder::default()
+        // Must be the first registered plugin so a second launch focuses the
+        // existing instance before any other plugin setup runs.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(desktop_state)
         .manage(Arc::clone(&download_state))
         .setup(move |app| {
+            // Acquire the resolved-profile OS advisory lock before dev bridge,
+            // stale PID cleanup, runtime spawn, or PGlite open. A second instance
+            // that races past single-instance must not run backend PID cleanup.
+            let profile = match profile_dirs() {
+                Ok(profile) => profile,
+                Err(err) => {
+                    eprintln!("desktop profile unavailable: {err}");
+                    return Err(Box::<dyn std::error::Error>::from(err));
+                }
+            };
+            if let Err(err) = acquire_profile_lock_for_startup(
+                app.state::<DesktopServerState>().inner(),
+                &profile,
+            ) {
+                eprintln!("desktop profile lock unavailable: {err}");
+                return Err(Box::<dyn std::error::Error>::from(err));
+            }
+
             #[cfg(debug_assertions)]
             {
-                let dev_bridge_result = profile_dirs().and_then(|profile| {
+                let dev_bridge_result = (|| {
                     let bridge_server = start_desktop_bridge(
                         Arc::clone(&dev_bridge_download_state),
                         workspace_reset_handler(
@@ -1543,8 +1597,8 @@ pub fn run() {
                         ),
                     )?;
                     let path = write_desktop_dev_bridge_file(&profile, &bridge_server.bridge)?;
-                    Ok((path, bridge_server))
-                });
+                    Ok::<_, String>((path, bridge_server))
+                })();
                 match dev_bridge_result {
                     Ok((path, bridge_server)) => {
                         if let Ok(mut guard) =
@@ -1652,14 +1706,76 @@ pub fn run() {
 
 #[cfg(all(test, unix))]
 mod desktop_server_lifecycle_tests {
-    use crate::{pid_matches_expected_binary, DesktopServerState};
+    use crate::{
+        acquire_profile_lock_for_startup, pid_matches_expected_binary, test_global_lock,
+        DesktopServerState, ProfileDirs,
+    };
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_profile(name: &str) -> ProfileDirs {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lunery-startup-{name}-{nanos}"));
+        let data = root.join("data");
+        ProfileDirs {
+            root: root.clone(),
+            config: root.join("config"),
+            data: data.clone(),
+            pglite: data.join("pglite"),
+            media: data.join("media"),
+            models: root.join("models"),
+            logs: root.join("logs"),
+            runtime: root.join("runtime"),
+        }
+    }
+
+    #[test]
+    fn second_profile_holder_fails_before_pid_cleanup_hook() {
+        let profile = unique_profile("second-holder");
+        let first = DesktopServerState::default();
+        acquire_profile_lock_for_startup(&first, &profile).expect("first profile holder");
+
+        let second = DesktopServerState::default();
+        let pid_cleanup_reached = AtomicBool::new(false);
+        let result = (|| -> Result<(), String> {
+            acquire_profile_lock_for_startup(&second, &profile)?;
+            pid_cleanup_reached.store(true, Ordering::SeqCst);
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert!(
+            !pid_cleanup_reached.load(Ordering::SeqCst),
+            "a second profile holder must fail before stale PID cleanup"
+        );
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_dir_all(&profile.root);
+    }
+
+    #[test]
+    fn poisoned_profile_lock_holder_fails_closed() {
+        let profile = unique_profile("poisoned-holder");
+        let state = DesktopServerState::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.profile_lock.lock().expect("profile lock holder");
+            panic!("poison profile lock holder");
+        });
+
+        let result = acquire_profile_lock_for_startup(&state, &profile);
+        assert!(result.is_err(), "poisoned holder must abort startup");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&profile.root);
+    }
 
     #[test]
     fn shutdown_reaps_runtime_child_and_cleans_runtime_files() {
+        let _global = test_global_lock();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

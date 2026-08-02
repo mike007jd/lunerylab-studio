@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::download::{
-    canonical_download_destination, hf_download_start_inner, DownloadState, JobSnapshot,
+    canonical_download_destination, hf_download_start_inner, DownloadCancelRequest, DownloadState,
+    JobSnapshot,
 };
 use crate::engine_llama::{
     acquire_llama_model_delete_lease, bridge_start_llama, bridge_stop_llama, llama_engine_slot,
@@ -26,29 +27,215 @@ use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
 use crate::secrets::{
     audit_secret_read, delete_provider_secret, get_provider_secret, save_provider_secret,
-    secret_read_rate_limit_ok, ProviderIdPayload, ProviderSecretMutationError,
-    ProviderSecretPayload, ProviderSecretReadError,
+    ProviderIdPayload, ProviderSecretMutationError, ProviderSecretPayload, ProviderSecretReadError,
 };
 use crate::security::{bridge_token, constant_time_eq, host_is_loopback};
 use crate::{DesktopBridge, DESKTOP_WORKSPACE_RESET_CONFIRMATION};
 
 pub(crate) type WorkspaceResetHandler = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+/// Pre-auth connection admission. Bounds accepted sockets before token checks.
+const BRIDGE_MAX_CONNECTIONS: usize = 24;
+/// Long lane: SSE download events + synchronous SD generation.
+const BRIDGE_MAX_LONG: usize = 8;
+/// Control lane: status, cancel, secrets, stop, lease, reset, and other short ops.
+const BRIDGE_MAX_CONTROL: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeLane {
+    Long,
+    Control,
+}
+
+struct BridgeAdmission {
+    connections: AtomicUsize,
+    long_ops: AtomicUsize,
+    control_ops: AtomicUsize,
+    revoked: Arc<AtomicBool>,
+    accepted_workers: AtomicUsize,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl BridgeAdmission {
+    fn new() -> Self {
+        Self {
+            connections: AtomicUsize::new(0),
+            long_ops: AtomicUsize::new(0),
+            control_ops: AtomicUsize::new(0),
+            revoked: Arc::new(AtomicBool::new(false)),
+            accepted_workers: AtomicUsize::new(0),
+            workers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
+
+    fn try_admit_connection(&self) -> bool {
+        if self.is_revoked() {
+            return false;
+        }
+        let current = self.connections.fetch_add(1, Ordering::AcqRel);
+        if current >= BRIDGE_MAX_CONNECTIONS || self.is_revoked() {
+            self.connections.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn release_connection(&self) {
+        self.connections.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn try_admit_lane(&self, lane: BridgeLane) -> bool {
+        if self.is_revoked() {
+            return false;
+        }
+        let counter = match lane {
+            BridgeLane::Long => &self.long_ops,
+            BridgeLane::Control => &self.control_ops,
+        };
+        let limit = match lane {
+            BridgeLane::Long => BRIDGE_MAX_LONG,
+            BridgeLane::Control => BRIDGE_MAX_CONTROL,
+        };
+        let current = counter.fetch_add(1, Ordering::AcqRel);
+        if current >= limit || self.is_revoked() {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn release_lane(&self, lane: BridgeLane) {
+        match lane {
+            BridgeLane::Long => {
+                self.long_ops.fetch_sub(1, Ordering::AcqRel);
+            }
+            BridgeLane::Control => {
+                self.control_ops.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn begin_worker(&self) {
+        self.accepted_workers.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn register_worker_handle(&self, handle: JoinHandle<()>) {
+        self.workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(handle);
+    }
+
+    fn worker_finished(&self) {
+        self.accepted_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn drain_workers(&self) {
+        let workers = {
+            let mut guard = self
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for handle in workers {
+            // Never detach an accepted worker. Request reads are timeout-bounded,
+            // and long SSE workers poll revocation every 50 ms.
+            let _ = handle.join();
+        }
+        debug_assert_eq!(self.accepted_workers.load(Ordering::Acquire), 0);
+    }
+}
+
+struct WorkerGuard {
+    admission: Arc<BridgeAdmission>,
+}
+
+impl WorkerGuard {
+    fn new(admission: Arc<BridgeAdmission>) -> Self {
+        admission.begin_worker();
+        Self { admission }
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.admission.worker_finished();
+        self.admission.release_connection();
+    }
+}
+
+fn classify_bridge_lane(method: &str, path_only: &str) -> BridgeLane {
+    if method == "GET" && path_only.starts_with("/download-events") {
+        return BridgeLane::Long;
+    }
+    if method == "POST" && path_only == "/sd-generate" {
+        return BridgeLane::Long;
+    }
+    BridgeLane::Control
+}
+
+struct LaneGuard {
+    admission: Arc<BridgeAdmission>,
+    lane: BridgeLane,
+}
+
+impl Drop for LaneGuard {
+    fn drop(&mut self) {
+        self.admission.release_lane(self.lane);
+    }
+}
+
 pub(crate) struct DesktopBridgeServer {
     pub(crate) bridge: DesktopBridge,
     shutdown: Arc<AtomicBool>,
+    /// Counts actual stop-body executions (not no-op re-entries). Used to prove
+    /// explicit shutdown + Drop is idempotent without racing process-global SD
+    /// epoch mutators from unrelated tests.
+    stop_body_runs: Arc<AtomicUsize>,
+    admission: Arc<BridgeAdmission>,
+    download_state: Arc<DownloadState>,
     listener_thread: Option<JoinHandle<()>>,
 }
 
 impl DesktopBridgeServer {
+    /// Idempotent stop: explicit `shutdown()` plus `Drop` must not advance the
+    /// SD runtime epoch twice or double-drain workers.
     fn stop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.stop_body_runs.fetch_add(1, Ordering::SeqCst);
+        // 1) Revoke admission first so new work cannot enter.
+        self.admission.revoke();
         // Wake the nonblocking accept loop immediately instead of waiting for
         // its poll interval. No request is sent and the connection is dropped.
         let _ = TcpStream::connect(("127.0.0.1", self.bridge.port));
+        // 2) Interrupt / cooperatively terminate long engines so workers exit.
+        crate::engine_sd::bridge_stop_sd();
+        self.download_state.request_cancel_all_active();
+        // 3) Seal the handle registry. The listener is the only producer, so it
+        // must be joined before taking and joining the accepted-worker handles.
         if let Some(thread) = self.listener_thread.take() {
             let _ = thread.join();
         }
+        // 4) Join every accepted worker. Dropping unfinished JoinHandles would
+        // detach post-teardown work and violate the bridge lifetime boundary.
+        self.admission.drain_workers();
+        // A request accepted just before revoke may have started a background
+        // download after the first cancel sweep. Sweep again once all request
+        // workers are joined, then wait for every tracked async task to return
+        // before reset can delete the model tree or a new bridge can reuse it.
+        self.download_state.request_cancel_all_active();
+        self.download_state.wait_for_background_tasks();
     }
 
     pub(crate) fn shutdown(mut self) {
@@ -223,6 +410,7 @@ fn handle_sse_download_events(
     stream: &mut TcpStream,
     query: &str,
     download_state: &Arc<DownloadState>,
+    revoked: &Arc<AtomicBool>,
 ) {
     let job_id = match query_param(query, "jobId") {
         Some(id) => id,
@@ -264,7 +452,7 @@ fn handle_sse_download_events(
     let _ = stream.set_read_timeout(None);
     // Bound thread lifetime: if the client disconnects and writes stall, the
     // write_timeout causes the next write_all to fail and the loop returns.
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
 
     // Write SSE response headers (chunked transfer encoding).
     let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -292,38 +480,16 @@ fn handle_sse_download_events(
         return;
     }
 
-    // Drain the broadcast channel until terminal or client disconnect.
-    // We're on a blocking thread, so spawning an async forwarder on Tauri's
-    // runtime + bridging through an unbounded tokio mpsc keeps the broadcast
-    // receiver awaitable while letting this thread block cleanly on the local
-    // queue. This avoids `handle.block_on()` (which pins a runtime worker per
-    // SSE connection and can deadlock if Tauri ever runs a single-thread rt).
-    let (tx_local, mut rx_local) = tokio::sync::mpsc::unbounded_channel::<
-        Result<JobSnapshot, tokio::sync::broadcast::error::RecvError>,
-    >();
-    tauri::async_runtime::spawn(async move {
-        let mut broadcast_rx = rx;
-        loop {
-            let result = broadcast_rx.recv().await;
-            let stop = matches!(
-                result,
-                Err(tokio::sync::broadcast::error::RecvError::Closed),
-            );
-            if tx_local.send(result).is_err() {
-                break;
-            }
-            if stop {
-                break;
-            }
-        }
-    });
-
+    // The blocking worker can poll the broadcast receiver directly. This keeps
+    // the path bounded: no orphan async forwarder and no unbounded queue when a
+    // client stops reading.
+    let mut rx = rx;
     loop {
-        let result = match rx_local.blocking_recv() {
-            Some(r) => r,
-            None => return,
-        };
-        match result {
+        if revoked.load(Ordering::Acquire) {
+            let _ = write_chunked_frame(stream, b"");
+            return;
+        }
+        match rx.try_recv() {
             Ok(snapshot) => {
                 if !emit(stream, &snapshot) {
                     return; // client disconnected
@@ -333,7 +499,10 @@ fn handle_sse_download_events(
                     return;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
                 // Sender dropped (download task finished but we may have missed the
                 // final snapshot). Grab the latest from state and emit it.
                 let guard = download_state.0.lock();
@@ -346,7 +515,7 @@ fn handle_sse_download_events(
                 let _ = write_chunked_frame(stream, b"");
                 return;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                 // We fell behind — grab current snapshot from state and continue.
                 let guard = download_state.0.lock();
                 if let Ok(g) = guard {
@@ -371,11 +540,21 @@ fn handle_bridge_request(
     token: &str,
     download_state: Arc<DownloadState>,
     workspace_reset: WorkspaceResetHandler,
+    admission: Arc<BridgeAdmission>,
 ) {
     let Ok((method, path, headers, body)) = read_http_request(&mut stream) else {
         bridge_error(&mut stream, "400 Bad Request", "Invalid request");
         return;
     };
+
+    if admission.is_revoked() {
+        bridge_error(
+            &mut stream,
+            "503 Service Unavailable",
+            "Desktop bridge is shutting down",
+        );
+        return;
+    }
 
     // Constant-time token check — avoids leaking the token via the timing of a
     // short-circuiting `!=` byte comparison. A missing header is rejected the
@@ -414,10 +593,32 @@ fn handle_bridge_request(
         .split_once('?')
         .map_or((path.as_str(), ""), |(p, q)| (p, q));
 
+    let lane = classify_bridge_lane(method.as_str(), path_only);
+    if !admission.try_admit_lane(lane) {
+        bridge_error(
+            &mut stream,
+            "429 Too Many Requests",
+            "Desktop bridge lane is at capacity; retry after current jobs settle.",
+        );
+        return;
+    }
+    let _lane_guard = LaneGuard {
+        admission: Arc::clone(&admission),
+        lane,
+    };
+    if admission.is_revoked() {
+        bridge_error(
+            &mut stream,
+            "503 Service Unavailable",
+            "Desktop bridge is shutting down",
+        );
+        return;
+    }
+
     // SSE path — handled separately, writes the full HTTP response itself and returns.
     // Must come BEFORE the match to avoid falling through to the standard responder.
     if method == "GET" && path_only.starts_with("/download-events") {
-        handle_sse_download_events(&mut stream, query, &download_state);
+        handle_sse_download_events(&mut stream, query, &download_state, &admission.revoked);
         return;
     }
 
@@ -510,23 +711,10 @@ fn handle_bridge_request(
             // SECURITY: the returned key is never logged anywhere in this
             // handler. Audit logs record the attempt + outcome only.
             //
-            // Two-layer hardening:
-            //   1. Rate limit globally to 5 reads/minute — caps blast radius
-            //      if the bridge token is ever exfiltrated.
-            //   2. Audit every request (allow + deny) to stderr so the OS
-            //      log captures who tried to read what and when.
-            if !secret_read_rate_limit_ok() {
-                let provider_for_audit = serde_json::from_str::<ProviderIdPayload>(&body)
-                    .map(|p| p.provider_id)
-                    .unwrap_or_else(|_| "unknown".to_string());
-                audit_secret_read(&provider_for_audit, false, "rate_limited");
-                bridge_error(
-                    &mut stream,
-                    "429 Too Many Requests",
-                    "Secret-read rate limit exceeded (5/min).",
-                );
-                return;
-            }
+            // Positive cache + same-provider single-flight keep repeated reads
+            // of a configured provider free. Every positive-cache miss that
+            // will perform a real OS-keychain read consumes the global
+            // 5/minute limiter before the backend call.
             let payload = match serde_json::from_str::<ProviderIdPayload>(&body) {
                 Ok(payload) => payload,
                 Err(_) => {
@@ -558,6 +746,7 @@ fn handle_bridge_request(
                         ProviderSecretReadError::InvalidProvider => "400 Bad Request",
                         ProviderSecretReadError::Missing => "404 Not Found",
                         ProviderSecretReadError::Unavailable => "503 Service Unavailable",
+                        ProviderSecretReadError::RateLimited => "429 Too Many Requests",
                     };
                     bridge_error(&mut stream, status, error.public_message());
                 }
@@ -625,18 +814,26 @@ fn handle_bridge_request(
                 job_id: String,
             }
             match serde_json::from_str::<CancelBody>(&body) {
-                Ok(cancel) => {
-                    if let Ok(guard) = download_state.0.lock() {
-                        if let Some(job) = guard.get(&cancel.job_id) {
-                            job.cancel.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    write_http_response(
+                Ok(cancel) => match download_state.request_cancel_job(&cancel.job_id) {
+                    DownloadCancelRequest::Accepted => write_http_response(
                         &mut stream,
-                        "200 OK",
-                        &serde_json::json!({ "ok": true }).to_string(),
-                    );
-                }
+                        "202 Accepted",
+                        &serde_json::json!({
+                            "ok": true,
+                            "cancelRequested": true,
+                            "jobId": cancel.job_id,
+                        })
+                        .to_string(),
+                    ),
+                    DownloadCancelRequest::NotFound => {
+                        bridge_error(&mut stream, "404 Not Found", "Download job not found")
+                    }
+                    DownloadCancelRequest::Terminal => bridge_error(
+                        &mut stream,
+                        "409 Conflict",
+                        "Download job is already terminal",
+                    ),
+                },
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err.to_string()),
             }
         }
@@ -1037,14 +1234,6 @@ fn handle_bridge_request(
     }
 }
 
-/// Cap on concurrent bridge worker threads. The bridge is the only HTTP
-/// surface that runs OS-keychain reads + child-process spawns, so a runaway
-/// caller (whether bug or token-leak exfiltration loop) used to be able to
-/// fork unbounded threads — quickly exhausting the per-process thread limit
-/// and bringing the runtime down with it. 8 in-flight is plenty for a single
-/// user (most calls finish in <100ms); anything beyond returns 429.
-const BRIDGE_MAX_IN_FLIGHT: usize = 8;
-
 fn provider_secret_mutation_http_status(error: ProviderSecretMutationError) -> &'static str {
     match error {
         ProviderSecretMutationError::InvalidProvider
@@ -1068,12 +1257,14 @@ pub(crate) fn start_desktop_bridge(
         .port();
     let token = bridge_token()?;
     let bridge_token = token.clone();
-    let in_flight = Arc::new(AtomicUsize::new(0));
+    let admission = Arc::new(BridgeAdmission::new());
     let shutdown = Arc::new(AtomicBool::new(false));
     let listener_shutdown = Arc::clone(&shutdown);
+    let listener_admission = Arc::clone(&admission);
 
+    let listener_download_state = Arc::clone(&download_state);
     let listener_thread = thread::spawn(move || {
-        while !listener_shutdown.load(Ordering::Acquire) {
+        while !listener_shutdown.load(Ordering::Acquire) && !listener_admission.is_revoked() {
             let mut stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1082,12 +1273,10 @@ pub(crate) fn start_desktop_bridge(
                 }
                 Err(_) => break,
             };
-            if listener_shutdown.load(Ordering::Acquire) {
+            if listener_shutdown.load(Ordering::Acquire) || listener_admission.is_revoked() {
                 break;
             }
-            let current = in_flight.fetch_add(1, Ordering::AcqRel);
-            if current >= BRIDGE_MAX_IN_FLIGHT {
-                in_flight.fetch_sub(1, Ordering::AcqRel);
+            if !listener_admission.try_admit_connection() {
                 bridge_error(
                     &mut stream,
                     "429 Too Many Requests",
@@ -1096,19 +1285,26 @@ pub(crate) fn start_desktop_bridge(
                 continue;
             }
             let token = bridge_token.clone();
-            let ds = Arc::clone(&download_state);
+            let ds = Arc::clone(&listener_download_state);
             let reset = Arc::clone(&workspace_reset);
-            let in_flight_for_worker = Arc::clone(&in_flight);
-            thread::spawn(move || {
-                handle_bridge_request(stream, &token, ds, reset);
-                in_flight_for_worker.fetch_sub(1, Ordering::AcqRel);
+            let admission_for_worker = Arc::clone(&listener_admission);
+            let worker = thread::Builder::new().spawn(move || {
+                let _worker_guard = WorkerGuard::new(Arc::clone(&admission_for_worker));
+                handle_bridge_request(stream, &token, ds, reset, Arc::clone(&admission_for_worker));
             });
+            match worker {
+                Ok(handle) => listener_admission.register_worker_handle(handle),
+                Err(_) => listener_admission.release_connection(),
+            }
         }
     });
 
     Ok(DesktopBridgeServer {
         bridge: DesktopBridge { port, token },
         shutdown,
+        stop_body_runs: Arc::new(AtomicUsize::new(0)),
+        admission,
+        download_state,
         listener_thread: Some(listener_thread),
     })
 }
@@ -1116,12 +1312,20 @@ pub(crate) fn start_desktop_bridge(
 #[cfg(test)]
 mod tests {
     use super::{
-        provider_secret_mutation_http_status, start_desktop_bridge, ProviderSecretMutationError,
-        WorkspaceResetHandler,
+        classify_bridge_lane, provider_secret_mutation_http_status, start_desktop_bridge,
+        BridgeAdmission, BridgeLane, ProviderSecretMutationError, WorkspaceResetHandler,
+        BRIDGE_MAX_CONTROL, BRIDGE_MAX_LONG,
     };
-    use crate::download::DownloadState;
+    use crate::download::{
+        update_job_status, DownloadCancel, DownloadJob, DownloadState, JobSnapshot,
+    };
+    use crate::test_global_lock;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn provider_secret_validation_errors_map_to_bad_request() {
@@ -1145,6 +1349,9 @@ mod tests {
 
     #[test]
     fn bridge_shutdown_revokes_the_previous_listener() {
+        // Shutdown advances the SD runtime epoch / cancel flag; serialize with
+        // engine_sd tests that share those process globals.
+        let _g = test_global_lock();
         let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
         let server =
             start_desktop_bridge(Arc::new(DownloadState::default()), reset).expect("start bridge");
@@ -1154,5 +1361,366 @@ mod tests {
         server.shutdown();
 
         assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    #[test]
+    fn bridge_stop_is_idempotent_across_shutdown_and_drop() {
+        let _g = test_global_lock();
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server =
+            start_desktop_bridge(Arc::new(DownloadState::default()), reset).expect("start bridge");
+        let stop_runs = Arc::clone(&server.stop_body_runs);
+        // shutdown() calls stop once; Drop calls stop again and must no-op.
+        server.shutdown();
+        assert_eq!(
+            stop_runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "explicit shutdown + Drop must run the stop body exactly once"
+        );
+    }
+
+    #[test]
+    fn long_and_control_lanes_are_separated() {
+        assert_eq!(
+            classify_bridge_lane("GET", "/download-events"),
+            BridgeLane::Long
+        );
+        assert_eq!(
+            classify_bridge_lane("POST", "/sd-generate"),
+            BridgeLane::Long
+        );
+        assert_eq!(classify_bridge_lane("GET", "/status"), BridgeLane::Control);
+        assert_eq!(
+            classify_bridge_lane("POST", "/sd-cancel"),
+            BridgeLane::Control
+        );
+        assert_eq!(
+            classify_bridge_lane("POST", "/provider-secret-read"),
+            BridgeLane::Control
+        );
+        assert_eq!(
+            classify_bridge_lane("POST", "/reset-workspace"),
+            BridgeLane::Control
+        );
+    }
+
+    #[test]
+    fn eight_long_operations_leave_control_capacity() {
+        let admission = BridgeAdmission::new();
+        for _ in 0..BRIDGE_MAX_LONG {
+            assert!(admission.try_admit_lane(BridgeLane::Long));
+        }
+        assert!(!admission.try_admit_lane(BridgeLane::Long));
+        for _ in 0..BRIDGE_MAX_CONTROL {
+            assert!(admission.try_admit_lane(BridgeLane::Control));
+        }
+        assert!(!admission.try_admit_lane(BridgeLane::Control));
+        admission.revoke();
+        assert!(admission.is_revoked());
+        assert!(!admission.try_admit_connection());
+    }
+
+    /// User-facing contract: eight authenticated long SSE download-event
+    /// connections must not consume control-lane capacity. A bounded control
+    /// request (/status) completes without 429 while those SSE streams are held.
+    #[test]
+    fn eight_authenticated_sse_connections_leave_control_lane_responsive() {
+        let _g = test_global_lock();
+        let download_state = Arc::new(DownloadState::default());
+        // Seed eight nonterminal jobs so SSE subscriptions stay open.
+        for i in 0..BRIDGE_MAX_LONG {
+            let job_id = format!("sse-job-{i}");
+            let (tx, _) = tokio::sync::broadcast::channel(8);
+            let cancel = Arc::new(DownloadCancel::new());
+            download_state.0.lock().expect("jobs").insert(
+                job_id,
+                DownloadJob {
+                    status: "downloading".to_string(),
+                    received: 1,
+                    total: 100,
+                    error: None,
+                    destination: std::env::temp_dir().join(format!("sse-{i}.gguf")),
+                    owns_destination: true,
+                    finished_at: None,
+                    cancel,
+                    tx,
+                },
+            );
+        }
+
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server = start_desktop_bridge(Arc::clone(&download_state), reset).expect("bridge");
+        let port = server.bridge.port;
+        let token = server.bridge.token.clone();
+
+        let ready = Arc::new(Barrier::new(BRIDGE_MAX_LONG + 1));
+        let release = Arc::new(Barrier::new(BRIDGE_MAX_LONG + 1));
+        let mut sse_threads = Vec::new();
+        for i in 0..BRIDGE_MAX_LONG {
+            let token = token.clone();
+            let ready = Arc::clone(&ready);
+            let release = Arc::clone(&release);
+            sse_threads.push(thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect sse");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                let request = format!(
+                    "GET /download-events?jobId=sse-job-{i} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Lunery-Desktop-Token: {token}\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(request.as_bytes())
+                    .expect("write sse request");
+                // Wait until headers + first SSE frame arrive so the long lane
+                // slot is definitively held before the control probe.
+                let mut buf = [0u8; 4096];
+                let mut received = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            received.extend_from_slice(&buf[..n]);
+                            let text = String::from_utf8_lossy(&received);
+                            if received.windows(4).any(|w| w == b"\r\n\r\n")
+                                && (text.contains("data:") || text.contains("downloading"))
+                            {
+                                ready.wait();
+                                // Hold the connection until both control probes
+                                // have completed; no sleep-based race.
+                                release.wait();
+                                return;
+                            }
+                        }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(err) => panic!("sse read failed: {err}"),
+                    }
+                }
+                panic!(
+                    "SSE connection {i} did not become ready; got: {}",
+                    String::from_utf8_lossy(&received)
+                );
+            }));
+        }
+
+        // Wait until all eight long SSE workers have entered the long lane.
+        ready.wait();
+
+        let control_deadline = Duration::from_millis(1500);
+        let started = Instant::now();
+        let mut control = TcpStream::connect(("127.0.0.1", port)).expect("control connect");
+        control
+            .set_read_timeout(Some(control_deadline))
+            .expect("control read timeout");
+        control
+            .set_write_timeout(Some(control_deadline))
+            .expect("control write timeout");
+        let control_req = format!(
+            "GET /status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Lunery-Desktop-Token: {token}\r\nConnection: close\r\n\r\n"
+        );
+        control
+            .write_all(control_req.as_bytes())
+            .expect("control write");
+        let mut response = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match control.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(err) => panic!("control read failed: {err}"),
+            }
+            if started.elapsed() > control_deadline {
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+        let body = String::from_utf8_lossy(&response);
+        assert!(
+            elapsed <= control_deadline,
+            "control /status must complete within {control_deadline:?}, took {elapsed:?}"
+        );
+        assert!(
+            body.contains("HTTP/1.1 200"),
+            "control must succeed without 429; got: {body}"
+        );
+        assert!(
+            !body.contains("429"),
+            "eight long SSE connections must not starve control lane; got: {body}"
+        );
+
+        // Also probe /sd-cancel as a second control route under the same load.
+        let started = Instant::now();
+        let mut cancel_stream = TcpStream::connect(("127.0.0.1", port)).expect("sd-cancel connect");
+        cancel_stream
+            .set_read_timeout(Some(control_deadline))
+            .expect("cancel read timeout");
+        let cancel_body = r#"{"runId":"control-probe-run"}"#;
+        let cancel_req = format!(
+            "POST /sd-cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Lunery-Desktop-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{cancel_body}",
+            cancel_body.len()
+        );
+        cancel_stream
+            .write_all(cancel_req.as_bytes())
+            .expect("cancel write");
+        let mut cancel_response = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match cancel_stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => cancel_response.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+            if started.elapsed() > control_deadline {
+                break;
+            }
+        }
+        let cancel_text = String::from_utf8_lossy(&cancel_response);
+        assert!(
+            started.elapsed() <= control_deadline,
+            "control /sd-cancel must complete within bound"
+        );
+        assert!(
+            cancel_text.contains("HTTP/1.1 200"),
+            "sd-cancel control must succeed under eight SSE holders: {cancel_text}"
+        );
+
+        release.wait();
+        for handle in sse_threads {
+            handle.join().expect("SSE client");
+        }
+        server.shutdown();
+    }
+
+    #[test]
+    fn shutdown_bounds_a_nonreading_sse_client() {
+        let _g = test_global_lock();
+        let download_state = Arc::new(DownloadState::default());
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        download_state.0.lock().expect("jobs").insert(
+            "blocked-sse".to_string(),
+            DownloadJob {
+                status: "downloading".to_string(),
+                received: 1,
+                total: 100,
+                error: None,
+                destination: std::env::temp_dir().join("blocked-sse.gguf"),
+                owns_destination: true,
+                finished_at: None,
+                cancel,
+                tx: tx.clone(),
+            },
+        );
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server = start_desktop_bridge(Arc::clone(&download_state), reset).expect("bridge");
+        let port = server.bridge.port;
+        let token = server.bridge.token.clone();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("SSE connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout");
+        let request = format!(
+            "GET /download-events?jobId=blocked-sse HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Lunery-Desktop-Token: {token}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).expect("SSE request");
+        let mut initial = [0u8; 4096];
+        let read = client.read(&mut initial).expect("initial SSE frame");
+        assert!(String::from_utf8_lossy(&initial[..read]).contains("HTTP/1.1 200"));
+
+        // Stop reading, then force a payload larger than the loopback socket
+        // buffer so the worker can be inside write_all when shutdown revokes it.
+        assert!(
+            tx.send(JobSnapshot {
+                status: "downloading".to_string(),
+                received: 2,
+                total: 100,
+                error: Some("x".repeat(16 * 1024 * 1024)),
+            })
+            .is_ok(),
+            "large SSE snapshot must have a receiver"
+        );
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        server.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "SSE write timeout must bound true worker join"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn shutdown_cancels_and_waits_for_background_download_tasks() {
+        let _g = test_global_lock();
+        let download_state = Arc::new(DownloadState::default());
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let cancel = Arc::new(DownloadCancel::new());
+        download_state.begin_background_task();
+        download_state.0.lock().expect("jobs").insert(
+            "background-download".to_string(),
+            DownloadJob {
+                status: "downloading".to_string(),
+                received: 1,
+                total: 100,
+                error: None,
+                destination: std::env::temp_dir().join("background-download.gguf"),
+                owns_destination: true,
+                finished_at: None,
+                cancel: Arc::clone(&cancel),
+                tx: tx.clone(),
+            },
+        );
+        let writes = Arc::new(AtomicUsize::new(0));
+        let worker_state = Arc::clone(&download_state);
+        let worker_writes = Arc::clone(&writes);
+        let worker = thread::spawn(move || {
+            while !cancel.is_canceled() {
+                worker_writes.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(2));
+            }
+            // Make the wait observable: shutdown must not return at cancel
+            // request time; it returns only after the task commits terminal.
+            thread::sleep(Duration::from_millis(40));
+            update_job_status(
+                &worker_state,
+                "background-download",
+                &tx,
+                "canceled",
+                1,
+                100,
+                None,
+            );
+            worker_state.finish_background_task();
+        });
+
+        let reset: WorkspaceResetHandler = Arc::new(|| Ok(()));
+        let server = start_desktop_bridge(Arc::clone(&download_state), reset).expect("bridge");
+        server.shutdown();
+        worker.join().expect("background task");
+        let writes_at_shutdown = writes.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(writes.load(Ordering::SeqCst), writes_at_shutdown);
+        assert_eq!(
+            download_state
+                .0
+                .lock()
+                .expect("jobs")
+                .get("background-download")
+                .expect("job")
+                .status,
+            "canceled"
+        );
     }
 }

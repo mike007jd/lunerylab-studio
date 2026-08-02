@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DOWNLOAD_PROGRESS_INITIAL_STATE,
+  HfDownloadCancelCoordinator,
+  normalizeDownloadStatus,
   reduceBridgeDownloadSnapshot,
   resolveHfDownloadKit,
   type BridgeDownloadSnapshot,
@@ -23,8 +25,14 @@ import {
 export function useHfDownload() {
   const [progress, setProgress] = useState(DOWNLOAD_PROGRESS_INITIAL_STATE);
   const eventSourceRef = useRef<EventSource | null>(null);
-  const canceledRef = useRef(false);
-  const currentJobIdRef = useRef<string | null>(null);
+  const cancelCoordinatorRef = useRef<HfDownloadCancelCoordinator | null>(null);
+  const currentTerminalResolverRef = useRef<
+    ((status: "ready" | "error" | "canceled") => void) | null
+  >(null);
+  if (!cancelCoordinatorRef.current) {
+    cancelCoordinatorRef.current = new HfDownloadCancelCoordinator();
+  }
+  const cancelCoordinator = cancelCoordinatorRef.current;
 
   useEffect(() => {
     return () => {
@@ -64,8 +72,12 @@ export function useHfDownload() {
           settled = true;
           source.close();
           if (eventSourceRef.current === source) eventSourceRef.current = null;
+          if (currentTerminalResolverRef.current === finish) {
+            currentTerminalResolverRef.current = null;
+          }
           resolve(status);
         };
+        currentTerminalResolverRef.current = finish;
 
         source.onmessage = (event) => {
           let snapshot: BridgeDownloadSnapshot;
@@ -85,14 +97,23 @@ export function useHfDownload() {
             timestamp: Date.now(),
           });
           speedSample = reduced.speedSample;
-          setProgress(reduced.progress);
+          setProgress((previous) =>
+            cancelCoordinator.cancelRequested && !reduced.terminalStatus
+              ? {
+                  ...reduced.progress,
+                  status: previous.status === "queued" ? "queued" : "downloading",
+                  error: previous.error,
+                }
+              : reduced.progress,
+          );
 
           if (reduced.terminalStatus) finish(reduced.terminalStatus);
         };
 
         source.onerror = () => {
-          if (canceledRef.current) {
-            finish("canceled");
+          if (cancelCoordinator.cancelRequested) {
+            // Cancel intent is not terminal truth. The cancel coordinator keeps
+            // polling GET until the bridge reports ready/error/canceled.
             return;
           }
           setProgress((prev) => ({
@@ -104,7 +125,7 @@ export function useHfDownload() {
         };
       });
     },
-    [stopStream],
+    [cancelCoordinator, stopStream],
   );
 
   /**
@@ -113,7 +134,7 @@ export function useHfDownload() {
    */
   const start = useCallback(
     async (modelId: string) => {
-      canceledRef.current = false;
+      cancelCoordinator.resetForStart();
       const kit = resolveHfDownloadKit(modelId);
       setProgress({
         ...DOWNLOAD_PROGRESS_INITIAL_STATE,
@@ -125,10 +146,7 @@ export function useHfDownload() {
 
       let completedBytes = 0;
       for (let i = 0; i < kit.files.length; i += 1) {
-        if (canceledRef.current) {
-          setProgress((prev) => ({ ...prev, status: "canceled" }));
-          return;
-        }
+        if (!cancelCoordinator.prepareJobRequest()) return;
         const f = kit.files[i]!; // safe: i < kit.files.length loop bound guarantees presence
         try {
           const response = await fetch("/api/desktop-runtime/hf-download", {
@@ -138,6 +156,7 @@ export function useHfDownload() {
             cache: "no-store",
           });
           if (!response.ok) {
+            cancelCoordinator.failJobRequest();
             const text = await response.text();
             setProgress((prev) => ({
               ...prev,
@@ -147,7 +166,17 @@ export function useHfDownload() {
             return;
           }
           const { jobId } = (await response.json()) as { jobId: string };
-          currentJobIdRef.current = jobId;
+          cancelCoordinator.registerJob(jobId);
+          const pendingCancel = cancelCoordinator.activeCancelAttempt();
+          if (pendingCancel) {
+            try {
+              await pendingCancel;
+              return;
+            } catch {
+              // Cancel was rejected or transport failed; keep watching the
+              // still-active server job and allow a retry.
+            }
+          }
           setProgress((prev) => ({
             ...prev,
             jobId,
@@ -155,6 +184,7 @@ export function useHfDownload() {
             fileIndex: i,
           }));
           const outcome = await streamOne(jobId, completedBytes, i, kit);
+          cancelCoordinator.finishJob(jobId);
           if (outcome !== "ready") {
             // streamOne already set the terminal status (error/canceled).
             if (outcome === "canceled") {
@@ -164,6 +194,7 @@ export function useHfDownload() {
           }
           completedBytes += f.size;
         } catch (err) {
+          cancelCoordinator.failJobRequest();
           setProgress((prev) => ({
             ...prev,
             status: "error",
@@ -182,26 +213,35 @@ export function useHfDownload() {
         speedBps: 0,
       }));
     },
-    [stopStream, streamOne],
+    [cancelCoordinator, stopStream, streamOne],
   );
 
-  /** Cancel the in-flight kit: abort the current stream + DELETE its job. */
+  /** Cancel the in-flight kit and wait for a server-reported terminal state. */
   const cancel = useCallback(async () => {
-    canceledRef.current = true;
-    const jobId = currentJobIdRef.current;
-    stopStream();
-    setProgress((prev) => ({ ...prev, status: "canceled" }));
-    if (jobId) {
-      try {
-        await fetch(`/api/desktop-runtime/hf-download/${encodeURIComponent(jobId)}`, {
-          method: "DELETE",
-          cache: "no-store",
-        });
-      } catch {
-        // Non-fatal — the cancel flag is also set on the bridge side.
-      }
+    try {
+      const outcome = await cancelCoordinator.requestCancel();
+      const snapshot = outcome.snapshot;
+      setProgress((previous) => ({
+        ...previous,
+        status: outcome.status,
+        received: snapshot?.received ?? previous.received,
+        total: snapshot?.total ?? previous.total,
+        error: snapshot?.error ?? null,
+        speedBps: 0,
+      }));
+      currentTerminalResolverRef.current?.(outcome.status);
+      stopStream();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Cancel request failed.";
+      setProgress((previous) => ({
+        ...previous,
+        // Preserve queued/downloading instead of claiming terminal canceled.
+        status: normalizeDownloadStatus(previous.status),
+        error: message,
+      }));
+      throw error;
     }
-  }, [stopStream]);
+  }, [cancelCoordinator, stopStream]);
 
   return {
     ...progress,

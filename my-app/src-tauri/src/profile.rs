@@ -1,7 +1,10 @@
+use fs4::FileExt;
 use serde::Serialize;
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 const DEFAULT_PROFILE_NAME: &str = "studio";
+const PROFILE_LOCK_FILE_NAME: &str = "profile.lock";
 
 #[derive(Clone)]
 pub(crate) struct ProfileDirs {
@@ -114,10 +117,79 @@ pub(crate) fn ensure_profile_dirs(dirs: &ProfileDirs) -> Result<(), String> {
     Ok(())
 }
 
+/// Exclusive non-blocking OS advisory lock for the resolved Lunery profile.
+/// The lock file is persistent and must not be unlinked on unlock; dropping the
+/// returned `File` releases the advisory lock for the process lifetime holder.
+pub(crate) fn acquire_profile_advisory_lock(dirs: &ProfileDirs) -> Result<File, String> {
+    ensure_profile_dirs(dirs)?;
+    let path = dirs.runtime.join(PROFILE_LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| format!("Could not open profile lock {}: {err}", path.display()))?;
+    // Call fs4 explicitly: Rust 1.89+ adds an inherent File::try_lock that
+    // returns std::fs::TryLockError and would otherwise shadow FileExt.
+    FileExt::try_lock(&file).map_err(|err| match err {
+        fs4::TryLockError::WouldBlock => {
+            "Another Lunery Lab Studio instance already holds this profile".to_string()
+        }
+        fs4::TryLockError::Error(io_err) => {
+            format!("Could not lock profile {}: {io_err}", path.display())
+        }
+    })?;
+    Ok(file)
+}
+
 pub(crate) fn profile_models_root_path() -> Result<PathBuf, String> {
     Ok(profile_dirs()?.models)
 }
 
 pub(crate) fn profile_runtime_root_path() -> Result<PathBuf, String> {
     Ok(profile_dirs()?.runtime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{acquire_profile_advisory_lock, ensure_profile_dirs, ProfileDirs};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_profile(name: &str) -> ProfileDirs {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lunery-profile-{name}-{nonce}"));
+        let data = root.join("data");
+        ProfileDirs {
+            root: root.clone(),
+            config: root.join("config"),
+            data: data.clone(),
+            pglite: data.join("pglite"),
+            media: data.join("media"),
+            models: root.join("models"),
+            logs: root.join("logs"),
+            runtime: root.join("runtime"),
+        }
+    }
+
+    #[test]
+    fn profile_advisory_lock_is_exclusive_and_persistent() {
+        let dirs = unique_profile("lock");
+        ensure_profile_dirs(&dirs).expect("dirs");
+        let first = acquire_profile_advisory_lock(&dirs).expect("first lock");
+        let lock_path = dirs.runtime.join("profile.lock");
+        assert!(lock_path.is_file());
+        let second = acquire_profile_advisory_lock(&dirs);
+        assert!(second.is_err());
+        drop(first);
+        // Persistent lock file must remain after unlock.
+        assert!(lock_path.is_file());
+        let third = acquire_profile_advisory_lock(&dirs).expect("lock after drop");
+        drop(third);
+        assert!(lock_path.is_file());
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
 }

@@ -73,6 +73,184 @@ export interface BridgeSnapshotReduction {
   terminalStatus: "ready" | "error" | "canceled" | null;
 }
 
+export type HfCancelTerminalStatus = "ready" | "error" | "canceled";
+
+export interface HfCancelOutcome {
+  status: HfCancelTerminalStatus;
+  snapshot: BridgeDownloadSnapshot | null;
+}
+
+type DownloadFetch = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+
+interface PendingJob {
+  promise: Promise<string | null>;
+  resolve: (jobId: string | null) => void;
+}
+
+function pendingJob(): PendingJob {
+  let resolve!: (jobId: string | null) => void;
+  const promise = new Promise<string | null>((resolver) => {
+    resolve = resolver;
+  });
+  return { promise, resolve };
+}
+
+async function responseMessage(response: Response): Promise<string> {
+  const text = await response.text().catch(() => "");
+  return text.trim() || `HTTP ${response.status}`;
+}
+
+export async function requestHfDownloadCancel(
+  jobId: string,
+  fetcher: DownloadFetch = fetch,
+): Promise<void> {
+  const response = await fetcher(
+    `/api/desktop-runtime/hf-download/${encodeURIComponent(jobId)}`,
+    { method: "DELETE", cache: "no-store" },
+  );
+  if (!response.ok) {
+    throw new Error(`Cancel request failed: ${await responseMessage(response)}`);
+  }
+  const ack = (await response.json().catch(() => null)) as {
+    ok?: unknown;
+    cancelRequested?: unknown;
+    jobId?: unknown;
+  } | null;
+  if (ack?.ok !== true || ack.cancelRequested !== true || ack.jobId !== jobId) {
+    throw new Error("Cancel request was not acknowledged by the desktop runtime.");
+  }
+}
+
+export async function waitForHfDownloadTerminal(
+  jobId: string,
+  options: {
+    fetcher?: DownloadFetch;
+    sleep?: (milliseconds: number) => Promise<void>;
+    pollIntervalMs?: number;
+    maxAttempts?: number;
+  } = {},
+): Promise<BridgeDownloadSnapshot> {
+  const fetcher = options.fetcher ?? fetch;
+  const sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
+  const maxAttempts = options.maxAttempts ?? 120;
+  let lastError = "Desktop runtime did not confirm cancellation.";
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await fetcher(
+        `/api/desktop-runtime/hf-download/${encodeURIComponent(jobId)}`,
+        { cache: "no-store" },
+      );
+      if (response.ok) {
+        const snapshot = (await response.json()) as BridgeDownloadSnapshot;
+        const status = normalizeDownloadStatus(snapshot.status);
+        if (status === "ready" || status === "error" || status === "canceled") {
+          return { ...snapshot, status };
+        }
+      } else {
+        lastError = await responseMessage(response);
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : "Desktop runtime status request failed.";
+    }
+    if (attempt + 1 < maxAttempts) await sleep(pollIntervalMs);
+  }
+  throw new Error(`Cancel confirmation failed: ${lastError}`);
+}
+
+/** Coordinates cancel with a start POST that may not have returned its job id.
+ * Server truth is authoritative: intent alone never yields terminal canceled.
+ */
+export class HfDownloadCancelCoordinator {
+  private currentJobId: string | null = null;
+  private pending: PendingJob | null = null;
+  private cancelIntent = false;
+  private cancelAttempt: Promise<HfCancelOutcome> | null = null;
+
+  constructor(
+    private readonly fetcher: DownloadFetch = fetch,
+    private readonly sleep: (milliseconds: number) => Promise<void> = (milliseconds) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  ) {}
+
+  get cancelRequested(): boolean {
+    return this.cancelIntent;
+  }
+
+  resetForStart(): void {
+    this.cancelIntent = false;
+    this.currentJobId = null;
+    this.pending?.resolve(null);
+    this.pending = null;
+    this.cancelAttempt = null;
+  }
+
+  prepareJobRequest(): boolean {
+    if (this.cancelIntent) return false;
+    this.currentJobId = null;
+    this.pending = pendingJob();
+    return true;
+  }
+
+  registerJob(jobId: string): void {
+    this.currentJobId = jobId;
+    this.pending?.resolve(jobId);
+    this.pending = null;
+  }
+
+  failJobRequest(): void {
+    this.pending?.resolve(null);
+    this.pending = null;
+  }
+
+  finishJob(jobId: string): void {
+    if (this.currentJobId === jobId) this.currentJobId = null;
+  }
+
+  activeCancelAttempt(): Promise<HfCancelOutcome> | null {
+    return this.cancelAttempt;
+  }
+
+  requestCancel(): Promise<HfCancelOutcome> {
+    if (this.cancelAttempt) return this.cancelAttempt;
+    this.cancelIntent = true;
+    const attempt = this.runCancel();
+    this.cancelAttempt = attempt;
+    void attempt.finally(() => {
+      if (this.cancelAttempt === attempt) this.cancelAttempt = null;
+    }).catch(() => {});
+    return attempt;
+  }
+
+  private async runCancel(): Promise<HfCancelOutcome> {
+    try {
+      const jobId = this.currentJobId ?? (this.pending ? await this.pending.promise : null);
+      // Between kit files there is no server job to cancel; local intent stops
+      // the loop before it starts the next file.
+      if (!jobId) return { status: "canceled", snapshot: null };
+      await requestHfDownloadCancel(jobId, this.fetcher);
+      const snapshot = await waitForHfDownloadTerminal(jobId, {
+        fetcher: this.fetcher,
+        sleep: this.sleep,
+      });
+      this.finishJob(jobId);
+      return {
+        status: snapshot.status as HfCancelTerminalStatus,
+        snapshot,
+      };
+    } catch (error) {
+      // A rejected/false/transport acknowledgment leaves the server job active
+      // and makes cancel retryable.
+      this.cancelIntent = false;
+      throw error;
+    }
+  }
+}
+
 export const DOWNLOAD_PROGRESS_INITIAL_STATE: DownloadProgress = {
   status: "idle",
   percent: null,
