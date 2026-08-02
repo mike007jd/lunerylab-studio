@@ -133,13 +133,19 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
     case "mkdir": {
       const root = rootPath(request.root);
       await assertTestProfileParents(request.root, root, `${request.relative_path}/.mkdir-leaf`);
-      await fs.mkdir(path.join(root, request.relative_path), { recursive: true });
+      await fs.mkdir(
+        path.join(/* turbopackIgnore: true */ root, request.relative_path),
+        { recursive: true },
+      );
       return;
     }
     case "write": {
       const root = rootPath(request.root);
       await assertTestProfileParents(request.root, root, request.relative_path);
-      const destination = path.join(root, request.relative_path);
+      const destination = path.join(
+        /* turbopackIgnore: true */ root,
+        request.relative_path,
+      );
       await fs.mkdir(path.dirname(destination), { recursive: true });
       await fs.copyFile(
         request.source_path,
@@ -152,8 +158,14 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
       const root = rootPath(request.root);
       await assertTestProfileParents(request.root, root, request.source_relative_path);
       await assertTestProfileParents(request.root, root, request.destination_relative_path);
-      const source = path.join(root, request.source_relative_path);
-      const destination = path.join(root, request.destination_relative_path);
+      const source = path.join(
+        /* turbopackIgnore: true */ root,
+        request.source_relative_path,
+      );
+      const destination = path.join(
+        /* turbopackIgnore: true */ root,
+        request.destination_relative_path,
+      );
       if (request.replace) {
         await fs.rename(source, destination);
       } else {
@@ -165,7 +177,10 @@ async function executeTestFallback(request: ProfileFsRequest): Promise<void> {
     case "unlink": {
       const root = rootPath(request.root);
       await assertTestProfileParents(request.root, root, request.relative_path);
-      await fs.unlink(path.join(root, request.relative_path)).catch((error) => {
+      await fs.unlink(path.join(
+        /* turbopackIgnore: true */ root,
+        request.relative_path,
+      )).catch((error) => {
         if (!(request.missing_ok && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
       });
       return;
@@ -240,7 +255,7 @@ async function execute(request: ProfileFsRequest): Promise<void> {
 }
 
 export function profileRelativePath(root: NativeProfileRoot, absolutePath: string): string {
-  const rootAbsolute = path.resolve(rootPath(root));
+  const rootAbsolute = path.resolve(/* turbopackIgnore: true */ rootPath(root));
   const relative = path.relative(rootAbsolute, path.resolve(absolutePath));
   if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error("Path is outside the selected profile root.");
