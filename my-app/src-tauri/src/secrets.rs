@@ -1,7 +1,11 @@
 use keyring_core::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub(crate) const KEYCHAIN_SERVICE: &str = "com.lunerylab.studio.provider";
@@ -19,6 +23,30 @@ const SECRET_READ_LIMIT: usize = 60;
 /// penalizing configured providers that resolve successfully.
 const SECRET_FAILURE_LIMIT: usize = 10;
 const SECRET_MISS_WINDOW: Duration = Duration::from_secs(60);
+const SECRET_BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
+const SECRET_FOLLOWER_TIMEOUT: Duration = Duration::from_millis(2250);
+const KEYCHAIN_READ_HELPER_ARG: &str = "--lunery-keychain-read-helper";
+
+const CANONICAL_PROVIDER_IDS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "gemini",
+    "xai",
+    "mistral",
+    "deepseek",
+    "groq",
+    "perplexity",
+    "cerebras",
+    "openrouter",
+    "minimax",
+    "replicate",
+    "fal",
+    "together",
+    "fireworks",
+    "meshy",
+    "tripo",
+    "openai-compatible",
+];
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,16 +71,16 @@ pub(crate) struct ProviderSecretStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeychainSecretState {
     Present,
-    Missing,
-    Unavailable,
+    Absent,
+    Unknown,
 }
 
 impl KeychainSecretState {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Present => "present",
-            Self::Missing => "missing",
-            Self::Unavailable => "unavailable",
+            Self::Absent => "absent",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -179,6 +207,124 @@ fn secret_read_state() -> &'static Mutex<SecretReadState> {
     })
 }
 
+#[derive(Default)]
+struct SecretRuntime {
+    cancelled: AtomicBool,
+    epoch: AtomicU64,
+    next_helper_id: AtomicU64,
+    helpers: Mutex<HashMap<u64, Arc<Mutex<Option<Child>>>>>,
+    presence_worker: Mutex<Option<JoinHandle<()>>>,
+    wake_lock: Mutex<()>,
+    wake: Condvar,
+}
+
+fn secret_runtime() -> &'static SecretRuntime {
+    static RUNTIME: OnceLock<SecretRuntime> = OnceLock::new();
+    RUNTIME.get_or_init(SecretRuntime::default)
+}
+
+impl SecretRuntime {
+    fn capture_epoch(&self) -> Result<u64, ProviderSecretReadError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(ProviderSecretReadError::Unavailable)
+        } else {
+            Ok(self.epoch.load(Ordering::Acquire))
+        }
+    }
+
+    fn is_current(&self, epoch: u64) -> bool {
+        !self.cancelled.load(Ordering::Acquire) && self.epoch.load(Ordering::Acquire) == epoch
+    }
+
+    fn wait_or_cancel(&self, duration: Duration, epoch: u64) -> bool {
+        if !self.is_current(epoch) {
+            return true;
+        }
+        let guard = match self.wake_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => return true,
+        };
+        let _ = self
+            .wake
+            .wait_timeout_while(guard, duration, |_| self.is_current(epoch));
+        !self.is_current(epoch)
+    }
+
+    fn register_helper(&self, child: Child) -> (u64, Arc<Mutex<Option<Child>>>) {
+        let id = self.next_helper_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let child = Arc::new(Mutex::new(Some(child)));
+        self.helpers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, Arc::clone(&child));
+        (id, child)
+    }
+
+    fn unregister_helper(&self, id: u64) {
+        self.helpers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+    }
+
+    fn shutdown(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.wake.notify_all();
+        {
+            let mut state = secret_read_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.presence_queue.clear();
+            state.presence_queued.clear();
+        }
+        let helpers = self
+            .helpers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for helper in helpers {
+            let mut child = helper
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(mut child) = child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        self.helpers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let worker = self
+            .presence_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        self.shutdown();
+        self.cancelled.store(false, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn shutdown_secret_runtime() {
+    secret_runtime().shutdown();
+}
+
+#[cfg(test)]
+pub(crate) fn reset_secret_runtime_for_tests() {
+    secret_runtime().reset();
+}
+
 /// Positive-cache misses that will perform a real OS-keychain read consume this
 /// budget before the backend call — success, Missing, and Unavailable alike.
 /// Cache hits and same-provider inflight followers are free. Returns false when
@@ -267,8 +413,8 @@ impl InflightLeaderGuard {
                     );
                     KeychainSecretState::Present
                 }
-                Err(ProviderSecretReadError::Missing) => KeychainSecretState::Missing,
-                Err(_) => KeychainSecretState::Unavailable,
+                Err(ProviderSecretReadError::Missing) => KeychainSecretState::Absent,
+                Err(_) => KeychainSecretState::Unknown,
             };
             state.presence.insert(
                 self.provider_id.clone(),
@@ -337,17 +483,46 @@ pub(crate) fn invalidate_provider_secret_cache(provider_id: &str) {
     invalidate_provider_secret_cache_inner(provider_id, None);
 }
 
-/// Append a tamper-evident-ish audit line for every secret-read attempt. We
-/// log to stderr only — the desktop runtime is single-user, so the OS event
-/// log + Console.app are the persistence layer. NEVER logs the key material.
+fn canonical_audit_provider(provider_id: &str) -> &'static str {
+    CANONICAL_PROVIDER_IDS
+        .iter()
+        .copied()
+        .find(|known| *known == provider_id)
+        .unwrap_or("unknown")
+}
+
+fn canonical_audit_reason(reason: &str) -> &'static str {
+    match reason {
+        "ok" => "ok",
+        "invalid_request" => "invalid_request",
+        "invalid_provider" => "invalid_provider",
+        "missing" => "missing",
+        "keychain_unavailable" => "keychain_unavailable",
+        "rate_limited" => "rate_limited",
+        _ => "unknown",
+    }
+}
+
+fn secret_audit_line(provider_id: &str, allowed: bool, reason: &str, ts: u128) -> String {
+    let payload = serde_json::json!({
+        "event": "secret-read",
+        "ts": ts,
+        "provider": canonical_audit_provider(provider_id),
+        "allowed": allowed,
+        "reason": canonical_audit_reason(reason),
+    });
+    format!("[lunerylab][audit] {payload}")
+}
+
+/// Append one structured single-line record for every secret-read attempt.
+/// Provider ids are an allowlist projection, not request text, and JSON
+/// escaping prevents CR/LF/control characters from forging extra records.
 pub(crate) fn audit_secret_read(provider_id: &str, allowed: bool, reason: &str) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    eprintln!(
-        "[lunerylab][audit] secret-read ts={ts} provider={provider_id} allowed={allowed} reason={reason}"
-    );
+    eprintln!("{}", secret_audit_line(provider_id, allowed, reason, ts));
 }
 
 fn classify_keychain_read_error(error: KeyringError) -> ProviderSecretReadError {
@@ -361,9 +536,126 @@ fn classify_keychain_mutation_error(_error: KeyringError) -> ProviderSecretMutat
     ProviderSecretMutationError::Unavailable
 }
 
-fn read_keychain_password(provider_id: &str) -> Result<String, ProviderSecretReadError> {
+fn read_keychain_password_direct(provider_id: &str) -> Result<String, ProviderSecretReadError> {
     let entry = provider_entry(provider_id).map_err(|_| ProviderSecretReadError::Unavailable)?;
     entry.get_password().map_err(classify_keychain_read_error)
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeychainReadHelperResponse {
+    state: String,
+    secret: Option<String>,
+}
+
+/// Hidden child-process entrypoint. The parent never calls an uncancellable OS
+/// keychain API in-process: if the native store stalls, it kills this helper at
+/// the deadline or lifecycle shutdown boundary.
+pub(crate) fn run_keychain_read_helper_if_requested() -> bool {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some(KEYCHAIN_READ_HELPER_ARG) {
+        return false;
+    }
+    let provider_id = args.next().unwrap_or_default();
+    let response = if validate_provider_id(&provider_id).is_err() {
+        KeychainReadHelperResponse {
+            state: "unknown".to_string(),
+            secret: None,
+        }
+    } else {
+        match read_keychain_password_direct(&provider_id) {
+            Ok(secret) => KeychainReadHelperResponse {
+                state: "present".to_string(),
+                secret: Some(secret),
+            },
+            Err(ProviderSecretReadError::Missing) => KeychainReadHelperResponse {
+                state: "absent".to_string(),
+                secret: None,
+            },
+            Err(_) => KeychainReadHelperResponse {
+                state: "unknown".to_string(),
+                secret: None,
+            },
+        }
+    };
+    if let Ok(payload) = serde_json::to_vec(&response) {
+        let _ = std::io::stdout().write_all(&payload);
+        let _ = std::io::stdout().flush();
+    }
+    true
+}
+
+fn run_bounded_keychain_helper(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<Vec<u8>, ProviderSecretReadError> {
+    let runtime = secret_runtime();
+    let epoch = runtime.capture_epoch()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let child = command
+        .spawn()
+        .map_err(|_| ProviderSecretReadError::Unavailable)?;
+    let (helper_id, child) = runtime.register_helper(child);
+    let deadline = Instant::now() + timeout;
+    let result = loop {
+        if !runtime.is_current(epoch) || Instant::now() >= deadline {
+            let mut slot = child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            break Err(ProviderSecretReadError::Unavailable);
+        }
+        let exited = {
+            let mut slot = child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match slot
+                .as_mut()
+                .and_then(|child| child.try_wait().ok())
+                .flatten()
+            {
+                Some(_) => slot.take(),
+                None => None,
+            }
+        };
+        if let Some(mut child) = exited {
+            let mut bytes = Vec::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                if stdout.read_to_end(&mut bytes).is_err() {
+                    let _ = child.wait();
+                    break Err(ProviderSecretReadError::Unavailable);
+                }
+            }
+            break match child.wait() {
+                Ok(status) if status.success() => Ok(bytes),
+                _ => Err(ProviderSecretReadError::Unavailable),
+            };
+        }
+        if runtime.wait_or_cancel(Duration::from_millis(10), epoch) {
+            continue;
+        }
+    };
+    runtime.unregister_helper(helper_id);
+    result
+}
+
+fn read_keychain_password(provider_id: &str) -> Result<String, ProviderSecretReadError> {
+    let executable = std::env::current_exe().map_err(|_| ProviderSecretReadError::Unavailable)?;
+    let mut command = Command::new(executable);
+    command.arg(KEYCHAIN_READ_HELPER_ARG).arg(provider_id);
+    let payload = run_bounded_keychain_helper(command, SECRET_BACKEND_TIMEOUT)?;
+    let response: KeychainReadHelperResponse =
+        serde_json::from_slice(&payload).map_err(|_| ProviderSecretReadError::Unavailable)?;
+    match (response.state.as_str(), response.secret) {
+        ("present", Some(secret)) if !secret.is_empty() => Ok(secret),
+        ("absent", _) => Err(ProviderSecretReadError::Missing),
+        _ => Err(ProviderSecretReadError::Unavailable),
+    }
 }
 
 type PresenceReader =
@@ -380,9 +672,46 @@ impl Drop for PresenceWorkerGuard {
     }
 }
 
+fn bump_provider_status_revision() {
+    static REVISION: AtomicU64 = AtomicU64::new(0);
+    #[cfg(test)]
+    if std::env::var_os("LUNERY_RUNTIME_DIR").is_none() {
+        return;
+    }
+    let Ok(runtime) = crate::profile::profile_runtime_root_path() else {
+        return;
+    };
+    if std::fs::create_dir_all(&runtime).is_err() {
+        return;
+    }
+    let sequence = REVISION.fetch_add(1, Ordering::AcqRel) + 1;
+    let revision = format!("{}-{sequence}", std::process::id());
+    let target = runtime.join("provider-status.revision");
+    let temporary = runtime.join(format!(
+        ".provider-status.revision.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    if std::fs::write(&temporary, revision).is_err() {
+        return;
+    }
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(&target);
+    if std::fs::rename(&temporary, &target).is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+}
+
 fn run_presence_worker(reader: PresenceReader) {
     let _guard = PresenceWorkerGuard;
+    let runtime = secret_runtime();
+    let Ok(epoch) = runtime.capture_epoch() else {
+        return;
+    };
     loop {
+        if !runtime.is_current(epoch) {
+            return;
+        }
         let provider_id = {
             let mut state = secret_read_state()
                 .lock()
@@ -395,12 +724,62 @@ fn run_presence_worker(reader: PresenceReader) {
             };
             provider_id
         };
-        let _ = resolve_provider_secret_with(&provider_id, Instant::now(), |id| reader(id));
+        let generation = secret_read_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generations
+            .get(&provider_id)
+            .copied()
+            .unwrap_or(0);
+        let outcome = reader(&provider_id);
+        if !runtime.is_current(epoch) {
+            return;
+        }
         let mut state = secret_read_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generations.get(&provider_id).copied().unwrap_or(0) == generation {
+            let presence = match outcome {
+                Ok(_) => KeychainSecretState::Present,
+                Err(ProviderSecretReadError::Missing) => KeychainSecretState::Absent,
+                Err(_) => KeychainSecretState::Unknown,
+            };
+            state.presence.insert(
+                provider_id.clone(),
+                CachedPresence {
+                    state: presence,
+                    expires_at: Instant::now() + SECRET_PRESENCE_TTL,
+                },
+            );
+        }
         state.presence_queued.remove(&provider_id);
+        drop(state);
+        bump_provider_status_revision();
     }
+}
+
+fn spawn_presence_worker(reader: PresenceReader) -> Result<(), String> {
+    let runtime = secret_runtime();
+    let mut worker = runtime
+        .presence_worker
+        .lock()
+        .map_err(|_| "Secret presence worker registry is poisoned".to_string())?;
+    if runtime.cancelled.load(Ordering::Acquire) {
+        return Err("Secret runtime is shutting down".to_string());
+    }
+    if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+        return Ok(());
+    }
+    if let Some(finished) = worker.take() {
+        let _ = finished.join();
+    }
+    *worker = Some(
+        std::thread::Builder::new()
+            .name("lunery-secret-presence".to_string())
+            .spawn(move || run_presence_worker(reader))
+            .map_err(|error| format!("Could not start secret presence worker: {error}"))?,
+    );
+    Ok(())
 }
 
 /// Returns a memory snapshot immediately. A cache miss or stale snapshot only
@@ -412,7 +791,7 @@ fn keychain_secret_state_with(
     reader: PresenceReader,
 ) -> KeychainSecretState {
     if validate_provider_id(provider_id).is_err() {
-        return KeychainSecretState::Unavailable;
+        return KeychainSecretState::Unknown;
     }
     let (snapshot, spawn_worker) = {
         let mut state = secret_read_state()
@@ -421,7 +800,7 @@ fn keychain_secret_state_with(
         let cached = state.presence.get(provider_id).copied();
         let snapshot = cached
             .map(|presence| presence.state)
-            .unwrap_or(KeychainSecretState::Unavailable);
+            .unwrap_or(KeychainSecretState::Unknown);
         if cached.is_none_or(|presence| presence.expires_at <= now)
             && state.presence_queued.insert(provider_id.to_string())
         {
@@ -433,12 +812,7 @@ fn keychain_secret_state_with(
         }
         (snapshot, spawn_worker)
     };
-    if spawn_worker
-        && std::thread::Builder::new()
-            .name("lunery-secret-presence".to_string())
-            .spawn(move || run_presence_worker(reader))
-            .is_err()
-    {
+    if spawn_worker && spawn_presence_worker(reader).is_err() {
         let mut state = secret_read_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -471,6 +845,9 @@ pub(crate) fn resolve_provider_secret_with<F>(
 where
     F: FnMut(&str) -> Result<String, ProviderSecretReadError>,
 {
+    if secret_runtime().cancelled.load(Ordering::Acquire) {
+        return Err(ProviderSecretReadError::Unavailable);
+    }
     if provider_id.is_empty() {
         return Err(ProviderSecretReadError::InvalidProvider);
     }
@@ -493,10 +870,35 @@ where
             .done
             .lock()
             .map_err(|_| ProviderSecretReadError::Unavailable)?;
-        let finished = inflight
+        let (mut finished, timeout) = inflight
             .cv
-            .wait_while(guard, |slot| slot.is_none())
+            .wait_timeout_while(guard, SECRET_FOLLOWER_TIMEOUT, |slot| {
+                slot.is_none() && !secret_runtime().cancelled.load(Ordering::Acquire)
+            })
             .map_err(|_| ProviderSecretReadError::Unavailable)?;
+        if finished.is_none()
+            && (timeout.timed_out() || secret_runtime().cancelled.load(Ordering::Acquire))
+        {
+            *finished = Some(Err(ProviderSecretReadError::Unavailable));
+            inflight.cv.notify_all();
+            drop(finished);
+            let mut state = secret_read_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state
+                .inflight
+                .get(provider_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &inflight))
+            {
+                state.inflight.remove(provider_id);
+                let generation = state
+                    .generations
+                    .entry(provider_id.to_string())
+                    .or_default();
+                *generation = generation.wrapping_add(1);
+            }
+            return Err(ProviderSecretReadError::Unavailable);
+        }
         return finished
             .clone()
             .unwrap_or(Err(ProviderSecretReadError::Unavailable));
@@ -581,10 +983,7 @@ pub(crate) fn delete_provider_secret(
     let entry = provider_entry(&provider_id)?;
     match entry.delete_credential() {
         Ok(()) | Err(KeyringError::NoEntry) => {
-            invalidate_provider_secret_cache_inner(
-                &provider_id,
-                Some(KeychainSecretState::Missing),
-            );
+            invalidate_provider_secret_cache_inner(&provider_id, Some(KeychainSecretState::Absent));
             Ok(ProviderSecretStatus {
                 provider_id,
                 configured: false,
@@ -600,16 +999,19 @@ mod tests {
     use super::{
         classify_keychain_mutation_error, classify_keychain_read_error,
         invalidate_provider_secret_cache, keychain_secret_state_with, resolve_provider_secret_with,
-        secret_read_state, KeychainSecretState, PresenceReader, ProviderSecretMutationError,
-        ProviderSecretReadError, SECRET_FAILURE_LIMIT, SECRET_READ_LIMIT,
+        run_bounded_keychain_helper, secret_audit_line, secret_read_state, secret_runtime,
+        KeychainSecretState, PresenceReader, ProviderSecretMutationError, ProviderSecretReadError,
+        SECRET_FAILURE_LIMIT, SECRET_READ_LIMIT,
     };
     use crate::test_global_lock;
     use keyring_core::Error as KeyringError;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn reset_secret_state() {
+        secret_runtime().reset();
         let mut state = secret_read_state().lock().expect("secret state");
         state.cache.clear();
         state.inflight.clear();
@@ -620,6 +1022,61 @@ mod tests {
         state.presence_worker_active = false;
         state.read_times.clear();
         state.failure_times.clear();
+    }
+
+    #[test]
+    fn audit_record_allowlists_provider_and_cannot_forge_lines() {
+        let injected = "openai\r\nprovider=anthropic raw-secret";
+        let line = secret_audit_line(injected, false, "bad\r\nreason", 42);
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.len() < 256);
+        assert!(line.contains("\"provider\":\"unknown\""));
+        assert!(line.contains("\"reason\":\"unknown\""));
+        assert!(!line.contains("raw-secret"));
+
+        let canonical = secret_audit_line("openai", true, "ok", 43);
+        assert!(canonical.contains("\"provider\":\"openai\""));
+        assert!(canonical.contains("\"reason\":\"ok\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_timeout_and_shutdown_are_strictly_bounded() {
+        let _g = test_global_lock();
+        reset_secret_state();
+
+        let mut timeout_command = Command::new("/bin/sh");
+        timeout_command.args(["-c", "exec sleep 30"]);
+        let started = Instant::now();
+        assert_eq!(
+            run_bounded_keychain_helper(timeout_command, Duration::from_millis(100))
+                .expect_err("helper must time out"),
+            ProviderSecretReadError::Unavailable
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(secret_runtime().helpers.lock().unwrap().is_empty());
+
+        let worker = std::thread::spawn(|| {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exec sleep 30"]);
+            run_bounded_keychain_helper(command, Duration::from_secs(30))
+        });
+        for _ in 0..100 {
+            if !secret_runtime().helpers.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(secret_runtime().helpers.lock().unwrap().len(), 1);
+        let shutdown_started = Instant::now();
+        secret_runtime().shutdown();
+        assert!(shutdown_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            worker.join().unwrap().expect_err("shutdown cancels helper"),
+            ProviderSecretReadError::Unavailable
+        );
+        assert!(secret_runtime().helpers.lock().unwrap().is_empty());
+        secret_runtime().reset();
     }
 
     #[test]
@@ -682,6 +1139,12 @@ mod tests {
     fn status_presence_is_nonblocking_and_single_worker_bounded() {
         let _g = test_global_lock();
         reset_secret_state();
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "lunery-secret-revision-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::env::set_var("LUNERY_RUNTIME_DIR", &runtime_dir);
         let reads = Arc::new(AtomicUsize::new(0));
         let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let reads_worker = Arc::clone(&reads);
@@ -698,7 +1161,7 @@ mod tests {
 
         assert_eq!(
             keychain_secret_state_with("status-provider", Instant::now(), Arc::clone(&reader)),
-            KeychainSecretState::Unavailable
+            KeychainSecretState::Unknown
         );
         for _ in 0..100 {
             if reads.load(Ordering::SeqCst) == 1 {
@@ -717,7 +1180,7 @@ mod tests {
             }));
         }
         for caller in callers {
-            assert_eq!(caller.join().unwrap(), KeychainSecretState::Unavailable);
+            assert_eq!(caller.join().unwrap(), KeychainSecretState::Unknown);
         }
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -743,6 +1206,9 @@ mod tests {
             KeychainSecretState::Present
         );
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert!(runtime_dir.join("provider-status.revision").is_file());
+        std::env::remove_var("LUNERY_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(runtime_dir);
     }
 
     #[test]
@@ -891,6 +1357,50 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(secret_read_state().lock().unwrap().read_times.len(), 1);
         assert!(secret_read_state().lock().unwrap().inflight.is_empty());
+    }
+
+    #[test]
+    fn timed_out_follower_detaches_generation_and_late_leader_cannot_cache() {
+        let _g = test_global_lock();
+        reset_secret_state();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_leader = Arc::clone(&entered);
+        let release_leader = Arc::clone(&release);
+        let leader = std::thread::spawn(move || {
+            resolve_provider_secret_with("blocked", Instant::now(), |_| {
+                entered_leader.wait();
+                release_leader.wait();
+                Ok("stale".to_string())
+            })
+        });
+        entered.wait();
+
+        let started = Instant::now();
+        assert_eq!(
+            resolve_provider_secret_with("blocked", Instant::now(), |_| {
+                panic!("follower must not call backend")
+            })
+            .expect_err("follower deadline"),
+            ProviderSecretReadError::Unavailable
+        );
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            secret_read_state()
+                .lock()
+                .unwrap()
+                .generations
+                .get("blocked"),
+            Some(&1)
+        );
+
+        release.wait();
+        assert_eq!(leader.join().unwrap().unwrap(), "stale");
+        let fresh =
+            resolve_provider_secret_with("blocked", Instant::now(), |_| Ok("fresh".to_string()))
+                .unwrap();
+        assert_eq!(fresh, "fresh");
     }
 
     #[test]

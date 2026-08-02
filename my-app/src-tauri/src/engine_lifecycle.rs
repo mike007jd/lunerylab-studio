@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::model_residency::PersistentRegistration;
@@ -21,6 +21,7 @@ pub(crate) struct EngineLifecycle {
     child: Mutex<Option<Child>>,
     start: Mutex<()>,
     residency: Mutex<Option<PersistentRegistration>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
     pid_filename: &'static str,
 }
 
@@ -31,6 +32,7 @@ impl EngineLifecycle {
             child: Mutex::new(None),
             start: Mutex::new(()),
             residency: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
             pid_filename,
         }
     }
@@ -70,6 +72,14 @@ impl EngineLifecycle {
         &self.residency
     }
 
+    #[cfg(test)]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     pub(crate) fn pid_lockfile_path(&self) -> Option<PathBuf> {
         profile_runtime_root_path()
             .ok()
@@ -92,6 +102,7 @@ impl EngineLifecycle {
     pub(crate) fn prepare_start(&self) -> u64 {
         let epoch = self.next_epoch();
         self.stop_owned_process();
+        self.join_workers();
         epoch
     }
 
@@ -99,6 +110,53 @@ impl EngineLifecycle {
     pub(crate) fn stop(&self) {
         self.next_epoch();
         self.stop_owned_process();
+        self.join_workers();
+    }
+
+    /// Spawn an engine-owned monitor. Finished workers are reaped before a new
+    /// one is registered; stop/restart invalidates their epoch, reaps the child
+    /// that may be holding a pipe open, then synchronously joins every worker.
+    pub(crate) fn spawn_worker(
+        &'static self,
+        epoch: u64,
+        name: &str,
+        work: impl FnOnce() + Send + 'static,
+    ) -> Result<(), String> {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.current_epoch() != epoch {
+            return Err("Engine monitor was superseded".to_string());
+        }
+        let mut active = Vec::with_capacity(workers.len() + 1);
+        for worker in workers.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                active.push(worker);
+            }
+        }
+        let worker = thread::Builder::new()
+            .name(name.to_string())
+            .spawn(work)
+            .map_err(|error| format!("Could not start {name}: {error}"))?;
+        active.push(worker);
+        *workers = active;
+        Ok(())
+    }
+
+    fn join_workers(&self) {
+        let workers = {
+            let mut slot = self
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *slot)
+        };
+        for worker in workers {
+            let _ = worker.join();
+        }
     }
 
     fn stop_owned_process(&self) {
@@ -230,8 +288,8 @@ impl EngineLifecycle {
         epoch: u64,
         registration_id: String,
         on_current_exit: impl FnOnce() + Send + 'static,
-    ) {
-        thread::spawn(move || loop {
+    ) -> Result<(), String> {
+        self.spawn_worker(epoch, "lunery-engine-exit", move || loop {
             thread::sleep(Duration::from_millis(250));
             if self.current_epoch() != epoch {
                 return;
@@ -265,7 +323,7 @@ impl EngineLifecycle {
                 on_current_exit();
             }
             return;
-        });
+        })
     }
 
     fn remove_pid_lockfile(&self) {

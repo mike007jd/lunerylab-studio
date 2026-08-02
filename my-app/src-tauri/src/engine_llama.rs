@@ -9,7 +9,7 @@ use crate::engine_lifecycle::EngineLifecycle;
 use crate::llama_resident::LlamaResident;
 #[cfg(test)]
 use crate::model_residency::PersistentRegistration;
-use crate::{kill_stale_pid_if_matches, reserve_local_port, residency_global, wait_for_port};
+use crate::{kill_stale_pid_if_matches, reserve_local_port, residency_global, wait_for_port_while};
 #[cfg(test)]
 use std::process::Child;
 
@@ -229,10 +229,14 @@ fn cleanup_llama_exit_if_current(epoch: u64, model_path: &str, registration_id: 
     true
 }
 
-fn monitor_llama_exit(epoch: u64, model_path: String, registration_id: String) {
+fn monitor_llama_exit(
+    epoch: u64,
+    model_path: String,
+    registration_id: String,
+) -> Result<(), String> {
     LLAMA_LIFECYCLE.monitor_exit(epoch, registration_id, move || {
         clear_llama_info_if_model(&model_path);
-    });
+    })
 }
 
 /// Resolve the bundled engine dir without an AppHandle (bridge threads have none).
@@ -344,7 +348,7 @@ pub(crate) fn bridge_start_llama(
     // next start would refuse to proceed). Roll back fully: kill+wait the child,
     // clear the child + engine slots, and remove the lockfile — but only while
     // we are still the current epoch, so we never tear down a concurrent start.
-    if let Err(err) = wait_for_port(port) {
+    if let Err(err) = wait_for_port_while(port, || LLAMA_LIFECYCLE.current_epoch() == my_epoch) {
         if LLAMA_LIFECYCLE.rollback_if_current(my_epoch, None) {
             if let Ok(mut slot) = llama_engine_slot().lock() {
                 *slot = None;
@@ -372,7 +376,13 @@ pub(crate) fn bridge_start_llama(
         LLAMA_LIFECYCLE
             .commit_registration(my_epoch, registration)
             .map_err(|_| "Llama start was superseded".to_string())?;
-        monitor_llama_exit(my_epoch, model_path.clone(), registration_id);
+        if let Err(error) =
+            monitor_llama_exit(my_epoch, model_path.clone(), registration_id.clone())
+        {
+            LLAMA_LIFECYCLE.rollback_if_current(my_epoch, Some(&registration_id));
+            clear_llama_info_if_model(&model_path);
+            return Err(error);
+        }
     } else {
         return Err("Llama start was superseded".to_string());
     }
