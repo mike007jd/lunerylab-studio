@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import {
   bridgeErrorText,
-  getBridgeDownloadStatus,
+  probeBridgeDownloadJob,
   requireDesktopBridge,
   startBridgeDownloadJob,
 } from "@/lib/server/desktop-bridge";
@@ -32,6 +32,22 @@ const importModelBodySchema = z.object({
 });
 
 const ACTIVE_IMPORT_STATUSES = new Set(["queued", "downloading"]);
+
+function queuedImportResponse(record: NonNullable<Awaited<ReturnType<typeof findImportedModel>>>, extra: {
+  recovered?: boolean;
+} = {}) {
+  return NextResponse.json({
+    imported: true,
+    queued: true,
+    reused: true,
+    ...extra,
+    jobId: record.jobId,
+    fileName: record.fileName,
+    runtimeTarget: record.runtimeTarget,
+    dest: record.modelPath,
+    model: record,
+  });
+}
 
 // Required SHA-256 preflight for integrity verification. Hugging Face returns
 // the SHA-256 of an LFS/Xet artifact in `x-linked-etag` on the /resolve HEAD
@@ -139,31 +155,85 @@ export async function POST(request: NextRequest) {
   const dest = importedModelDownloadDest(runtimeTarget, modelId, resolved.fileName);
   const existing = await findImportedModel(modelId);
   if (existing?.jobId) {
-    const existingStatus = await getBridgeDownloadStatus(bridge, existing.jobId).catch(() => null);
-    if (typeof existingStatus?.status === "string" && ACTIVE_IMPORT_STATUSES.has(existingStatus.status)) {
-      return NextResponse.json({
-        imported: true,
-        queued: true,
-        reused: true,
-        jobId: existing.jobId,
-        fileName: existing.fileName,
-        runtimeTarget: existing.runtimeTarget,
-        dest: existing.modelPath,
-        model: existing,
-      });
+    const existingProbe = await probeBridgeDownloadJob(bridge, existing.jobId);
+    if (existingProbe.outcome === "observed" && ACTIVE_IMPORT_STATUSES.has(existingProbe.status)) {
+      return queuedImportResponse(existing);
     }
-    if (!existingStatus || typeof existingStatus.status !== "string") {
+    if (existingProbe.outcome === "ambiguous") {
       return NextResponse.json(
         {
           error: "Existing model import status is unknown; queued ownership was retained.",
-          code: "bridge_start_unknown",
+          code: existingProbe.code,
           partialState: true,
           queued: true,
           retryable: true,
           jobId: existing.jobId,
         },
-        { status: 503 },
+        { status: existingProbe.code === "bridge_timeout" ? 504 : 503 },
       );
+    }
+    if (existingProbe.outcome === "not_found") {
+      // An earlier start may have been accepted even though both its response
+      // and the immediate status probe were lost. Re-submit the exact durable
+      // request identity under the original jobId. Native start is idempotent
+      // for same-ID/same-payload and adopts the existing reservation instead
+      // of creating a second job.
+      if (
+        existing.source !== "huggingface-url"
+        || !existing.url
+        || !existing.sha256
+        || existing.modelPath !== dest
+      ) {
+        return NextResponse.json(
+          {
+            error: "Existing model import ownership is incomplete and cannot be retried safely.",
+            code: "bridge_start_unknown",
+            partialState: true,
+            queued: true,
+            retryable: false,
+            jobId: existing.jobId,
+          },
+          { status: 409 },
+        );
+      }
+      try {
+        const retry = await startBridgeDownloadJob(bridge, {
+          url: existing.url,
+          dest: existing.modelPath,
+          sha256: existing.sha256,
+          jobId: existing.jobId,
+        });
+        if (!retry.ok) {
+          const message = await bridgeErrorText(retry).catch(() => `HTTP ${retry.status}`);
+          return NextResponse.json(
+            {
+              error: `Bridge start failed: ${message}`,
+              code: "bridge_start_rejected",
+              queued: true,
+              retryable: false,
+              jobId: existing.jobId,
+            },
+            { status: retry.status },
+          );
+        }
+        return queuedImportResponse(existing, { recovered: true });
+      } catch (error) {
+        const observed = await probeBridgeDownloadJob(bridge, existing.jobId);
+        if (observed.outcome === "observed") {
+          return queuedImportResponse(existing, { recovered: true });
+        }
+        return NextResponse.json(
+          {
+            error: "Existing model import status is unknown; queued ownership was retained.",
+            code: "bridge_start_unknown",
+            partialState: true,
+            queued: true,
+            retryable: true,
+            jobId: existing.jobId,
+          },
+          { status: 503 },
+        );
+      }
     }
   }
 
@@ -211,8 +281,8 @@ export async function POST(request: NextRequest) {
           // The local bridge can accept/start the job and then lose the HTTP
           // response. Probe by jobId before deciding whether queued ownership
           // is safe to remove.
-          const observed = await getBridgeDownloadStatus(bridge, jobId).catch(() => null);
-          if (typeof observed?.status === "string" && observed.status !== "unknown") {
+          const observed = await probeBridgeDownloadJob(bridge, jobId);
+          if (observed.outcome === "observed") {
             return new Response(null, { status: 202 });
           }
           // A single immediate "unknown" does not prove rejection: the native

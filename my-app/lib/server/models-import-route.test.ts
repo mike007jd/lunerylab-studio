@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 const mocks = vi.hoisted(() => ({
   requireDesktopBridge: vi.fn(),
   startBridgeDownloadJob: vi.fn(),
-  getBridgeDownloadStatus: vi.fn(),
+  probeBridgeDownloadJob: vi.fn(),
   bridgeErrorText: vi.fn(),
   upsertImportedModel: vi.fn(),
   withQueuedImportedModelReservation: vi.fn(),
@@ -16,7 +16,7 @@ vi.mock("server-only", () => ({}));
 vi.mock("@/lib/server/desktop-bridge", () => ({
   requireDesktopBridge: mocks.requireDesktopBridge,
   startBridgeDownloadJob: mocks.startBridgeDownloadJob,
-  getBridgeDownloadStatus: mocks.getBridgeDownloadStatus,
+  probeBridgeDownloadJob: mocks.probeBridgeDownloadJob,
   bridgeErrorText: mocks.bridgeErrorText,
 }));
 vi.mock("@/lib/server/imported-model-registry", async () => {
@@ -48,6 +48,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.requireDesktopBridge.mockReturnValue({ url: "http://127.0.0.1:9", token: "t" });
   mocks.findImportedModel.mockResolvedValue(undefined);
+  mocks.probeBridgeDownloadJob.mockResolvedValue({ outcome: "not_found", jobId: "missing" });
   mocks.resolveHuggingFaceModelFileUrl.mockReturnValue({
     url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
     fileName: "demo.gguf",
@@ -114,38 +115,28 @@ describe("desktop model import route compensation", () => {
     );
   });
 
-  it("does not replace an existing queued owner when its bridge status is unavailable", async () => {
-    mocks.findImportedModel.mockResolvedValue({
+  it("adopts an existing queued owner with the original job id and payload when status is unavailable", async () => {
+    mocks.findImportedModel.mockImplementation(async () => ({
       id: "existing-model",
       jobId: "existing-job",
       status: "queued",
+      source: "huggingface-url",
       fileName: "demo.gguf",
       runtimeTarget: "llama-cpp",
-      modelPath: "/models/demo.gguf",
-    });
-    mocks.getBridgeDownloadStatus.mockResolvedValue(null);
-
-    const response = await POST(
-      importRequest({
-        source: "huggingface-url",
-        url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
-        runtimeTarget: "llama-cpp",
-      }),
-    );
-
-    expect(response.status).toBe(503);
-    await expect(response.json()).resolves.toMatchObject({
-      code: "bridge_start_unknown",
-      queued: true,
-      jobId: "existing-job",
-    });
-    expect(mocks.withQueuedImportedModelReservation).not.toHaveBeenCalled();
-    expect(mocks.startBridgeDownloadJob).not.toHaveBeenCalled();
-  });
-
-  it("keeps queued ownership when start response is lost but status finds the job", async () => {
-    mocks.startBridgeDownloadJob.mockRejectedValue(new Error("socket closed after write"));
-    mocks.getBridgeDownloadStatus.mockResolvedValue({ status: "downloading" });
+      modelPath: (await import("@/lib/server/imported-model-registry")).importedModelDownloadDest(
+        "llama-cpp",
+        (await import("@/lib/server/imported-model-registry")).importedModelId(
+          "llama-cpp",
+          "demo.gguf",
+          "https://huggingface.co/org/model/resolve/main/demo.gguf",
+        ),
+        "demo.gguf",
+      ),
+      url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
+      sha256: "b".repeat(64),
+    }));
+    mocks.probeBridgeDownloadJob.mockResolvedValue({ outcome: "not_found", jobId: "existing-job" });
+    mocks.startBridgeDownloadJob.mockResolvedValue(new Response(null, { status: 200 }));
 
     const response = await POST(
       importRequest({
@@ -156,7 +147,79 @@ describe("desktop model import route compensation", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.getBridgeDownloadStatus).toHaveBeenCalledWith(
+    await expect(response.json()).resolves.toMatchObject({
+      queued: true,
+      reused: true,
+      recovered: true,
+      jobId: "existing-job",
+    });
+    expect(mocks.withQueuedImportedModelReservation).not.toHaveBeenCalled();
+    expect(mocks.startBridgeDownloadJob).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        jobId: "existing-job",
+        url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
+        sha256: "b".repeat(64),
+      }),
+    );
+  });
+
+  it("does not retry an existing queued owner while its status probe is ambiguous", async () => {
+    mocks.findImportedModel.mockResolvedValue({
+      id: "existing-model",
+      jobId: "existing-job",
+      status: "queued",
+      source: "huggingface-url",
+      fileName: "demo.gguf",
+      runtimeTarget: "llama-cpp",
+      modelPath: "/models/demo.gguf",
+      url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
+      sha256: "b".repeat(64),
+    });
+    mocks.probeBridgeDownloadJob.mockResolvedValue({
+      outcome: "ambiguous",
+      jobId: "existing-job",
+      code: "bridge_timeout",
+    });
+
+    const response = await POST(
+      importRequest({
+        source: "huggingface-url",
+        url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
+        runtimeTarget: "llama-cpp",
+      }),
+    );
+
+    expect(response.status).toBe(504);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "bridge_timeout",
+      partialState: true,
+      queued: true,
+      jobId: "existing-job",
+    });
+    expect(mocks.startBridgeDownloadJob).not.toHaveBeenCalled();
+    expect(mocks.withQueuedImportedModelReservation).not.toHaveBeenCalled();
+  });
+
+  it("keeps queued ownership when start response is lost but status finds the job", async () => {
+    mocks.startBridgeDownloadJob.mockRejectedValue(new Error("socket closed after write"));
+    mocks.probeBridgeDownloadJob.mockResolvedValue({
+      outcome: "observed",
+      jobId: "accepted-job",
+      status: "downloading",
+      body: { status: "downloading" },
+    });
+
+    const response = await POST(
+      importRequest({
+        source: "huggingface-url",
+        url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
+        runtimeTarget: "llama-cpp",
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.probeBridgeDownloadJob).toHaveBeenCalledWith(
       expect.objectContaining({ url: expect.any(String) }),
       expect.any(String),
     );
@@ -164,7 +227,7 @@ describe("desktop model import route compensation", () => {
 
   it("reports unknown partial state and preserves queued ownership when status is unavailable", async () => {
     mocks.startBridgeDownloadJob.mockRejectedValue(new Error("socket closed after write"));
-    mocks.getBridgeDownloadStatus.mockResolvedValue(null);
+    mocks.probeBridgeDownloadJob.mockResolvedValue({ outcome: "not_found", jobId: "missing" });
 
     const response = await POST(
       importRequest({
@@ -187,9 +250,11 @@ describe("desktop model import route compensation", () => {
     mocks.startBridgeDownloadJob.mockRejectedValue(
       Object.assign(new Error("bridge start timed out"), { name: "TimeoutError" }),
     );
-    mocks.getBridgeDownloadStatus.mockRejectedValue(
-      Object.assign(new Error("bridge status timed out"), { name: "TimeoutError" }),
-    );
+    mocks.probeBridgeDownloadJob.mockResolvedValue({
+      outcome: "ambiguous",
+      jobId: "timed-out-job",
+      code: "bridge_timeout",
+    });
 
     const response = await POST(
       importRequest({
@@ -233,9 +298,9 @@ describe("desktop model import route compensation", () => {
       order.push("start-request-sent");
       throw new Error("response lost");
     });
-    mocks.getBridgeDownloadStatus.mockImplementation(async () => {
+    mocks.probeBridgeDownloadJob.mockImplementation(async () => {
       order.push("probe-unknown");
-      return { status: "unknown" };
+      return { outcome: "not_found", jobId: "missing" };
     });
 
     const response = await POST(
