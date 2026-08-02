@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { promises as fs } from "node:fs";
 import { ApiError, jsonError } from "@/lib/server/errors";
 import { requireLocalWorkspaceOwner } from "@/lib/server/local-workspace-owner";
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
-import { resolveStoragePath } from "@/lib/server/storage";
+import { ensureStorageSubdirectory } from "@/lib/server/storage";
 import { prisma } from "@/lib/server/prisma";
+import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 const run = promisify(execFile);
 
@@ -41,11 +41,13 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       });
     }
 
-    const folder = resolveStoragePath(`generated/${project.id}`);
-    // A project with no outputs yet has no folder — create it so reveal always
-    // lands somewhere instead of erroring.
-    await fs.mkdir(folder, { recursive: true });
-    await openInFileManager(folder);
+    await withSharedMutationLease(async () => {
+      // A project with no outputs yet has no folder. Create it through the
+      // canonical no-follow storage path and keep restore excluded until the
+      // file manager launch has consumed that verified directory.
+      const folder = await ensureStorageSubdirectory(`generated/${project.id}`);
+      await openInFileManager(folder);
+    });
 
     return NextResponse.json({ ok: true });
   } catch (error) {

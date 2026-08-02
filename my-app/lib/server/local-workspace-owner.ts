@@ -6,6 +6,7 @@ import { reconcileExternalModelDeleteJournals } from "@/lib/server/imported-mode
 import { prisma } from "@/lib/server/prisma";
 import { ensureBuiltInProjectTemplates } from "@/lib/server/sample-projects";
 import { reconcileStagedStoredFileDeletions } from "@/lib/server/storage";
+import { reconcileStagedManagedModelFiles } from "@/lib/server/local-model-files";
 import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
 
 export interface LocalWorkspaceOwner {
@@ -50,6 +51,7 @@ async function ensureLocalWorkspaceOwnerOnce(): Promise<void> {
   // APIs never observe a split media/config/DB restore.
   await ensureWorkspaceRestoreReconciled();
   await reconcileExternalModelDeleteJournals();
+  await reconcileStagedManagedModelFiles();
 
   const existing = await prisma.user.findUnique({
     where: { id: LOCAL_WORKSPACE_OWNER.id },

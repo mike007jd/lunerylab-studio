@@ -66,9 +66,11 @@ import {
   beginDetachedVideoWork,
   getWorkspaceOperationGateStateForTests,
   resetWorkspaceOperationGateForTests,
+  withSharedMutationLeaseSync,
 } from "@/lib/server/workspace-operation-gate";
 import {
   buildExpectedRestoreSwaps,
+  ensureWorkspaceRestoreReconciled,
   reconcileWorkspaceRestoreState,
   resetWorkspaceRestoreReconcileForTests,
   restoreJournalPath,
@@ -539,6 +541,46 @@ describe("restore crash reconciliation", () => {
     // Idempotent across a second restart with no residue.
     await reconcileWorkspaceRestoreState();
     expect(await fs.readFile(path.join(testRoot, "media/generated/old.png"), "utf8")).toBe("old-media");
+  });
+
+  it("holds startup crash reconciliation exclusively before sync config writes", async () => {
+    const token = "startup-crash-barrier";
+    const { swaps } = await seedPromotedTrees(token);
+    await writeRestoreJournal({
+      format: "lunery-workspace-restore-journal",
+      version: 1,
+      token,
+      swaps,
+    });
+    mocks.models.workspaceRestoreCommit = makeModel();
+    let releaseCommitProbe!: () => void;
+    const commitProbeMayFinish = new Promise<void>((resolve) => {
+      releaseCommitProbe = resolve;
+    });
+    mocks.models.workspaceRestoreCommit.findUnique.mockImplementation(async () => {
+      await commitProbeMayFinish;
+      return null;
+    });
+
+    const recovery = ensureWorkspaceRestoreReconciled();
+    await vi.waitFor(() => {
+      expect(getWorkspaceOperationGateStateForTests()).toMatchObject({
+        exclusive: "destructive-reconcile",
+        exclusivePending: true,
+      });
+    });
+    expect(() => withSharedMutationLeaseSync(() => undefined)).toThrow(
+      expect.objectContaining({ code: "workspace_busy", retryable: true }),
+    );
+
+    releaseCommitProbe();
+    await recovery;
+    expect(await fs.readFile(path.join(testRoot, "config/old.json"), "utf8")).toBe("old-config");
+    expect(getWorkspaceOperationGateStateForTests()).toMatchObject({
+      exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
+    });
   });
 
   it("keeps new roots and finishes cleanup when the commit marker matches the journal", async () => {

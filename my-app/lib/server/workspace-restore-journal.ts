@@ -4,6 +4,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { prisma } from "@/lib/server/prisma";
 import { luneryConfigDir, luneryDataDir, luneryMediaDir } from "@/lib/server/lunery-profile";
+import {
+  getWorkspaceExclusiveCapability,
+  hasWorkspaceMutationAuthority,
+  withWorkspaceExclusive,
+} from "@/lib/server/workspace-operation-gate";
 
 export const RESTORE_JOURNAL_FORMAT = "lunery-workspace-restore-journal";
 export const RESTORE_JOURNAL_VERSION = 1;
@@ -398,7 +403,7 @@ async function finishCommittedSwap(swap: RestoreJournalSwap): Promise<void> {
  * work completes, and before the DB marker, so a crash cannot leave an
  * ambiguous "marker without journal" gap.
  */
-export async function reconcileWorkspaceRestoreState(): Promise<void> {
+async function reconcileWorkspaceRestoreStateWithAuthority(): Promise<void> {
   let journal: RestoreJournal | null;
   try {
     journal = await readRestoreJournal();
@@ -436,12 +441,38 @@ export async function reconcileWorkspaceRestoreState(): Promise<void> {
   await clearRestoreCommitMarker();
 }
 
+export async function reconcileWorkspaceRestoreState(): Promise<void> {
+  if (getWorkspaceExclusiveCapability()) {
+    return reconcileWorkspaceRestoreStateWithAuthority();
+  }
+  if (hasWorkspaceMutationAuthority()) {
+    throw new Error("Workspace restore reconciliation cannot begin from a shared mutation lease.");
+  }
+  return withWorkspaceExclusive(
+    "destructive-reconcile",
+    reconcileWorkspaceRestoreStateWithAuthority,
+  );
+}
+
 let reconcilePromise: Promise<void> | null = null;
 
-/** Single-flight startup reconciliation before workspace owner/bootstrap work. */
+/**
+ * Single-flight startup reconciliation before workspace APIs read or mutate
+ * profile state. Recovery owns exclusive authority so sync config writers
+ * cannot race a media/config swap. An already-exclusive restore may re-enter;
+ * a shared caller fails closed instead of waiting on its own lease forever.
+ */
 export function ensureWorkspaceRestoreReconciled(): Promise<void> {
   if (!reconcilePromise) {
-    reconcilePromise = reconcileWorkspaceRestoreState().catch((error) => {
+    const exclusive = getWorkspaceExclusiveCapability();
+    const recovery = exclusive
+      ? reconcileWorkspaceRestoreStateWithAuthority()
+      : hasWorkspaceMutationAuthority()
+        ? Promise.reject(
+            new Error("Startup restore reconciliation cannot begin from a shared mutation lease."),
+          )
+        : withWorkspaceExclusive("destructive-reconcile", reconcileWorkspaceRestoreStateWithAuthority);
+    reconcilePromise = recovery.catch((error) => {
       reconcilePromise = null;
       throw error;
     });

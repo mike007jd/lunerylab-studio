@@ -276,6 +276,129 @@ function noFollowFlag(): number {
   return typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
 }
 
+interface StoragePathIdentity {
+  device: bigint;
+  inode: bigint;
+}
+
+interface CanonicalOpenGuard {
+  directories: Array<{ absolutePath: string; identity: StoragePathIdentity }>;
+  finalIdentity: StoragePathIdentity | null;
+  rootReal: string;
+}
+
+function bigintIdentity(metadata: import("node:fs").BigIntStats): StoragePathIdentity {
+  return { device: metadata.dev, inode: metadata.ino };
+}
+
+function samePathIdentity(left: StoragePathIdentity, right: StoragePathIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function guardedDirectoryPaths(absolutePath: string): string[] {
+  const root = normalizeRuntimeRoot(storageRootPath());
+  const relative = path.relative(root, absolutePath);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("Stored path escapes the media root.");
+  }
+  const relativeParts = relative.split(path.sep);
+  // Reuse the public storage-path grammar so only root/bucket/optional-project
+  // directories can participate in the final open guard.
+  storagePathSegments(relativeParts.join("/"));
+  const directories = [root];
+  let current = root;
+  for (const segment of relativeParts.slice(0, -1)) {
+    current = joinRuntimePath(current, segment);
+    directories.push(current);
+  }
+  return directories;
+}
+
+async function captureCanonicalOpenGuard(
+  absolutePath: string,
+  allowMissingFinal: boolean,
+): Promise<CanonicalOpenGuard> {
+  const fs = await localFs();
+  const directoryPaths = guardedDirectoryPaths(absolutePath);
+  const rootPath = directoryPaths[0]!;
+  const rootMetadata = await fs.lstat(rootPath, { bigint: true });
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+    throw new Error("Storage root must be a real directory.");
+  }
+  const rootReal = await fs.realpath(rootPath);
+  const directories: CanonicalOpenGuard["directories"] = [];
+  for (const directoryPath of directoryPaths) {
+    const metadata = await fs.lstat(directoryPath, { bigint: true });
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error("Storage path component is a symlink.");
+    }
+    assertRealPathInsideRoot(rootReal, await fs.realpath(directoryPath));
+    directories.push({ absolutePath: directoryPath, identity: bigintIdentity(metadata) });
+  }
+
+  let finalIdentity: StoragePathIdentity | null = null;
+  try {
+    const finalMetadata = await fs.lstat(absolutePath, { bigint: true });
+    if (finalMetadata.isSymbolicLink()) {
+      throw new Error("Storage path component is a symlink.");
+    }
+    if (!finalMetadata.isFile()) {
+      throw new Error("Stored path is not a regular file.");
+    }
+    finalIdentity = bigintIdentity(finalMetadata);
+  } catch (error) {
+    if (
+      allowMissingFinal
+      && (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+    ) {
+      finalIdentity = null;
+    } else {
+      throw error;
+    }
+  }
+  return { directories, finalIdentity, rootReal };
+}
+
+async function verifyCanonicalOpenGuard(
+  guard: CanonicalOpenGuard,
+  absolutePath: string,
+  handle: import("node:fs/promises").FileHandle,
+): Promise<void> {
+  const fs = await localFs();
+  await verifyCanonicalDirectories(guard);
+
+  const [opened, currentFinal] = await Promise.all([
+    handle.stat({ bigint: true }),
+    fs.lstat(absolutePath, { bigint: true }),
+  ]);
+  if (!opened.isFile() || currentFinal.isSymbolicLink() || !currentFinal.isFile()) {
+    throw new Error("Stored path is not a stable regular file.");
+  }
+  const openedIdentity = bigintIdentity(opened);
+  const currentIdentity = bigintIdentity(currentFinal);
+  if (!samePathIdentity(openedIdentity, currentIdentity)) {
+    throw new Error("Storage path changed during final open.");
+  }
+  if (guard.finalIdentity && !samePathIdentity(guard.finalIdentity, openedIdentity)) {
+    throw new Error("Storage file changed during final open.");
+  }
+}
+
+async function verifyCanonicalDirectories(guard: CanonicalOpenGuard): Promise<void> {
+  const fs = await localFs();
+  for (const expected of guard.directories) {
+    const current = await fs.lstat(expected.absolutePath, { bigint: true });
+    if (
+      current.isSymbolicLink()
+      || !current.isDirectory()
+      || !samePathIdentity(expected.identity, bigintIdentity(current))
+    ) {
+      throw new Error("Storage path changed during final open.");
+    }
+    assertRealPathInsideRoot(guard.rootReal, await fs.realpath(expected.absolutePath));
+  }
+}
+
 export const __storageTestHooks = {
   beforeFinalOpen: null as null | ((absolutePath: string) => Promise<void> | void),
 };
@@ -286,12 +409,30 @@ async function openFinalNoFollow(
   mode?: number,
 ): Promise<import("node:fs/promises").FileHandle> {
   const fs = await localFs();
+  let handle: import("node:fs/promises").FileHandle | null = null;
   try {
+    // Node does not expose openat(2), and macOS /dev/fd directory paths cannot
+    // address children. Revalidate root/bucket/project immediately before the
+    // open, then compare every directory and final-file dev/ino again before
+    // any read, truncate, or write. O_NOFOLLOW remains the atomic final-link
+    // guard on macOS/Linux. On platforms without it (notably Windows), the
+    // post-open lstat/fstat identity check is fail-closed but cannot claim the
+    // same kernel-level atomicity as openat.
+    const guard = await captureCanonicalOpenGuard(
+      absolutePath,
+      (flags & fsConstants.O_CREAT) !== 0,
+    );
     if (process.env.NODE_ENV === "test" && __storageTestHooks.beforeFinalOpen) {
       await __storageTestHooks.beforeFinalOpen(absolutePath);
     }
-    return await fs.open(absolutePath, flags | noFollowFlag(), mode);
+    // Recheck after the deterministic race hook and immediately before open.
+    // A hostile component swap detected here cannot create/truncate anything.
+    await verifyCanonicalDirectories(guard);
+    handle = await fs.open(absolutePath, flags | noFollowFlag(), mode);
+    await verifyCanonicalOpenGuard(guard, absolutePath, handle);
+    return handle;
   } catch (error) {
+    await handle?.close().catch(() => undefined);
     if ((error as NodeJS.ErrnoException | undefined)?.code === "ELOOP") {
       throw new Error("Storage path component is a symlink.");
     }
@@ -347,6 +488,39 @@ export async function ensureStorage() {
     await prepareStorageBucket(bucket, { create: true });
   }
   return root;
+}
+
+/**
+ * Create and resolve one project-scoped storage directory without following
+ * symlink components. Callers receive the canonical contained directory, and
+ * the whole create/verify sequence participates in the workspace mutation
+ * gate so restore cannot swap the media root underneath it.
+ */
+export async function ensureStorageSubdirectory(storageDirectoryPath: string): Promise<string> {
+  return withSharedMutationLease(async () => {
+    const probePath = `${storageDirectoryPath}/.lunery-directory-probe`;
+    const parts = storagePathSegments(probePath);
+    if (parts.length !== 3) {
+      throw new Error("Invalid storage directory path");
+    }
+
+    await ensureStorage();
+    const absoluteProbe = await resolveCanonicalStoragePath(probePath, {
+      allowMissingLeaf: true,
+    });
+    const directory = path.dirname(absoluteProbe);
+    await ensureContainedDirectory(directory);
+
+    const fs = await localFs();
+    const rootReal = await fs.realpath(storageRootPath());
+    const metadata = await fs.lstat(directory);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error("Storage path component is a symlink.");
+    }
+    const directoryReal = await fs.realpath(directory);
+    assertRealPathInsideRoot(rootReal, directoryReal);
+    return directoryReal;
+  });
 }
 
 function storedFileNotFound(): never {
@@ -792,14 +966,16 @@ export async function reconcileStagedStoredFileDeletions(
 export async function writeFilesOrCleanup<T extends { storagePath: string }>(
   writes: Array<() => Promise<T>>,
 ): Promise<T[]> {
-  const settled = await Promise.allSettled(writes.map((write) => write()));
-  const written = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
-  const failure = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
-  if (failure) {
-    await Promise.allSettled(written.map((file) => deleteStoredFile(file.storagePath)));
-    throw failure.reason;
-  }
-  return written;
+  return withSharedMutationLease(async () => {
+    const settled = await Promise.allSettled(writes.map((write) => write()));
+    const written = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+    const failure = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failure) {
+      await Promise.allSettled(written.map((file) => deleteStoredFile(file.storagePath)));
+      throw failure.reason;
+    }
+    return written;
+  });
 }
 
 export async function getStoredFileMetadata(storagePath: string): Promise<StoredFileMetadata> {

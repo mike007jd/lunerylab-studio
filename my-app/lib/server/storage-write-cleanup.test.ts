@@ -6,10 +6,16 @@ import * as path from "node:path";
 vi.mock("server-only", () => ({}));
 
 import * as storage from "@/lib/server/storage";
+import {
+  getWorkspaceOperationGateStateForTests,
+  resetWorkspaceOperationGateForTests,
+  withWorkspaceExclusive,
+} from "@/lib/server/workspace-operation-gate";
 
 let tmpDir: string;
 
 beforeEach(() => {
+  resetWorkspaceOperationGateForTests();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-cleanup-"));
   // Local filesystem rooted at the temp dir (absolute path required).
   vi.stubEnv("LUNERY_MEDIA_DIR", tmpDir);
@@ -160,6 +166,25 @@ describe("writeFilesOrCleanup (#7)", () => {
   );
 
   it.runIf(process.platform !== "win32")(
+    "rejects a symlinked project directory when preparing it for reveal",
+    async () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "storage-reveal-target-"));
+      try {
+        fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
+        fs.symlinkSync(outside, path.join(tmpDir, "generated", "project_reveal"), "dir");
+
+        await expect(
+          storage.ensureStorageSubdirectory("generated/project_reveal"),
+        ).rejects.toThrow("Storage path component is a symlink");
+        expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+        expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
     "deletes a final-component symlink without touching its target",
     async () => {
       const outside = path.join(tmpDir, "outside.png");
@@ -268,6 +293,54 @@ describe("writeFilesOrCleanup (#7)", () => {
     },
   );
 
+  it.runIf(process.platform !== "win32")(
+    "rejects deterministic root, bucket, or project swaps before the final open",
+    async () => {
+      for (const component of ["root", "bucket", "project"] as const) {
+        const caseDir = path.join(tmpDir, `swap-${component}`);
+        const mediaRoot = path.join(caseDir, "media");
+        const storagePath = "generated/project_1/victim.txt";
+        const inside = path.join(mediaRoot, "generated", "project_1", "victim.txt");
+        const outside = path.join(caseDir, "outside");
+        const outsideVictim = component === "root"
+          ? path.join(outside, "generated", "project_1", "victim.txt")
+          : component === "bucket"
+            ? path.join(outside, "project_1", "victim.txt")
+            : path.join(outside, "victim.txt");
+        fs.mkdirSync(path.dirname(inside), { recursive: true });
+        fs.mkdirSync(path.dirname(outsideVictim), { recursive: true });
+        fs.writeFileSync(inside, "inside");
+        fs.writeFileSync(outsideVictim, "outside");
+        vi.stubEnv("LUNERY_MEDIA_DIR", mediaRoot);
+
+        const swapped = component === "root"
+          ? mediaRoot
+          : component === "bucket"
+            ? path.join(mediaRoot, "generated")
+            : path.join(mediaRoot, "generated", "project_1");
+        const held = `${swapped}.held`;
+        let didSwap = false;
+        storage.__storageTestHooks.beforeFinalOpen = () => {
+          if (didSwap) return;
+          didSwap = true;
+          fs.renameSync(swapped, held);
+          fs.symlinkSync(outside, swapped, "dir");
+        };
+
+        try {
+          await expect(storage.readStoredFile(storagePath)).rejects.toThrow(
+            /symlink|changed during final open|real directory/,
+          );
+          expect(fs.readFileSync(outsideVictim, "utf8")).toBe("outside");
+        } finally {
+          storage.__storageTestHooks.beforeFinalOpen = null;
+          if (fs.lstatSync(swapped).isSymbolicLink()) fs.unlinkSync(swapped);
+          fs.renameSync(held, swapped);
+        }
+      }
+    },
+  );
+
   it("normalizes a configured root without using a dynamic filesystem trace", () => {
     vi.stubEnv("LUNERY_MEDIA_DIR", `${tmpDir}${path.sep}`);
     expect(storage.resolveStoragePath("generated/sample.png")).toBe(
@@ -290,6 +363,49 @@ describe("writeFilesOrCleanup (#7)", () => {
 
     // The orphaned first file must be cleaned up, not left behind.
     expect(fs.existsSync(firstPath)).toBe(false);
+  });
+
+  it("keeps the batch lease through compensation before restore can start", async () => {
+    const firstPath = storage.resolveStoragePath("generated/batch-first.png");
+    let rejectSecond!: () => void;
+    const secondMayFail = new Promise<void>((resolve) => {
+      rejectSecond = resolve;
+    });
+    const batch = storage.writeFilesOrCleanup([
+      async () => {
+        fs.writeFileSync(firstPath, "partial");
+        return { storagePath: "generated/batch-first.png" };
+      },
+      async () => {
+        await secondMayFail;
+        throw new Error("second write failed");
+      },
+    ]);
+
+    await vi.waitFor(() => {
+      expect(fs.existsSync(firstPath)).toBe(true);
+      expect(getWorkspaceOperationGateStateForTests().sharedCount).toBe(1);
+    });
+
+    let filePresentWhenRestoreStarted: boolean | null = null;
+    const restore = withWorkspaceExclusive("restore", async () => {
+      filePresentWhenRestoreStarted = fs.existsSync(firstPath);
+    });
+    await vi.waitFor(() => {
+      expect(getWorkspaceOperationGateStateForTests().exclusivePending).toBe(true);
+    });
+
+    rejectSecond();
+    await expect(batch).rejects.toThrow("second write failed");
+    await restore;
+
+    expect(filePresentWhenRestoreStarted).toBe(false);
+    expect(fs.existsSync(firstPath)).toBe(false);
+    expect(getWorkspaceOperationGateStateForTests()).toMatchObject({
+      exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
+    });
   });
 
   it("returns all results and deletes nothing when every write succeeds", async () => {

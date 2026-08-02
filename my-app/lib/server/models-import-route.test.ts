@@ -183,6 +183,85 @@ describe("desktop model import route compensation", () => {
     });
   });
 
+  it("reports a retryable queued state when the post-timeout status probe also times out", async () => {
+    mocks.startBridgeDownloadJob.mockRejectedValue(
+      Object.assign(new Error("bridge start timed out"), { name: "TimeoutError" }),
+    );
+    mocks.getBridgeDownloadStatus.mockRejectedValue(
+      Object.assign(new Error("bridge status timed out"), { name: "TimeoutError" }),
+    );
+
+    const response = await POST(
+      importRequest({
+        source: "huggingface-url",
+        url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
+        runtimeTarget: "llama-cpp",
+      }),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "bridge_start_unknown",
+      partialState: true,
+      queued: true,
+      retryable: true,
+    });
+  });
+
+  it("keeps queued ownership when the worker appears after an immediate unknown probe", async () => {
+    const order: string[] = [];
+    let releaseWorker!: () => void;
+    const workerMayStart = new Promise<void>((resolve) => {
+      releaseWorker = resolve;
+    });
+    const workerStarted = workerMayStart.then(() => {
+      order.push("worker-started");
+    });
+    mocks.withQueuedImportedModelReservation.mockImplementation(async ({ record, start }) => {
+      order.push("queued");
+      try {
+        return { record, result: await start() };
+      } catch (error) {
+        const registry = await import("@/lib/server/imported-model-registry");
+        if (!(error instanceof registry.QueuedImportedModelStartUncertainError)) {
+          order.push("compensated");
+        }
+        throw error;
+      }
+    });
+    mocks.startBridgeDownloadJob.mockImplementation(async () => {
+      order.push("start-request-sent");
+      throw new Error("response lost");
+    });
+    mocks.getBridgeDownloadStatus.mockImplementation(async () => {
+      order.push("probe-unknown");
+      return { status: "unknown" };
+    });
+
+    const response = await POST(
+      importRequest({
+        source: "huggingface-url",
+        url: "https://huggingface.co/org/model/resolve/main/demo.gguf",
+        runtimeTarget: "llama-cpp",
+      }),
+    );
+    releaseWorker();
+    await workerStarted;
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "bridge_start_unknown",
+      partialState: true,
+      queued: true,
+    });
+    expect(order).toEqual([
+      "queued",
+      "start-request-sent",
+      "probe-unknown",
+      "worker-started",
+    ]);
+  });
+
   it("returns bridge unavailable when the desktop bridge is missing", async () => {
     mocks.requireDesktopBridge.mockReturnValue(
       NextResponse.json({ error: "Desktop runtime bridge is not available" }, { status: 404 }),

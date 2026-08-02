@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   ensureWorkspaceRestoreReconciled: vi.fn(),
   reconcileStagedStoredFileDeletions: vi.fn(),
   reconcileExternalModelDeleteJournals: vi.fn(),
+  reconcileStagedManagedModelFiles: vi.fn(),
   assetFindMany: vi.fn(),
   isDesktopRuntime: vi.fn(),
 }));
@@ -39,6 +40,9 @@ vi.mock("@/lib/server/storage", () => ({
 vi.mock("@/lib/server/imported-model-registry", () => ({
   reconcileExternalModelDeleteJournals: mocks.reconcileExternalModelDeleteJournals,
 }));
+vi.mock("@/lib/server/local-model-files", () => ({
+  reconcileStagedManagedModelFiles: mocks.reconcileStagedManagedModelFiles,
+}));
 
 beforeEach(() => {
   vi.resetModules();
@@ -48,6 +52,7 @@ beforeEach(() => {
   mocks.ensureWorkspaceRestoreReconciled.mockResolvedValue(undefined);
   mocks.reconcileStagedStoredFileDeletions.mockResolvedValue(undefined);
   mocks.reconcileExternalModelDeleteJournals.mockResolvedValue(undefined);
+  mocks.reconcileStagedManagedModelFiles.mockResolvedValue(0);
   mocks.assetFindMany.mockResolvedValue([]);
   mocks.userCreate.mockResolvedValue({ id: "owner" });
 });
@@ -67,6 +72,7 @@ describe("local workspace owner initialization", () => {
 
     expect(mocks.ensureWorkspaceRestoreReconciled).toHaveBeenCalledTimes(1);
     expect(mocks.reconcileExternalModelDeleteJournals).toHaveBeenCalledTimes(1);
+    expect(mocks.reconcileStagedManagedModelFiles).toHaveBeenCalledTimes(1);
     expect(mocks.userCreate).toHaveBeenCalledTimes(1);
     expect(mocks.ensureBuiltInProjectTemplates).toHaveBeenCalledWith(LOCAL_WORKSPACE_OWNER.id);
   });

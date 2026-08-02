@@ -17,7 +17,10 @@ vi.mock("@/lib/server/prisma", () => ({
   },
 }));
 
-import { clearDefaultsOwnedByProvider } from "@/lib/server/clear-provider-defaults";
+import {
+  clearDefaultsOwnedByProvider,
+  restoreClearedProviderDefaults,
+} from "@/lib/server/clear-provider-defaults";
 
 describe("clearDefaultsOwnedByProvider", () => {
   beforeEach(() => {
@@ -55,5 +58,26 @@ describe("clearDefaultsOwnedByProvider", () => {
 
     expect(result.cleared).toEqual([]);
     expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("restores exactly the defaults cleared before metadata unlink failed", async () => {
+    mocks.update.mockResolvedValue({});
+
+    await restoreClearedProviderDefaults("user-1", {
+      cleared: ["text", "video"],
+      previous: {
+        defaultTextModel: "byok:openai:gpt-5",
+        defaultImageModel: "byok:fal:flux",
+        defaultVideoModel: "byok:openai:sora",
+      },
+    });
+
+    expect(mocks.update).toHaveBeenCalledWith({
+      where: { userId: "user-1" },
+      data: {
+        defaultTextModel: "byok:openai:gpt-5",
+        defaultVideoModel: "byok:openai:sora",
+      },
+    });
   });
 });

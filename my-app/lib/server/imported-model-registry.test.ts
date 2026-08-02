@@ -472,6 +472,38 @@ describe("imported-model-registry profile paths", () => {
     await expect(registry.findImportedModel(queued.id)).resolves.toEqual(queued);
   });
 
+  it("releases registry and workspace admission after an accepted start loses its response", async () => {
+    const registry = await import("@/lib/server/imported-model-registry");
+    const gate = await import("@/lib/server/workspace-operation-gate");
+    gate.resetWorkspaceOperationGateForTests();
+    const queued = record({
+      status: "queued",
+      jobId: "job-accepted-no-response",
+      createdAt: "2026-08-03T00:00:01.000Z",
+    });
+
+    await expect(
+      registry.withQueuedImportedModelReservation({
+        record: queued,
+        start: async () => {
+          throw new registry.QueuedImportedModelStartUncertainError("accepted; response timed out");
+        },
+      }),
+    ).rejects.toBeInstanceOf(registry.QueuedImportedModelStartUncertainError);
+
+    let exclusiveEntered = false;
+    await gate.withWorkspaceExclusive("restore", async () => {
+      exclusiveEntered = true;
+    });
+    expect(exclusiveEntered).toBe(true);
+    expect(gate.getWorkspaceOperationGateStateForTests()).toMatchObject({
+      exclusive: null,
+      exclusivePending: false,
+      sharedCount: 0,
+    });
+    await expect(registry.findImportedModel(queued.id)).resolves.toEqual(queued);
+  });
+
   it("does not roll back a newer queued owner during compensation", async () => {
     const registry = await import("@/lib/server/imported-model-registry");
     const failed = await registry.queueImportedModel(record({

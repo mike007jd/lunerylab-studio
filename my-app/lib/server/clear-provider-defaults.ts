@@ -61,3 +61,27 @@ export async function clearDefaultsOwnedByProvider(
     },
   };
 }
+
+/** Restore only fields cleared by clearDefaultsOwnedByProvider. */
+export async function restoreClearedProviderDefaults(
+  userId: string,
+  snapshot: ClearedProviderDefaults,
+): Promise<void> {
+  const data: {
+    defaultTextModel?: string;
+    defaultImageModel?: string;
+    defaultVideoModel?: string;
+  } = {};
+  if (snapshot.cleared.includes("text")) {
+    data.defaultTextModel = snapshot.previous.defaultTextModel;
+  }
+  if (snapshot.cleared.includes("image")) {
+    data.defaultImageModel = snapshot.previous.defaultImageModel;
+  }
+  if (snapshot.cleared.includes("video")) {
+    data.defaultVideoModel = snapshot.previous.defaultVideoModel;
+  }
+  if (Object.keys(data).length > 0) {
+    await prisma.userSettings.update({ where: { userId }, data });
+  }
+}

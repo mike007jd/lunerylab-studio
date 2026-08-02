@@ -139,7 +139,7 @@ export async function POST(request: NextRequest) {
   const dest = importedModelDownloadDest(runtimeTarget, modelId, resolved.fileName);
   const existing = await findImportedModel(modelId);
   if (existing?.jobId) {
-    const existingStatus = await getBridgeDownloadStatus(bridge, existing.jobId);
+    const existingStatus = await getBridgeDownloadStatus(bridge, existing.jobId).catch(() => null);
     if (typeof existingStatus?.status === "string" && ACTIVE_IMPORT_STATUSES.has(existingStatus.status)) {
       return NextResponse.json({
         imported: true,
@@ -211,19 +211,17 @@ export async function POST(request: NextRequest) {
           // The local bridge can accept/start the job and then lose the HTTP
           // response. Probe by jobId before deciding whether queued ownership
           // is safe to remove.
-          const observed = await getBridgeDownloadStatus(bridge, jobId);
+          const observed = await getBridgeDownloadStatus(bridge, jobId).catch(() => null);
           if (typeof observed?.status === "string" && observed.status !== "unknown") {
             return new Response(null, { status: 202 });
           }
-          if (observed?.status !== "unknown") {
-            throw new QueuedImportedModelStartUncertainError(
-              "Desktop bridge start outcome is unknown; queued ownership was retained.",
-              { cause: error },
-            );
-          }
-          throw new BridgeStartError(
-            error instanceof Error ? error.message : "Desktop bridge request failed.",
-            503,
+          // A single immediate "unknown" does not prove rejection: the native
+          // worker can reserve/spawn after the status probe. Any transport-loss
+          // outcome therefore retains queued ownership. Only an explicit HTTP
+          // rejection from the start request is safe to compensate.
+          throw new QueuedImportedModelStartUncertainError(
+            "Desktop bridge start outcome is unknown; queued ownership was retained.",
+            { cause: error },
           );
         }
         if (!bridgeRes.ok) {
