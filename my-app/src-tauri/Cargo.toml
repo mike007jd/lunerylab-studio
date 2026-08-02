@@ -43,6 +43,9 @@ tauri = { version = "2.11.2", features = [] }
 tauri-plugin-single-instance = "=2.4.3"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+
 [profile.release]
 opt-level = "z"
 lto = true

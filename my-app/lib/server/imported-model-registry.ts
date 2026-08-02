@@ -5,6 +5,7 @@ import type { ModelCapability, ModelFormat, ModelRuntimeTarget } from "@/lib/hf-
 import { ApiError } from "@/lib/server/errors";
 import { luneryModelsDir } from "@/lib/server/lunery-profile";
 import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
+import { nativeUnlinkExternalIdentity } from "@/lib/server/native-profile-fs";
 
 export type ImportedModelSource = "local-path" | "huggingface-url";
 export type ImportedModelStatus = "ready" | "queued";
@@ -38,6 +39,7 @@ export interface StagedExternalModelFile {
   journalPath: string;
   hadFile: boolean;
   preservedChangedFile: boolean;
+  expectedIdentity: ExternalPathIdentity | null;
 }
 
 interface ExternalModelDeleteJournal {
@@ -344,6 +346,7 @@ export async function stageImportedExternalModelFile(
     journalPath: "",
     hadFile: false,
     preservedChangedFile,
+    expectedIdentity: null,
   });
   if (record.source !== "local-path" || !record.fileIdentity) {
     return emptyStage(true);
@@ -429,6 +432,7 @@ export async function stageImportedExternalModelFile(
         journalPath,
         hadFile: true,
         preservedChangedFile: false,
+        expectedIdentity: record.fileIdentity,
       };
     }
   } catch (error) {
@@ -494,7 +498,16 @@ export async function commitImportedExternalModelFile(
   stage: StagedExternalModelFile,
 ): Promise<number> {
   if (!stage.hadFile) return 0;
-  await fs.unlink(stage.stagedPath);
+  if (!stage.expectedIdentity) {
+    throw new Error("Staged external model deletion is missing its expected identity.");
+  }
+  if (process.env.NODE_ENV === "test" && __importedModelRegistryTestHooks.beforeExternalFinalize) {
+    await __importedModelRegistryTestHooks.beforeExternalFinalize(stage);
+  }
+  // Keep the journal until the native descriptor-relative unlink has matched
+  // the exact file staged earlier. A replacement at the staging name is user
+  // data: preserve it and leave the journal actionable for startup recovery.
+  await nativeUnlinkExternalIdentity(stage.stagedPath, stage.expectedIdentity);
   await fs.unlink(stage.journalPath).catch(() => undefined);
   return 1;
 }
@@ -934,6 +947,7 @@ export async function restoreImportedModelAfterFailedQueue(
 /** Test-only hook to inject write failures after the lock is held. */
 export const __importedModelRegistryTestHooks = {
   beforeWrite: null as null | (() => Promise<void> | void),
+  beforeExternalFinalize: null as null | ((stage: StagedExternalModelFile) => Promise<void> | void),
 };
 
 async function writeImportedModels(records: ImportedModelRecord[]): Promise<void> {

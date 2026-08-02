@@ -186,6 +186,44 @@ describe("imported-model-registry profile paths", () => {
     expect(fs.readFileSync(restored.modelPath, "utf8")).toBe("original-model");
   });
 
+  it("preserves an inode replacement raced between metadata commit and final unlink", async () => {
+    const modelPath = path.join(tmpDir, "external", "finalize-race.gguf");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, "original-model");
+    const registry = await import("@/lib/server/imported-model-registry");
+    const resolved = await registry.resolveLocalModelPath(modelPath);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const imported = record({
+      id: "imported-llama-cpp-finalize-race-12345678",
+      source: "local-path",
+      modelPath,
+      fileName: path.basename(modelPath),
+      sizeBytes: resolved.sizeBytes,
+      fileIdentity: resolved.fileIdentity,
+    });
+    await registry.upsertImportedModel(imported);
+    const staged = await registry.stageImportedExternalModelFile(imported);
+    await registry.removeImportedModel(imported.id);
+    registry.__importedModelRegistryTestHooks.beforeExternalFinalize = () => {
+      fs.unlinkSync(staged.stagedPath);
+      fs.writeFileSync(staged.stagedPath, "replacement-model");
+    };
+
+    await expect(registry.commitImportedExternalModelFile(staged)).rejects.toThrow(
+      /identity changed|safe-file service rejected/,
+    );
+    expect(fs.readFileSync(staged.stagedPath, "utf8")).toBe("replacement-model");
+    expect(fs.existsSync(staged.journalPath)).toBe(true);
+
+    registry.__importedModelRegistryTestHooks.beforeExternalFinalize = null;
+    await registry.reconcileExternalModelDeleteJournals();
+    await registry.reconcileExternalModelDeleteJournals();
+    const recoveredFiles = fs.readdirSync(path.dirname(modelPath));
+    expect(recoveredFiles.some((name) =>
+      fs.readFileSync(path.join(path.dirname(modelPath), name), "utf8") === "replacement-model"
+    )).toBe(true);
+  });
+
   it("unregisters a changed external file without staging or deleting it", async () => {
     const modelPath = path.join(tmpDir, "external", "changed.gguf");
     fs.mkdirSync(path.dirname(modelPath), { recursive: true });

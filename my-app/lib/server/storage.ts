@@ -10,6 +10,12 @@ import { assertImageByteSize, safeSharp } from "@/lib/server/image-safety";
 import { extensionFromMime } from "@/lib/mime";
 import { sniff3dModelMime, sniffVideoMime } from "@/lib/media-sniff";
 import { luneryMediaDir } from "@/lib/server/lunery-profile";
+import {
+  nativeProfileMkdir,
+  nativeProfileRename,
+  nativeProfileUnlink,
+  nativeProfileWrite,
+} from "@/lib/server/native-profile-fs";
 import { withSharedMutationLease } from "@/lib/server/workspace-operation-gate";
 
 export interface StoredFile {
@@ -450,42 +456,13 @@ async function assertRegularFileHandle(
   return metadata;
 }
 
-async function writeNewFileNoFollow(absolutePath: string, bytes: Buffer): Promise<void> {
-  const handle = await openFinalNoFollow(
-    absolutePath,
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
-    0o600,
-  );
-  try {
-    await assertRegularFileHandle(handle);
-    await handle.writeFile(bytes);
-  } finally {
-    await handle.close();
-  }
-}
-
-async function replaceFileNoFollow(absolutePath: string, bytes: Buffer): Promise<void> {
-  const handle = await openFinalNoFollow(
-    absolutePath,
-    fsConstants.O_WRONLY | fsConstants.O_CREAT,
-    0o600,
-  );
-  try {
-    await assertRegularFileHandle(handle);
-    await handle.truncate(0);
-    await handle.writeFile(bytes);
-  } finally {
-    await handle.close();
-  }
-}
-
 // sniffImageMime imported from `byok-shared.ts` — single MIME-table for the
 // whole repo. Returns null on unknown bytes; callers decide their default.
 
 export async function ensureStorage() {
   const root = storageRootPath();
   for (const bucket of STORAGE_BUCKETS) {
-    await prepareStorageBucket(bucket, { create: true });
+    await nativeProfileMkdir("media", bucket);
   }
   return root;
 }
@@ -509,7 +486,7 @@ export async function ensureStorageSubdirectory(storageDirectoryPath: string): P
       allowMissingLeaf: true,
     });
     const directory = path.dirname(absoluteProbe);
-    await ensureContainedDirectory(directory);
+    await nativeProfileMkdir("media", parts.slice(0, -1).join("/"));
 
     const fs = await localFs();
     const rootReal = await fs.realpath(storageRootPath());
@@ -587,7 +564,7 @@ export async function writeReferenceFile(
       allowMissingLeaf: true,
     });
 
-    await writeNewFileNoFollow(absolutePath, buffer);
+    await nativeProfileWrite("media", storagePath, buffer, { replace: false });
 
     return {
       storagePath,
@@ -599,46 +576,6 @@ export async function writeReferenceFile(
       buffer,
     };
   });
-}
-
-async function ensureContainedDirectory(absoluteDir: string): Promise<void> {
-  const fs = await localFs();
-  const root = normalizeRuntimeRoot(storageRootPath());
-  const rootReal = await fs.realpath(root);
-  const normalizedDir = normalizeRuntimeRoot(absoluteDir);
-  if (normalizedDir === normalizeRuntimeRoot(root)) {
-    assertRealPathInsideRoot(rootReal, rootReal);
-    return;
-  }
-  let metadata: import("node:fs").Stats | null = null;
-  try {
-    metadata = await fs.lstat(normalizedDir);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
-  }
-  if (metadata) {
-    if (metadata.isSymbolicLink()) {
-      throw new Error("Storage path component is a symlink.");
-    }
-    if (!metadata.isDirectory()) {
-      throw new Error("Storage path component is not a directory.");
-    }
-    const dirReal = await fs.realpath(normalizedDir);
-    assertRealPathInsideRoot(rootReal, dirReal);
-    return;
-  }
-  await ensureContainedDirectory(path.dirname(normalizedDir));
-  try {
-    await fs.mkdir(normalizedDir);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") throw error;
-  }
-  const created = await fs.lstat(normalizedDir);
-  if (created.isSymbolicLink() || !created.isDirectory()) {
-    throw new Error("Storage path component is a symlink.");
-  }
-  const createdReal = await fs.realpath(normalizedDir);
-  assertRealPathInsideRoot(rootReal, createdReal);
 }
 
 async function writeGeneratedFile({
@@ -666,11 +603,10 @@ async function writeGeneratedFile({
       allowMissingLeaf: true,
     });
 
-    // ensureStorage only creates the bucket roots — make the per-project subdir
-    // with lstat/recheck. Node does not expose openat for intermediate path
-    // descriptors, so final-component O_NOFOLLOW below is the atomic boundary.
-    await ensureContainedDirectory(path.dirname(absolutePath));
-    await writeNewFileNoFollow(absolutePath, bytes);
+    if (storagePath.split("/").length === 3) {
+      await nativeProfileMkdir("media", path.posix.dirname(storagePath));
+    }
+    await nativeProfileWrite("media", storagePath, bytes, { replace: false });
 
     return {
       storagePath,
@@ -695,8 +631,10 @@ export async function restoreStoredFile({
     const absolutePath = await resolveCanonicalStoragePath(storagePath, {
       allowMissingLeaf: true,
     });
-    await ensureContainedDirectory(path.dirname(absolutePath));
-    await replaceFileNoFollow(absolutePath, bytes);
+    if (storagePath.split("/").length === 3) {
+      await nativeProfileMkdir("media", path.posix.dirname(storagePath));
+    }
+    await nativeProfileWrite("media", storagePath, bytes, { replace: true });
 
     return {
       storagePath,
@@ -834,7 +772,7 @@ export async function deleteStoredFile(storagePath: string) {
       const fs = await localFs();
       const metadata = await fs.lstat(resolved);
       if (metadata.isDirectory()) throw new Error("Refusing to delete a storage directory as a file.");
-      await fs.unlink(resolved);
+      await nativeProfileUnlink("media", storagePath, { missingOk: true });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
         return;
@@ -899,7 +837,7 @@ export async function stageStoredFileDeletion(
       return { storagePath, stagedStoragePath, hadFile: false };
     }
 
-    await fs.rename(resolved, staged);
+    await nativeProfileRename("media", storagePath, stagedStoragePath);
     return { storagePath, stagedStoragePath, hadFile: true };
   });
 }
@@ -929,7 +867,7 @@ export async function rollbackStoredFileDeletion(
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
     }
-    await fs.rename(staged, resolved);
+    await nativeProfileRename("media", stage.stagedStoragePath, stage.storagePath);
   });
 }
 

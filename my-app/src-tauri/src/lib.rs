@@ -11,6 +11,7 @@ mod llama_resident;
 mod mlx_resident;
 mod model_residency;
 mod profile;
+mod profile_fs;
 mod sd_cpp_resident;
 mod secrets;
 mod security;

@@ -25,6 +25,7 @@ use crate::engine_sd::{
 };
 use crate::external_apps::launch_external_app;
 use crate::hardware::{detect_hardware, probe_local_runtime};
+use crate::profile_fs::{execute_profile_fs, ProfileFsRequest};
 use crate::secrets::{
     audit_secret_read, delete_provider_secret, get_provider_secret, save_provider_secret,
     ProviderIdPayload, ProviderSecretMutationError, ProviderSecretPayload, ProviderSecretReadError,
@@ -627,6 +628,19 @@ fn handle_bridge_request(
             Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
             Err(err) => bridge_error(&mut stream, "500 Internal Server Error", &err.to_string()),
         },
+        ("POST", "/profile-fs") => {
+            match serde_json::from_str::<ProfileFsRequest>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(execute_profile_fs)
+            {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "ok": true }).to_string(),
+                ),
+                Err(error) => bridge_error(&mut stream, "409 Conflict", &error),
+            }
+        }
         ("POST", "/reset-workspace") => {
             #[derive(Deserialize)]
             struct ResetWorkspaceBody {
