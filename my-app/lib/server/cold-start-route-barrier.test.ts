@@ -86,7 +86,7 @@ vi.mock("@/lib/server/dto", () => ({ toAssetDTO: (value: unknown) => value }));
 
 let tempRoot: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   vi.resetModules();
   events.length = 0;
@@ -97,6 +97,13 @@ beforeEach(() => {
   vi.stubEnv("LUNERY_CONFIG_DIR", path.join(tempRoot, "config"));
   vi.stubEnv("LUNERY_MEDIA_DIR", path.join(tempRoot, "data", "media"));
   vi.stubEnv("LUNERY_MODELS_DIR", path.join(tempRoot, "models"));
+  vi.stubEnv("LUNERY_RUNTIME_DIR", path.join(tempRoot, "runtime"));
+  // Tauri creates and descriptor-pins every profile resource root before the
+  // desktop server accepts requests. Mirror that startup contract so the real
+  // native initialization lock can run in this cold-module route fixture.
+  for (const directory of ["config", "data/media", "models", "runtime"]) {
+    fs.mkdirSync(path.join(tempRoot, directory), { recursive: true });
+  }
   mocks.workspaceCommitFind.mockResolvedValue(null);
   mocks.workspaceCommitDelete.mockImplementation(async () => {
     events.push("restore-reconciled");
@@ -116,6 +123,10 @@ beforeEach(() => {
         }]
       : []);
   mocks.requireWritableCanvasSession.mockResolvedValue({ id: "session", projectId: null });
+  const { resetLocalWorkspaceOwnerForTests } = await import(
+    "@/lib/server/local-workspace-owner"
+  );
+  resetLocalWorkspaceOwnerForTests();
 });
 
 afterEach(() => {
