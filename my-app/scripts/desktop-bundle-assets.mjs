@@ -23,7 +23,7 @@ const distOut = path.join(root, "desktop-dist");
 //
 // Set LUNERY_DESKTOP_NODE_PATH to override (e.g. CI snapshotting a specific
 // runtime). Otherwise we fetch and cache the pinned tarball below.
-const NODE_PINNED_VERSION = "v22.23.1";
+const NODE_PINNED_VERSION = "v24.18.0";
 const cacheDir = path.join(os.homedir(), ".cache", "lunerylab", "desktop-node");
 
 async function exists(target) {

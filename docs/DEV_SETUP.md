@@ -22,7 +22,7 @@ Studio running with the fewest steps.
 
 | Tool | Requirement |
 | --- | --- |
-| Node.js | `>=22.23.1` (CI uses `22.23.1`) |
+| Node.js | `24.18.0` (pinned in `my-app/.node-version` and used by CI) |
 | pnpm | `>=10` (repo pins `pnpm@10.15.1` via `packageManager`) |
 | Rust | Stable toolchain (`rustup`), needed for Tauri |
 | macOS | Xcode Command Line Tools; Apple Silicon is the supported release target |

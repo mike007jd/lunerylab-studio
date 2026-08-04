@@ -1,10 +1,10 @@
 {
   "node": {
-    "version": "v22.23.1",
-    "asset": "node-v22.23.1-darwin-arm64.tar.xz",
-    "url": "https://nodejs.org/dist/v22.23.1/node-v22.23.1-darwin-arm64.tar.xz",
-    "sha256": "fb526811860f81dcac7dd8b2b55eca4accfc5d61c3b7c2508f2639faee8a738d",
-    "sha256Source": "https://nodejs.org/dist/v22.23.1/SHASUMS256.txt"
+    "version": "v24.18.0",
+    "asset": "node-v24.18.0-darwin-arm64.tar.xz",
+    "url": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-darwin-arm64.tar.xz",
+    "sha256": "4477b9f78efb77744cf5eb57a0e9594dba66466b38b4e93fa9f35cb907a095a6",
+    "sha256Source": "https://nodejs.org/dist/v24.18.0/SHASUMS256.txt"
   },
   "assets": [
     {

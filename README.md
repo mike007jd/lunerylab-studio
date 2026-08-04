@@ -79,7 +79,7 @@ pnpm prisma:generate
 pnpm desktop:dev
 ```
 
-Use Node.js `>=22.23.1`, pnpm `>=10`, and Rust for the Tauri desktop shell.
+Use Node.js `24.18.0` (pinned in `my-app/.node-version`), pnpm `>=10`, and Rust for the Tauri desktop shell.
 Desktop uses embedded PGlite, so no external Postgres is required. The complete
 setup, validation, and local-data guidance is in
 [Developer Setup](docs/DEV_SETUP.md).
