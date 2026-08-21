@@ -36,7 +36,7 @@ export const COPY = {
     testConnection: "Test connection",
     testing: "Testing…",
     comfyUiUnreachable:
-      "Not detected — install & start ComfyUI, or use a cloud key",
+      "Not detected — install & start ComfyUI, attach your own server in Comfy, or use a cloud key",
     ready: "Ready",
     notReady: "Not ready",
     imageCapability: "Image creation",
@@ -69,7 +69,7 @@ export const COPY = {
     testConnection: "测试连接",
     testing: "测试中…",
     comfyUiUnreachable:
-      "未检测到 — 请安装并启动 ComfyUI，或使用云端 key",
+      "未检测到 — 请安装并启动 ComfyUI、在 Comfy 画布接入你自己的服务器，或使用云端 key",
     ready: "已就绪",
     notReady: "未就绪",
     imageCapability: "图片创作",
@@ -106,7 +106,7 @@ export const COPY = {
     testConnection: "測試連線",
     testing: "測試中…",
     comfyUiUnreachable:
-      "未檢測到 — 請安裝並啟動 ComfyUI，或使用雲端 key",
+      "未檢測到 — 請安裝並啟動 ComfyUI、在 Comfy 畫布接入你自己的伺服器，或使用雲端 key",
     ready: "已就緒",
     notReady: "未就緒",
     imageCapability: "圖片創作",

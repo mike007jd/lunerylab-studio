@@ -534,13 +534,13 @@ function isPrivateIpv6(ip: string): boolean {
   return false;
 }
 
-function isPrivateIp(ip: string): boolean {
+export function isPrivateIp(ip: string): boolean {
   if (net.isIPv4(ip)) return isPrivateIpv4(ip);
   if (!net.isIPv6(ip)) return true;
   return isPrivateIpv6(ip);
 }
 
-function isLoopbackIp(ip: string): boolean {
+export function isLoopbackIp(ip: string): boolean {
   if (net.isIPv4(ip)) return ip.split(".")[0] === "127";
   const hextets = parseIpv6Hextets(ip);
   if (!hextets) return false;
@@ -549,15 +549,15 @@ function isLoopbackIp(ip: string): boolean {
   return mappedIpv4 ? mappedIpv4.split(".")[0] === "127" : false;
 }
 
-function normalizeEndpointHostname(hostname: string): string {
+export function normalizeEndpointHostname(hostname: string): string {
   return hostname.replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "").toLowerCase();
 }
 
-function isBlockedMetadataHost(hostname: string): boolean {
+export function isBlockedMetadataHost(hostname: string): boolean {
   return hostname === "metadata" || hostname === "metadata.google.internal";
 }
 
-async function resolveEndpointHost(hostname: string): Promise<Array<{ address: string; family: number }> | null> {
+export async function resolveEndpointHost(hostname: string): Promise<Array<{ address: string; family: number }> | null> {
   const directIp = net.isIP(hostname);
   if (directIp) return [{ address: hostname, family: directIp }];
   try {

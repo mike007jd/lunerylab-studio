@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::comfy_remote::comfy_ssh_start;
 use crate::download::{
     canonical_download_destination, hf_download_start_inner, DownloadCancelRequest, DownloadState,
     JobSnapshot,
@@ -1338,6 +1339,22 @@ fn handle_bridge_request(
                     "200 OK",
                     &serde_json::json!({ "ok": true }).to_string(),
                 ),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        // Remote ComfyUI start — argv-only ssh, no local shell, hard timeout.
+        ("POST", "/comfy-ssh-start") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ComfySshStartBody {
+                host_alias: String,
+                command: String,
+            }
+            match serde_json::from_str::<ComfySshStartBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_ssh_start(&b.host_alias, &b.command))
+            {
+                Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
             }
         }

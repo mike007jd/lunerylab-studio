@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { isDesktopOnlyRoute, isDesktopRuntime } from "@/lib/desktop-runtime";
 import { buildCsp } from "@/lib/csp";
+import { listComfyFrameOrigins } from "@/lib/server/comfy-frame-origins";
 import { PUBLIC_SITE_DOWNLOAD_URL } from "@/lib/public-site";
 
 const DESKTOP_WEBVIEW_ORIGINS = [
@@ -140,6 +141,12 @@ export async function proxy(request: NextRequest) {
   // `forwardWithNonce` (sets it on the forwarded request headers Next reads
   // to stamp inline scripts) and `finalizeResponse` (writes it into the CSP).
   const nonce = expectsHtml(request) ? buildNonce() : null;
+  // The /comfy workspace embeds the user's own ComfyUI frontend, so those
+  // HTML responses carry frame-src entries for the saved endpoints only.
+  const frameSrcOrigins =
+    pathname === "/comfy" || pathname.startsWith("/comfy/")
+      ? listComfyFrameOrigins()
+      : undefined;
 
   // Workbench routes only open inside the desktop WebView. Browser traffic is
   // sent to the standalone public site, which owns marketing and downloads.
@@ -147,7 +154,7 @@ export async function proxy(request: NextRequest) {
     if (!isDesktopRuntime()) {
       return NextResponse.redirect(PUBLIC_SITE_DOWNLOAD_URL);
     }
-    return finalizeResponse(forwardWithNonce(request, nonce), nonce);
+    return finalizeResponse(forwardWithNonce(request, nonce), nonce, frameSrcOrigins);
   }
 
   // CSRF: state-changing API requests must present an Origin/Referer that
@@ -162,7 +169,7 @@ export async function proxy(request: NextRequest) {
     }
   }
 
-  return finalizeResponse(forwardWithNonce(request, nonce), nonce);
+  return finalizeResponse(forwardWithNonce(request, nonce), nonce, frameSrcOrigins);
 }
 
 function forwardWithNonce(request: NextRequest, nonce: string | null): NextResponse {
@@ -172,9 +179,16 @@ function forwardWithNonce(request: NextRequest, nonce: string | null): NextRespo
   return NextResponse.next({ request: { headers } });
 }
 
-function finalizeResponse(response: NextResponse, nonce: string | null): NextResponse {
+function finalizeResponse(
+  response: NextResponse,
+  nonce: string | null,
+  frameSrcOrigins?: string[],
+): NextResponse {
   if (nonce) {
-    response.headers.set("Content-Security-Policy", buildCsp(nonce));
+    response.headers.set(
+      "Content-Security-Policy",
+      buildCsp(nonce, frameSrcOrigins ? { frameSrcOrigins } : {}),
+    );
   }
   return response;
 }

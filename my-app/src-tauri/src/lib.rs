@@ -1,3 +1,4 @@
+mod comfy_remote;
 mod download;
 mod engine_lifecycle;
 mod engine_llama;
