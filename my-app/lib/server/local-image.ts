@@ -212,17 +212,36 @@ const ABORT_ERROR = new ApiError({
   retryable: false,
 });
 
+/**
+ * Compose a ComfyUI request URL from the stored endpoint. Building through URL
+ * (rather than string concatenation) normalizes a trailing slash away so a
+ * pasted "http://host:8188/" cannot produce "http://host:8188//prompt", and
+ * preserves any reverse-proxy sub-path on the endpoint.
+ */
+function comfyUrl(baseUrl: string, path: string, search?: URLSearchParams): string {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const url = new URL(path, base);
+  if (search) url.search = search.toString();
+  return url.toString();
+}
+
+// A validated endpoint has no cross-origin redirect; following one would let an
+// attacker-controlled ComfyUI bounce these requests off the validation
+// boundary, so every call rejects redirects instead of following them.
+const NO_REDIRECT: Pick<RequestInit, "redirect"> = { redirect: "error" };
+
 async function queueWorkflow(
   baseUrl: string,
   workflow: ComfyWorkflow,
   abortSignal?: AbortSignal,
 ): Promise<string> {
   if (abortSignal?.aborted) throw ABORT_ERROR;
-  const response = await fetch(`${baseUrl}/prompt`, {
+  const response = await fetch(comfyUrl(baseUrl, "prompt"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ prompt: workflow }),
     signal: requestSignal(10_000, abortSignal),
+    ...NO_REDIRECT,
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -257,9 +276,10 @@ async function pollHistory(
     if (abortSignal?.aborted) throw ABORT_ERROR;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     if (abortSignal?.aborted) throw ABORT_ERROR;
-    const response = await fetch(`${baseUrl}/history/${promptId}`, {
+    const response = await fetch(comfyUrl(baseUrl, `history/${promptId}`), {
       cache: "no-store",
       signal: requestSignal(5_000, abortSignal),
+      ...NO_REDIRECT,
     });
     if (!response.ok) {
       delayMs = Math.min(delayMs * 1.5, 5000);
@@ -301,8 +321,9 @@ async function fetchOutputImage(
         subfolder: first.subfolder,
         type: first.type,
       });
-      const response = await fetch(`${baseUrl}/view?${params.toString()}`, {
+      const response = await fetch(comfyUrl(baseUrl, "view", params), {
         signal: requestSignal(30_000, abortSignal),
+        ...NO_REDIRECT,
       });
       if (!response.ok) {
         throw new ApiError({
@@ -331,15 +352,17 @@ async function fetchOutputImage(
  */
 async function cancelComfyJob(baseUrl: string, promptId: string): Promise<void> {
   await Promise.allSettled([
-    fetch(`${baseUrl}/queue`, {
+    fetch(comfyUrl(baseUrl, "queue"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ delete: [promptId] }),
       signal: AbortSignal.timeout(2_000),
+      ...NO_REDIRECT,
     }),
-    fetch(`${baseUrl}/interrupt`, {
+    fetch(comfyUrl(baseUrl, "interrupt"), {
       method: "POST",
       signal: AbortSignal.timeout(2_000),
+      ...NO_REDIRECT,
     }),
   ]);
 }

@@ -13,6 +13,7 @@ import {
   isComfyRelayOrigin,
   storeComfyCanvasReport,
 } from "@/lib/server/comfy-canvas-report";
+import { getActiveComfyConnection } from "@/lib/server/comfy-connection-store";
 
 export const dynamic = "force-dynamic";
 
@@ -48,7 +49,13 @@ export async function POST(request: NextRequest) {
   }
   try {
     const body = await parseJsonBody(request, canvasReportSchema);
-    storeComfyCanvasReport({ prompt: body.prompt, workflow: body.workflow });
+    // Stamp the report with the connection that is active right now so a reader
+    // can reject a graph that belongs to a different attached server.
+    storeComfyCanvasReport({
+      prompt: body.prompt,
+      workflow: body.workflow,
+      connectionEndpoint: getActiveComfyConnection()?.endpoint,
+    });
     return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
   } catch {
     return NextResponse.json({ error: "invalid_body" }, { status: 400, headers: corsHeaders(origin) });

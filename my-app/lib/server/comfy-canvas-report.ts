@@ -12,6 +12,13 @@ export interface ComfyCanvasReport {
   prompt: Record<string, unknown>;
   /** UI-format graph (positions, groups) when the frontend provided it. */
   workflow?: Record<string, unknown>;
+  /**
+   * The attached connection's endpoint that was active when this report was
+   * stored. Readers must match it against the connection they are operating on
+   * so a stale beacon can never feed one server's graph to another server's
+   * agent (single global slot, one canvas window at a time).
+   */
+  connectionEndpoint?: string;
   receivedAt: string;
 }
 

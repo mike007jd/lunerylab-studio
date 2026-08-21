@@ -17,10 +17,14 @@ afterEach(() => {
 });
 
 describe("comfy canvas report cache", () => {
-  it("returns a freshly stored report", () => {
-    storeComfyCanvasReport({ prompt: { "3": { class_type: "KSampler" } } });
+  it("returns a freshly stored report with its connection stamp", () => {
+    storeComfyCanvasReport({
+      prompt: { "3": { class_type: "KSampler" } },
+      connectionEndpoint: "http://192.168.1.10:8188",
+    });
     const report = getComfyCanvasReport();
     expect(report?.prompt).toEqual({ "3": { class_type: "KSampler" } });
+    expect(report?.connectionEndpoint).toBe("http://192.168.1.10:8188");
     expect(typeof report?.receivedAt).toBe("string");
   });
 

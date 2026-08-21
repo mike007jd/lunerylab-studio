@@ -83,7 +83,7 @@ export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
       inputSchema: z.object({}).strict(),
       execute: async () => {
         ctx.recordStep("Reading the live graph", "observe_graph");
-        const report = await refreshComfyCanvasReport(ctx.bridge);
+        const report = await refreshComfyCanvasReport(ctx.bridge, ctx.activeEndpointRaw);
         if (!report) {
           return {
             ok: false,
@@ -147,7 +147,7 @@ export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
       execute: async ({ workflow }) => {
         let prompt = workflow;
         if (!prompt) {
-          const report = await refreshComfyCanvasReport(ctx.bridge);
+          const report = await refreshComfyCanvasReport(ctx.bridge, ctx.activeEndpointRaw);
           prompt = report?.prompt;
         }
         if (!prompt || Object.keys(prompt).length === 0) {
