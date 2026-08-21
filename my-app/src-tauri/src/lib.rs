@@ -1,3 +1,4 @@
+mod comfy_canvas;
 mod comfy_remote;
 mod download;
 mod engine_lifecycle;
@@ -18,6 +19,7 @@ mod secrets;
 mod security;
 mod vram_probe;
 
+use crate::comfy_canvas::stop_comfy_canvas_relay;
 use crate::download::DownloadState;
 use crate::engine_llama::{bridge_stop_llama, llama_engine_slot};
 use crate::engine_mlx::{bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot};
@@ -354,6 +356,14 @@ impl Drop for DesktopServerState {
 static RESIDENCY_GLOBAL: OnceLock<Arc<ResidencyManager>> = OnceLock::new();
 pub(crate) fn residency_global() -> Option<&'static Arc<ResidencyManager>> {
     RESIDENCY_GLOBAL.get()
+}
+
+/// Process-global AppHandle so bridge threads (no Tauri State) can manage the
+/// ComfyUI canvas window. Set once during setup, before any bridge request can
+/// arrive (the bridge starts after setup on both dev and production paths).
+static BRIDGE_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+pub(crate) fn bridge_app_handle() -> Option<&'static AppHandle> {
+    BRIDGE_APP_HANDLE.get()
 }
 
 #[derive(Serialize)]
@@ -1930,6 +1940,22 @@ pub fn run() {
         .manage(desktop_state)
         .manage(Arc::clone(&download_state))
         .setup(move |app| {
+            // Make the handle reachable from bridge threads for ComfyUI canvas
+            // window management (open/focus/close/eval).
+            let _ = BRIDGE_APP_HANDLE.set(app.handle().clone());
+            // The main window is declared `create: false` in tauri.conf.json.
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .first()
+                .cloned()
+                .ok_or("Main window config is missing")?;
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)
+                .map_err(|err| Box::<dyn std::error::Error>::from(err.to_string()))?
+                .build()
+                .map_err(|err| Box::<dyn std::error::Error>::from(err.to_string()))?;
+
             // Acquire the resolved-profile OS advisory lock before dev bridge,
             // stale PID cleanup, runtime spawn, or PGlite open. A second instance
             // that races past single-instance must not run backend PID cleanup.
@@ -2075,6 +2101,7 @@ pub fn run() {
             bridge_stop_llama();
             bridge_stop_sd();
             bridge_stop_mlx();
+            stop_comfy_canvas_relay();
         }
     });
 }

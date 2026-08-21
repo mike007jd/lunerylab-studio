@@ -53,3 +53,23 @@ export interface ComfyTestResponse {
   error?: string;
   code?: string;
 }
+
+export type ComfyActivityJobStatus = "running" | "completed" | "failed" | "cancelled";
+
+/**
+ * One Studio-submitted ComfyUI job, as served by GET /api/comfy-activity.
+ * Memory-only live feed — the workspace uses it to load the running graph
+ * into the embedded canvas and to attribute canvas activity to Studio.
+ */
+export interface ComfyActivityJob {
+  /** ComfyUI prompt_id returned by POST /prompt. */
+  id: string;
+  /** Configured endpoint the job was submitted to (as saved on the connection). */
+  endpoint: string;
+  status: ComfyActivityJobStatus;
+  /** API-format workflow (the POST /prompt body) — the canvas loads this verbatim. */
+  workflow: unknown;
+  prompt: string;
+  startedAt: string;
+  finishedAt?: string;
+}

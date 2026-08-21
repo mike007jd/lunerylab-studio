@@ -1,13 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
+  ExternalLink,
   Play,
   RefreshCw,
   RotateCcw,
   Settings2,
   Sparkles,
+  Workflow,
+  X,
 } from "@/components/ui/icons";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,6 +25,7 @@ import { SurfaceCard } from "@/components/ui/page-primitives";
 import { useT } from "@/lib/i18n/useT";
 import { fetchJson, toErrorMessage } from "@/lib/client/fetch-json";
 import {
+  type ComfyActivityJob,
   type ComfyConnectionState,
   type ComfyConnectionStatus,
   type ComfyTestResponse,
@@ -37,6 +41,12 @@ interface StartOutput {
   error?: string;
 }
 
+/**
+ * Console for the attached ComfyUI server. The graph itself lives in a
+ * dedicated native window running the official ComfyUI frontend (reached
+ * through the desktop bridge's loopback relay), so this page owns connections,
+ * health, sync, remote start, and pushing Studio jobs onto the canvas.
+ */
 export function ComfyWorkspace({
   initialState,
 }: {
@@ -53,7 +63,9 @@ export function ComfyWorkspace({
   const [managerOpen, setManagerOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [startOutput, setStartOutput] = useState<StartOutput | null>(null);
-  const [canvasReloadKey, setCanvasReloadKey] = useState(0);
+  const [canvasOpen, setCanvasOpen] = useState(false);
+  const [canvasBusy, setCanvasBusy] = useState(false);
+  const [activityJobs, setActivityJobs] = useState<ComfyActivityJob[]>([]);
 
   const activeConnection = useMemo(
     () =>
@@ -150,6 +162,66 @@ export function ComfyWorkspace({
     };
   }, [activeConnectionId, testConnection]);
 
+  // Poll the Studio-side activity feed while visible: a running job for the
+  // active connection is what gets pushed onto the canvas window below.
+  useEffect(() => {
+    if (!activeConnectionId) return;
+    let cancelled = false;
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const result = await fetchJson<{ jobs: ComfyActivityJob[] }>("/api/comfy/activity", {
+          cache: "no-store",
+        });
+        if (!cancelled) setActivityJobs(result.jobs);
+      } catch {
+        // Transient poll failure — the next tick retries.
+      }
+    };
+    void poll();
+    const interval = window.setInterval(poll, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [activeConnectionId]);
+
+  const openCanvas = useCallback(
+    async (reload = false) => {
+      if (!activeConnection) return;
+      setCanvasBusy(true);
+      setActionError(null);
+      try {
+        await fetchJson("/api/comfy/canvas/open", {
+          method: "POST",
+          body: JSON.stringify({
+            id: activeConnection.id,
+            ...(reload ? { reload: true } : {}),
+          }),
+        });
+        setCanvasOpen(true);
+      } catch (error) {
+        setActionError(toErrorMessage(error, t("comfy.canvasOpenFailed")));
+      } finally {
+        setCanvasBusy(false);
+      }
+    },
+    [activeConnection, t],
+  );
+
+  const closeCanvas = useCallback(async () => {
+    setCanvasBusy(true);
+    setActionError(null);
+    try {
+      await fetchJson("/api/comfy/canvas/close", { method: "POST", body: "{}" });
+      setCanvasOpen(false);
+    } catch (error) {
+      setActionError(toErrorMessage(error, t("comfy.canvasCloseFailed")));
+    } finally {
+      setCanvasBusy(false);
+    }
+  }, [t]);
+
   const handleActivate = useCallback(
     async (id: string) => {
       setActionError(null);
@@ -159,12 +231,19 @@ export function ComfyWorkspace({
           body: JSON.stringify({ id }),
         });
         await refreshState();
-        setCanvasReloadKey((key) => key + 1);
+        // An open canvas follows the newly activated server: the bridge
+        // retargets its relay and navigates the window without a manual reload.
+        if (canvasOpen) {
+          await fetchJson("/api/comfy/canvas/open", {
+            method: "POST",
+            body: JSON.stringify({ id }),
+          });
+        }
       } catch (error) {
         setActionError(toErrorMessage(error, t("comfy.activateFailed")));
       }
     },
-    [refreshState, t],
+    [refreshState, canvasOpen, t],
   );
 
   const handleSync = useCallback(async () => {
@@ -199,11 +278,12 @@ export function ComfyWorkspace({
         body: JSON.stringify({ id: activeConnection.id }),
       });
       setStartOutput(result);
-      // The remote service needs a moment before /system_stats answers.
+      // The remote service needs a moment before /system_stats answers; an
+      // open canvas must reconnect to the freshly started server.
       const startedConnection = activeConnection;
       window.setTimeout(() => {
         void testConnection(startedConnection.id, { quiet: false }).then(() => {
-          setCanvasReloadKey((key) => key + 1);
+          if (canvasOpen) void openCanvas(true);
         });
       }, 1500);
     } catch (error) {
@@ -211,7 +291,40 @@ export function ComfyWorkspace({
     } finally {
       setStarting(false);
     }
-  }, [activeConnection, testConnection, t]);
+  }, [activeConnection, testConnection, canvasOpen, openCanvas, t]);
+
+  const activeEndpoint = activeConnection?.endpoint;
+  const runningStudioJob = useMemo(
+    () =>
+      activityJobs.find(
+        (job) => job.endpoint === activeEndpoint && job.status === "running",
+      ),
+    [activityJobs, activeEndpoint],
+  );
+
+  // Canvas follow: load the running Studio workflow into the official editor
+  // in the canvas window so its native node highlighting shows execution live.
+  // Each job is pushed once per connection epoch.
+  const loadedJobsRef = useRef<{ connectionId: string; ids: Set<string> }>({
+    connectionId: "",
+    ids: new Set(),
+  });
+  useEffect(() => {
+    loadedJobsRef.current = { connectionId: activeConnectionId ?? "", ids: new Set() };
+  }, [activeConnectionId]);
+
+  useEffect(() => {
+    if (!canvasOpen || !activeConnectionId || !runningStudioJob) return;
+    if (loadedJobsRef.current.connectionId !== activeConnectionId) {
+      loadedJobsRef.current = { connectionId: activeConnectionId, ids: new Set() };
+    }
+    if (loadedJobsRef.current.ids.has(runningStudioJob.id)) return;
+    loadedJobsRef.current.ids.add(runningStudioJob.id);
+    void fetchJson("/api/comfy/canvas/load", {
+      method: "POST",
+      body: JSON.stringify({ workflow: runningStudioJob.workflow }),
+    }).catch(() => setActionError(t("comfy.canvasLoadFailed")));
+  }, [canvasOpen, activeConnectionId, runningStudioJob, t]);
 
   const statusBadgeVariant =
     displayStatus === "online"
@@ -227,7 +340,7 @@ export function ComfyWorkspace({
         {state.connections.length > 0 ? (
           <Select
             value={activeConnection?.id ?? ""}
-            onValueChange={handleActivate}
+            onValueChange={(id) => void handleActivate(id)}
           >
             <SelectTrigger
               size="sm"
@@ -260,7 +373,7 @@ export function ComfyWorkspace({
             <Button
               size="sm"
               variant="gold"
-              onClick={handleStart}
+              onClick={() => void handleStart()}
               disabled={starting || testing}
             >
               <Play />
@@ -270,7 +383,9 @@ export function ComfyWorkspace({
           <Button
             size="sm"
             variant="accent"
-            onClick={() => activeConnection && testConnection(activeConnection.id, { quiet: false })}
+            onClick={() =>
+              activeConnection && void testConnection(activeConnection.id, { quiet: false })
+            }
             disabled={!activeConnection || testing}
           >
             <Activity />
@@ -279,7 +394,7 @@ export function ComfyWorkspace({
           <Button
             size="sm"
             variant="accent"
-            onClick={handleSync}
+            onClick={() => void handleSync()}
             disabled={!activeConnection || syncing}
           >
             <RefreshCw />
@@ -295,15 +410,6 @@ export function ComfyWorkspace({
               {t("comfy.details")}
             </Button>
           ) : null}
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => setCanvasReloadKey((key) => key + 1)}
-            disabled={!activeConnection}
-            aria-label={t("comfy.reloadCanvas")}
-          >
-            <RotateCcw />
-          </Button>
           <Button size="sm" onClick={() => setManagerOpen(true)}>
             <Settings2 />
             {t("comfy.manage")}
@@ -318,22 +424,63 @@ export function ComfyWorkspace({
       ) : null}
 
       {activeConnection ? (
-        <div className="relative min-h-0 flex-1 overflow-hidden rounded-xl border border-(--border-subtle) bg-(--bg-surface)">
-          <iframe
-            key={`${activeConnection.id}-${canvasReloadKey}`}
-            src={activeConnection.endpoint}
-            title={`${activeConnection.name} — ComfyUI`}
-            className="absolute inset-0 h-full w-full border-0"
-            allow="clipboard-read; clipboard-write; fullscreen"
-          />
-          {displayStatus === "offline" ? (
-            <div className="absolute inset-x-0 top-0 flex items-start justify-center p-3">
-              <div className="rounded-lg border border-(--border-subtle) bg-(--bg-surface) px-4 py-2 text-sm text-(--text-secondary) shadow-(--shadow-sm)">
-                {t("comfy.offlineOverlay")}
-              </div>
+        <SurfaceCard className="flex flex-col gap-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <Workflow className="size-4 text-(--accent)" />
+            <h2 className="text-sm font-semibold text-(--text-primary)">
+              {t("comfy.canvasTitle")}
+            </h2>
+            <Badge variant={canvasOpen ? "successSoft" : "secondary"}>
+              {canvasOpen ? t("comfy.canvasOpenBadge") : t("comfy.canvasClosedBadge")}
+            </Badge>
+            <div className="ml-auto flex items-center gap-2">
+              {canvasOpen ? (
+                <>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void openCanvas(true)}
+                    disabled={canvasBusy}
+                    aria-label={t("comfy.reloadCanvas")}
+                  >
+                    <RotateCcw />
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void closeCanvas()}
+                    disabled={canvasBusy}
+                  >
+                    <X />
+                    {t("comfy.closeCanvas")}
+                  </Button>
+                </>
+              ) : null}
+              <Button
+                size="sm"
+                variant="accent"
+                onClick={() => void openCanvas()}
+                disabled={canvasBusy}
+              >
+                <ExternalLink />
+                {canvasBusy
+                  ? t("comfy.canvasWorking")
+                  : canvasOpen
+                    ? t("comfy.focusCanvas")
+                    : t("comfy.openCanvas")}
+              </Button>
             </div>
+          </div>
+          <p className="max-w-3xl text-sm text-(--text-secondary)">
+            {t("comfy.canvasDescription", {
+              name: activeConnection.name,
+              endpoint: activeConnection.endpoint,
+            })}
+          </p>
+          {displayStatus === "offline" ? (
+            <p className="text-sm text-destructive">{t("comfy.canvasOfflineHint")}</p>
           ) : null}
-        </div>
+        </SurfaceCard>
       ) : (
         <SurfaceCard className="flex flex-1 items-center justify-center">
           <div className="max-w-md text-center">

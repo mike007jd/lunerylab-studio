@@ -37,6 +37,7 @@ import { findHfModelEntry } from "@/lib/hf-model-catalog";
 import { findImportedModel } from "@/lib/server/imported-model-registry";
 import { localImageDimensions } from "@/lib/server/generation-dimensions";
 import { normalizeGenerationParameters, randomGenerationSeed } from "@/lib/generation-parameters";
+import { recordComfyJobFinished, recordComfyJobStarted } from "@/lib/server/comfy-activity";
 
 // ---------------------------------------------------------------------------
 // Model-family workflow profiles
@@ -443,21 +444,26 @@ export async function generateImagesLocal(
   const generateOne = async (index: number) => {
     let promptId: string | null = null;
     const seed = requestedParameters.seed ?? randomGenerationSeed();
+    const workflow = buildTxt2ImgWorkflow({
+      checkpointName,
+      prompt: input.prompt,
+      seed,
+      negativePrompt: requestedParameters.negativePrompt,
+      profile: appliedProfile,
+      width,
+      height,
+    });
     try {
-      promptId = await queueWorkflow(
-        endpoint,
-        buildTxt2ImgWorkflow({
-          checkpointName,
-          prompt: input.prompt,
-          seed,
-          negativePrompt: requestedParameters.negativePrompt,
-          profile: appliedProfile,
-          width,
-          height,
-        }),
-        abortSignal,
-      );
+      promptId = await queueWorkflow(endpoint, workflow, abortSignal);
       activePromptIds.add(promptId);
+      // Surface the job to the /comfy workspace so it can load this exact
+      // graph into the embedded canvas and show live progress.
+      recordComfyJobStarted({
+        id: promptId,
+        endpoint,
+        workflow,
+        prompt: input.prompt,
+      });
       // Close the window where abort fires after the server queued the job but
       // before onAbort could see this id — cancel it on the server right away.
       if (abortSignal?.aborted) {
@@ -466,6 +472,7 @@ export async function generateImagesLocal(
       }
       const historyEntry = await pollHistory(endpoint, promptId, abortSignal);
       const bytes = await fetchOutputImage(endpoint, historyEntry, abortSignal);
+      recordComfyJobFinished(endpoint, promptId, "completed");
       images.push({
         bytes,
         mimeType: "image/png",
@@ -478,6 +485,13 @@ export async function generateImagesLocal(
         },
       });
     } catch (error) {
+      if (promptId) {
+        recordComfyJobFinished(
+          endpoint,
+          promptId,
+          abortSignal?.aborted ? "cancelled" : "failed",
+        );
+      }
       warnings.push(
         `candidate_${index + 1}: ${error instanceof ApiError ? error.code : "generation_error"}`,
       );

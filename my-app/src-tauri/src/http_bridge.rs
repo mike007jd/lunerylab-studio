@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::comfy_canvas::{
+    comfy_canvas_close, comfy_canvas_load, comfy_canvas_open, comfy_canvas_status_json,
+};
 use crate::comfy_remote::comfy_ssh_start;
 use crate::download::{
     canonical_download_destination, hf_download_start_inner, DownloadCancelRequest, DownloadState,
@@ -1355,6 +1358,52 @@ fn handle_bridge_request(
                 .and_then(|b| comfy_ssh_start(&b.host_alias, &b.command))
             {
                 Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        // ComfyUI canvas — loopback relay target + native canvas window.
+        ("POST", "/comfy-canvas-open") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ComfyCanvasOpenBody {
+                endpoint: String,
+                #[serde(default)]
+                reload: bool,
+            }
+            match serde_json::from_str::<ComfyCanvasOpenBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_canvas_open(&b.endpoint, b.reload))
+            {
+                Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        ("POST", "/comfy-canvas-close") => match comfy_canvas_close() {
+            Ok(()) => write_http_response(
+                &mut stream,
+                "200 OK",
+                &serde_json::json!({ "ok": true }).to_string(),
+            ),
+            Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+        },
+        ("GET", "/comfy-canvas-status") => match comfy_canvas_status_json() {
+            Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+            Err(err) => bridge_error(&mut stream, "500 Internal Server Error", &err),
+        },
+        ("POST", "/comfy-canvas-load") => {
+            #[derive(Deserialize)]
+            struct ComfyCanvasLoadBody {
+                workflow: serde_json::Value,
+            }
+            match serde_json::from_str::<ComfyCanvasLoadBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_canvas_load(&b.workflow))
+            {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "ok": true }).to_string(),
+                ),
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
             }
         }

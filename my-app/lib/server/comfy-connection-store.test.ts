@@ -24,10 +24,6 @@ function loadStore() {
   return import("@/lib/server/comfy-connection-store");
 }
 
-function loadFrameOrigins() {
-  return import("@/lib/server/comfy-frame-origins");
-}
-
 function writeFixture(data: unknown) {
   fs.mkdirSync(path.dirname(storeFile), { recursive: true });
   fs.writeFileSync(storeFile, JSON.stringify(data), "utf8");
@@ -160,27 +156,5 @@ describe("comfy-connection-store lifecycle", () => {
       store.saveComfyConnection({ name: "x", endpoint: "http://127.0.0.1:8188" }),
     ).rejects.toThrow();
     expect(store.listComfyConnections()).toEqual([]);
-  });
-});
-
-describe("comfy frame origins for CSP", () => {
-  it("collects origins from saved connections and skips malformed endpoints", async () => {
-    writeFixture({
-      connections: [
-        { id: "a", name: "lan", endpoint: "http://192.168.1.143:8188" },
-        { id: "b", name: "ts", endpoint: "http://100.120.182.80:8188/" },
-        { id: "c", name: "broken", endpoint: "::not a url::" },
-      ],
-    });
-    const { listComfyFrameOrigins } = await loadFrameOrigins();
-    expect(listComfyFrameOrigins().sort()).toEqual([
-      "http://100.120.182.80:8188",
-      "http://192.168.1.143:8188",
-    ]);
-  });
-
-  it("returns no origins when the store is missing", async () => {
-    const { listComfyFrameOrigins } = await loadFrameOrigins();
-    expect(listComfyFrameOrigins()).toEqual([]);
   });
 });
