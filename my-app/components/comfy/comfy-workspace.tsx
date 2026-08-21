@@ -32,6 +32,7 @@ import {
 } from "@/lib/comfy-attach";
 import { ComfyConnectionManagerDialog } from "@/components/comfy/comfy-connection-manager";
 import { ComfyStartOutputDialog, ComfySyncDetailsDialog } from "@/components/comfy/comfy-dialogs";
+import { ComfyAgentChat } from "@/components/comfy/comfy-agent-chat";
 
 interface StartOutput {
   ok?: boolean;
@@ -335,8 +336,9 @@ export function ComfyWorkspace({
   const statusLabel = t(`comfy.status.${displayStatus}`);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3">
-      <div className="flex flex-wrap items-center gap-2">
+    <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[minmax(0,1fr)_380px]">
+      <div className="flex min-h-0 flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-2">
         {state.connections.length > 0 ? (
           <Select
             value={activeConnection?.id ?? ""}
@@ -517,6 +519,13 @@ export function ComfyWorkspace({
         output={startOutput}
         onClose={() => setStartOutput(null)}
       />
+      </div>
+
+      {activeConnection ? (
+        <ComfyAgentChat connectionId={activeConnection.id} />
+      ) : (
+        <div className="hidden lg:block" />
+      )}
     </div>
   );
 }

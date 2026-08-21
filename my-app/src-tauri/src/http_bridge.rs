@@ -8,7 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::comfy_canvas::{
-    comfy_canvas_close, comfy_canvas_load, comfy_canvas_open, comfy_canvas_status_json,
+    comfy_canvas_close, comfy_canvas_load, comfy_canvas_open, comfy_canvas_report,
+    comfy_canvas_status_json,
 };
 use crate::comfy_remote::comfy_ssh_start;
 use crate::download::{
@@ -1407,6 +1408,14 @@ fn handle_bridge_request(
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
             }
         }
+        ("POST", "/comfy-canvas-report") => match comfy_canvas_report() {
+            Ok(()) => write_http_response(
+                &mut stream,
+                "200 OK",
+                &serde_json::json!({ "ok": true }).to_string(),
+            ),
+            Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+        },
         _ => bridge_error(&mut stream, "404 Not Found", "Unknown desktop bridge route"),
     }
 }

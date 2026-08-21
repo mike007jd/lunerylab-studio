@@ -95,7 +95,24 @@ const en = {
     "syncedAt": "Synced at",
     "models": "Models",
     "modelCount": "{count} files",
-    "noModels": "No models found on this server."
+    "noModels": "No models found on this server.",
+    "agent": {
+      "title": "Luna for Comfy",
+      "subtitle": "Reads and edits your live graph",
+      "thinking": "Working…",
+      "ready": "Ready",
+      "welcome": "Ask Luna about your ComfyUI graph",
+      "welcomeHint": "She can read the canvas, edit the graph, queue runs, and install nodes on your server.",
+      "placeholder": "Message Luna…",
+      "send": "Send",
+      "stop": "Stop",
+      "stopped": "Stopped.",
+      "retry": "Retry",
+      "chipObserve": "What's on the canvas right now?",
+      "chipEditPrompt": "Change the positive prompt to a snowy mountain at dawn",
+      "chipRun": "Queue the current graph",
+      "chipModels": "List the checkpoints on the server"
+    }
   },
   "shell": {
     "navigationTitle": "Navigation",

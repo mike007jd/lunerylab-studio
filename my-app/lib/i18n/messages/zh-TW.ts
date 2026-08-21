@@ -95,7 +95,24 @@ const zhTW = {
     "syncedAt": "同步時間",
     "models": "模型",
     "modelCount": "{count} 個檔案",
-    "noModels": "此伺服器上未發現模型。"
+    "noModels": "此伺服器上未發現模型。",
+    "agent": {
+      "title": "Luna · Comfy",
+      "subtitle": "讀取並編輯你的即時節點圖",
+      "thinking": "處理中…",
+      "ready": "就緒",
+      "welcome": "向 Luna 詢問你的 ComfyUI 節點圖",
+      "welcomeHint": "她能讀取畫布、編輯節點圖、排入佇列執行，並在你的伺服器上安裝節點。",
+      "placeholder": "給 Luna 傳訊息…",
+      "send": "傳送",
+      "stop": "停止",
+      "stopped": "已停止。",
+      "retry": "重試",
+      "chipObserve": "現在畫布上有什麼？",
+      "chipEditPrompt": "把正向提示詞改成破曉時分的雪山",
+      "chipRun": "把目前節點圖排入佇列執行",
+      "chipModels": "列出伺服器上的檢查點模型"
+    }
   },
   "shell": {
     "navigationTitle": "導航",

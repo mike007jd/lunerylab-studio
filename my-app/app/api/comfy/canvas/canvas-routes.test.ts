@@ -166,6 +166,7 @@ describe("/api/comfy/canvas/load", () => {
     expect(mocks.proxyToBridge).toHaveBeenCalledWith(expect.anything(), "/comfy-canvas-load", {
       method: "POST",
       body: JSON.stringify({ workflow }),
+      timeoutMs: 10_000,
     });
   });
 

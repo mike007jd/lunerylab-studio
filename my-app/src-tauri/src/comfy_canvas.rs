@@ -145,7 +145,7 @@ impl ComfyCanvasRelay {
             .spawn(move || {
                 while !listener_shutdown.load(Ordering::Acquire) {
                     match listener.accept() {
-                        Ok((mut client, _)) => {
+                        Ok((client, _)) => {
                             if listener_shutdown.load(Ordering::Acquire) {
                                 break;
                             }
@@ -353,10 +353,25 @@ fn validate_canvas_endpoint(endpoint: &str) -> Result<tauri::Url, String> {
     Ok(url)
 }
 
+/// Frame-agent initialization script for the canvas window. When the Studio
+/// server origin is known, it is injected so the agent can beacon graph state
+/// back to `/api/comfy/canvas/report`.
+fn canvas_agent_script() -> String {
+    match crate::studio_origin_global() {
+        Some(origin) => format!(
+            "window.__LUNERY_STUDIO_ORIGIN = '{}';\n{}",
+            origin,
+            include_str!("comfy_frame_agent.js")
+        ),
+        None => include_str!("comfy_frame_agent.js").to_string(),
+    }
+}
+
 fn open_or_focus_canvas_window(
     app: &tauri::AppHandle,
     url: tauri::Url,
     force_reload: bool,
+    agent_script: &str,
 ) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window(CANVAS_WINDOW_LABEL) {
         // Re-opening the same server must not reload the frontend by default:
@@ -377,7 +392,7 @@ fn open_or_focus_canvas_window(
         .title("ComfyUI Canvas")
         .inner_size(1440.0, 980.0)
         .min_inner_size(1180.0, 760.0)
-        .initialization_script(include_str!("comfy_frame_agent.js"))
+        .initialization_script(agent_script)
         .build()
         .map_err(|err| format!("Could not open the ComfyUI canvas window: {err}"))?;
     Ok(())
@@ -402,10 +417,11 @@ pub(crate) fn comfy_canvas_open(endpoint: &str, reload: bool) -> Result<String, 
 
     let canvas_url = tauri::Url::parse(&canvas_url_string)
         .map_err(|err| format!("Invalid canvas URL: {err}"))?;
+    let agent_script = canvas_agent_script();
     let app = crate::bridge_app_handle().ok_or_else(|| "Desktop shell is not ready".to_string())?;
     let app_for_main = app.clone();
     run_on_main_thread_with(app, move || {
-        open_or_focus_canvas_window(&app_for_main, canvas_url, reload || retargeted)
+        open_or_focus_canvas_window(&app_for_main, canvas_url, reload || retargeted, &agent_script)
     })
     .and_then(|opened| opened)?;
 
@@ -465,6 +481,25 @@ pub(crate) fn comfy_canvas_load(workflow: &serde_json::Value) -> Result<(), Stri
             .map_err(|err| format!("Could not drive the canvas frontend: {err}"))
     })
     .and_then(|loaded| loaded)?;
+    Ok(())
+}
+
+/// Ask the canvas window's frame agent to serialize the live graph and beacon
+/// it to the Studio server (`/api/comfy/canvas/report`). The beacon itself is
+/// asynchronous — callers poll the report cache for the fresh snapshot.
+pub(crate) fn comfy_canvas_report() -> Result<(), String> {
+    let app = crate::bridge_app_handle().ok_or_else(|| "Desktop shell is not ready".to_string())?;
+    const SCRIPT: &str = "(function(){var h=window.__luneryComfyHost;if(!h||typeof h.reportState!=='function'){return 'agent-missing';}h.reportState();return 'ok';})()";
+    let app_for_main = app.clone();
+    run_on_main_thread_with(app, move || {
+        let window = app_for_main
+            .get_webview_window(CANVAS_WINDOW_LABEL)
+            .ok_or_else(|| "The ComfyUI canvas window is not open".to_string())?;
+        window
+            .eval(SCRIPT)
+            .map_err(|err| format!("Could not drive the canvas frontend: {err}"))
+    })
+    .and_then(|triggered| triggered)?;
     Ok(())
 }
 

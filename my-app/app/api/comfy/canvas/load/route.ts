@@ -1,13 +1,14 @@
 // Load an API-format workflow into the native ComfyUI canvas window's official
 // frontend. Used by the Studio so a running job's graph shows up on the canvas
-// with live node highlighting.
+// with live node highlighting, and by the agent's edit_graph tool.
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { requireDesktopBridge, proxyToBridge } from "@/lib/server/desktop-bridge";
+import { requireDesktopBridge } from "@/lib/server/desktop-bridge";
 import { parseJsonBody } from "@/lib/server/http-validation";
 import { jsonError } from "@/lib/server/errors";
 import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
+import { loadWorkflowOnCanvas } from "@/lib/server/comfy-agent/canvas-bridge";
 
 export const dynamic = "force-dynamic";
 
@@ -22,10 +23,8 @@ export async function POST(request: NextRequest) {
     await ensureWorkspaceRestoreReconciled();
 
     const body = await parseJsonBody(request, canvasLoadSchema);
-    return proxyToBridge(bridge, "/comfy-canvas-load", {
-      method: "POST",
-      body: JSON.stringify({ workflow: body.workflow }),
-    });
+    await loadWorkflowOnCanvas(bridge, body.workflow);
+    return NextResponse.json({ ok: true });
   } catch (error) {
     return jsonError(error);
   }

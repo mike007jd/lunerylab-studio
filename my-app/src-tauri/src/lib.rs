@@ -366,6 +366,14 @@ pub(crate) fn bridge_app_handle() -> Option<&'static AppHandle> {
     BRIDGE_APP_HANDLE.get()
 }
 
+/// Process-global Studio server origin ("http://127.0.0.1:<port>"). The canvas
+/// window's injected agent beacons graph state to it; set during runtime boot
+/// on both dev and production paths.
+static STUDIO_ORIGIN_GLOBAL: OnceLock<String> = OnceLock::new();
+pub(crate) fn studio_origin_global() -> Option<&'static String> {
+    STUDIO_ORIGIN_GLOBAL.get()
+}
+
 #[derive(Serialize)]
 struct DesktopRuntimeStatus {
     app: &'static str,
@@ -1688,6 +1696,7 @@ fn boot_desktop_runtime_inner(app: &AppHandle, download_state: &Arc<DownloadStat
             if !state.lifecycle_is_current(epoch) {
                 return;
             }
+            let _ = STUDIO_ORIGIN_GLOBAL.set(runtime.url.clone());
             if let Err(err) = navigate_and_show(app, &format!("{}/studio", runtime.url)) {
                 eprintln!("Desktop Studio navigation failed: {err}");
                 if state.lifecycle_is_current(epoch) {

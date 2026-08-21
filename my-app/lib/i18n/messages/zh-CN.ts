@@ -95,7 +95,24 @@ const zhCN = {
     "syncedAt": "同步时间",
     "models": "模型",
     "modelCount": "{count} 个文件",
-    "noModels": "此服务器上未发现模型。"
+    "noModels": "此服务器上未发现模型。",
+    "agent": {
+      "title": "Luna · Comfy",
+      "subtitle": "读取并编辑你的实时节点图",
+      "thinking": "处理中…",
+      "ready": "就绪",
+      "welcome": "向 Luna 询问你的 ComfyUI 节点图",
+      "welcomeHint": "她能读取画布、编辑节点图、排队执行，并在你的服务器上安装节点。",
+      "placeholder": "给 Luna 发消息…",
+      "send": "发送",
+      "stop": "停止",
+      "stopped": "已停止。",
+      "retry": "重试",
+      "chipObserve": "现在画布上有什么？",
+      "chipEditPrompt": "把正向提示词改成破晓时分的雪山",
+      "chipRun": "把当前节点图排队执行",
+      "chipModels": "列出服务器上的检查点模型"
+    }
   },
   "shell": {
     "navigationTitle": "导航",

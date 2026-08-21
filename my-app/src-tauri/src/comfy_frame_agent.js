@@ -72,6 +72,41 @@
     });
   }
 
+  // Serialize the live graph and beacon it to the Studio server so the ComfyUI
+  // agent can read what the user is editing. The Studio origin is injected by
+  // the desktop bridge when the canvas window is created. Failures are silent:
+  // a missed beacon only means the agent sees an older snapshot.
+  function reportState() {
+    var target = findApp();
+    var origin = window.__LUNERY_STUDIO_ORIGIN;
+    if (!target || typeof target.graphToPrompt !== "function" || !origin) {
+      return Promise.resolve(false);
+    }
+    return Promise.resolve()
+      .then(function () {
+        return target.graphToPrompt();
+      })
+      .then(function (result) {
+        var payload = { prompt: result && result.output ? result.output : result };
+        if (result && result.workflow) payload.workflow = result.workflow;
+        return fetch(origin + "/api/comfy/canvas/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }).then(
+          function (response) {
+            return response.ok;
+          },
+          function () {
+            return false;
+          },
+        );
+      })
+      .catch(function () {
+        return false;
+      });
+  }
+
   var attached = false;
   function attach(app) {
     if (attached) return;
@@ -82,6 +117,7 @@
       window.__luneryComfyHost = {
         ready: true,
         loadApiJson: loadApiJson,
+        reportState: reportState,
       };
       return;
     }
