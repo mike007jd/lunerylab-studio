@@ -68,6 +68,33 @@ function readLatestUserMessage(messages: unknown): string | null {
   return null;
 }
 
+const MAX_HISTORY_MESSAGES = 20;
+
+interface ModelMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/**
+ * Convert the client's UIMessage history to plain model messages so follow-ups
+ * ("make that stronger", "yes, run it") keep the prior workflow and intent.
+ * Only text is carried — the UI-only data parts (step/error/backend) are
+ * dropped — and the tail is capped to bound the prompt.
+ */
+function readConversation(messages: unknown): ModelMessage[] {
+  if (!Array.isArray(messages)) return [];
+  const history: ModelMessage[] = [];
+  for (const raw of messages) {
+    const message = raw as { role?: unknown; parts?: unknown };
+    if ((message?.role !== "user" && message?.role !== "assistant") || !Array.isArray(message.parts)) {
+      continue;
+    }
+    const content = message.parts.map(readTextPart).join("").trim();
+    if (content) history.push({ role: message.role, content });
+  }
+  return history.slice(-MAX_HISTORY_MESSAGES);
+}
+
 export async function POST(request: Request) {
   try {
     const bridge = requireDesktopBridge();
@@ -77,6 +104,7 @@ export async function POST(request: Request) {
 
     const body = await parseJsonBody(request, agentBodySchema);
     const userText = readLatestUserMessage(body.messages);
+    const conversation = readConversation(body.messages);
     if (!userText) {
       throw new ApiError({
         status: 400,
@@ -147,7 +175,8 @@ export async function POST(request: Request) {
     const result = streamText({
       model,
       system: buildComfyAgentSystemPrompt({ locale, connectionName: connection.name }),
-      prompt: userText,
+      messages:
+        conversation.length > 0 ? conversation : [{ role: "user", content: userText }],
       tools: buildComfyAgentToolset(toolContext),
       stopWhen: stepCountIs(MAX_STEPS),
       temperature: 0.3,

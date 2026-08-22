@@ -29,9 +29,17 @@ const RELAY_PORT_RANGE: std::ops::RangeInclusive<u16> = 8189..=8199;
 struct ForwardTarget {
     host: String,
     port: u16,
+    /// Address the relay actually dials. When the Studio passes the DNS-pinned
+    /// IP it validated, the relay connects to that exact address instead of
+    /// re-resolving the hostname — re-resolution would reopen the DNS-rebinding
+    /// path the endpoint validator explicitly closed.
+    connect_host: String,
 }
 
-fn parse_http_forward_target(endpoint: &str) -> Result<ForwardTarget, String> {
+fn parse_http_forward_target(
+    endpoint: &str,
+    pinned_address: Option<&str>,
+) -> Result<ForwardTarget, String> {
     let url =
         tauri::Url::parse(endpoint).map_err(|_| "Invalid ComfyUI endpoint URL".to_string())?;
     if url.scheme() != "http" {
@@ -50,10 +58,15 @@ fn parse_http_forward_target(endpoint: &str) -> Result<ForwardTarget, String> {
         .ok_or_else(|| "ComfyUI endpoint is missing a host".to_string())?;
     // The url crate already strips IPv6 brackets; trim defensively anyway so a
     // literal bracketed host can never reach TcpStream::connect.
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let connect_host = match pinned_address {
+        Some(address) if !address.trim().is_empty() => address.trim().to_string(),
+        _ => host.clone(),
+    };
     Ok(ForwardTarget {
-        host: host.to_string(),
+        host,
         port: url.port_or_known_default().unwrap_or(80),
+        connect_host,
     })
 }
 
@@ -82,17 +95,22 @@ impl ComfyCanvasRelay {
     /// Ensure the relay forwards to `endpoint`. Returns `(loopback port,
     /// retargeted)` — `retargeted` is true when the upstream changed and live
     /// pipes were force-closed.
-    pub(crate) fn ensure_target(&self, endpoint: &str) -> Result<(u16, bool), String> {
+    pub(crate) fn ensure_target(
+        &self,
+        endpoint: &str,
+        pinned_address: Option<&str>,
+    ) -> Result<(u16, bool), String> {
         let ports: Vec<u16> = RELAY_PORT_RANGE.collect();
-        self.ensure_target_on_ports(endpoint, &ports)
+        self.ensure_target_on_ports(endpoint, pinned_address, &ports)
     }
 
     fn ensure_target_on_ports(
         &self,
         endpoint: &str,
+        pinned_address: Option<&str>,
         ports: &[u16],
     ) -> Result<(u16, bool), String> {
-        let target = parse_http_forward_target(endpoint)?;
+        let target = parse_http_forward_target(endpoint, pinned_address)?;
         let mut guard = self
             .active
             .lock()
@@ -103,8 +121,10 @@ impl ComfyCanvasRelay {
                 .target
                 .lock()
                 .map_err(|_| "ComfyUI canvas relay target is poisoned".to_string())?;
+            // Compares host, port, and the pinned connect address, so a hostname
+            // that re-resolves to a new IP is treated as a retarget and repinned.
             let changed = match current.as_ref() {
-                Some(existing) => existing.host != target.host || existing.port != target.port,
+                Some(existing) => existing != &target,
                 None => true,
             };
             if changed {
@@ -271,7 +291,7 @@ fn handle_relay_connection(
             .ok()
             .and_then(|guard| guard.clone())
             .ok_or_else(|| std::io::Error::other("relay has no upstream target"))?;
-        let mut upstream = TcpStream::connect((snapshot.host.as_str(), snapshot.port))?;
+        let mut upstream = TcpStream::connect((snapshot.connect_host.as_str(), snapshot.port))?;
         let _ = client.set_nodelay(true);
         let _ = upstream.set_nodelay(true);
 
@@ -367,6 +387,33 @@ fn canvas_agent_script() -> String {
     }
 }
 
+/// After a runtime restart (packaged workspace reset boots a new server on a new
+/// port) the Studio origin changes. Push the refreshed origin into an already-
+/// open canvas so its agent keeps beaconing to the live server; fresh opens pick
+/// it up through `canvas_agent_script`. Best-effort and non-blocking: a missing
+/// origin/window is a no-op, and the eval is queued rather than awaited so it is
+/// safe to call from the boot path regardless of the current thread.
+pub(crate) fn refresh_canvas_agent_origin() {
+    let Some(origin) = crate::studio_origin_global() else {
+        return;
+    };
+    // The origin is our own loopback runtime URL; refuse to splice anything that
+    // could break out of the single-quoted eval string.
+    if origin.contains('\'') || origin.contains('\\') || origin.contains('\n') {
+        return;
+    }
+    let Some(app) = crate::bridge_app_handle() else {
+        return;
+    };
+    let script = format!("window.__LUNERY_STUDIO_ORIGIN='{origin}';");
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = app_handle.get_webview_window(CANVAS_WINDOW_LABEL) {
+            let _ = window.eval(&script);
+        }
+    });
+}
+
 fn open_or_focus_canvas_window(
     app: &tauri::AppHandle,
     url: tauri::Url,
@@ -401,7 +448,11 @@ fn open_or_focus_canvas_window(
 /// Open (or focus) the native ComfyUI canvas window for `endpoint`.
 /// `reload` forces a fresh page load of an already-open canvas (explicit user
 /// action or a server restart). Returns the JSON bridge response payload.
-pub(crate) fn comfy_canvas_open(endpoint: &str, reload: bool) -> Result<String, String> {
+pub(crate) fn comfy_canvas_open(
+    endpoint: &str,
+    reload: bool,
+    pinned_address: Option<&str>,
+) -> Result<String, String> {
     let url = validate_canvas_endpoint(endpoint)?;
     // Https remotes are loaded directly: TLS is addressed to the real hostname,
     // so a loopback relay cannot sit in front of them.
@@ -411,7 +462,8 @@ pub(crate) fn comfy_canvas_open(endpoint: &str, reload: bool) -> Result<String, 
         // A relay retarget means the upstream server changed — the open page
         // would keep talking to the old one, so the window must navigate even
         // though its loopback URL is unchanged.
-        let (relay_port, retargeted) = comfy_canvas_relay().ensure_target(endpoint)?;
+        let (relay_port, retargeted) =
+            comfy_canvas_relay().ensure_target(endpoint, pinned_address)?;
         (format!("http://127.0.0.1:{relay_port}"), retargeted)
     };
 
@@ -461,27 +513,93 @@ pub(crate) fn comfy_canvas_status_json() -> Result<String, String> {
         .map_err(|err| format!("Could not encode canvas status: {err}"))
 }
 
+/// Evaluate `script` on the canvas window and return the WebView's
+/// JSON-serialized result string. Bounded wait via a channel: the callback fires
+/// on the main-thread event loop, so the worker that called this blocks on the
+/// receiver instead of the main thread.
+fn eval_canvas_string(
+    app: &tauri::AppHandle,
+    script: String,
+    timeout: Duration,
+) -> Result<String, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let app_for_main = app.clone();
+    app.run_on_main_thread(move || {
+        match app_for_main.get_webview_window(CANVAS_WINDOW_LABEL) {
+            Some(window) => {
+                let cb_tx = tx.clone();
+                if let Err(err) = window.eval_with_callback(script, move |result| {
+                    let _ = cb_tx.send(Ok(result));
+                }) {
+                    let _ = tx.send(Err(format!("Could not drive the canvas frontend: {err}")));
+                }
+            }
+            None => {
+                let _ = tx.send(Err("The ComfyUI canvas window is not open".to_string()));
+            }
+        }
+    })
+    .map_err(|err| format!("Could not schedule canvas window work: {err}"))?;
+    rx.recv_timeout(timeout)
+        .map_err(|_| "The canvas did not respond in time.".to_string())?
+}
+
 /// Load an API-format workflow into the canvas window's official frontend via
-/// the injected frame agent (`window.__luneryComfyHost`). Fire-and-forget on
-/// the page side: load errors surface inside the ComfyUI UI itself.
+/// the injected frame agent (`window.__luneryComfyHost.loadApiObject`), and
+/// return only after the load truly settles. The WebView eval cannot await the
+/// load Promise, so the page records the outcome on `window.__luneryComfyLoad`
+/// and this polls it — a missing agent or a rejected load surfaces as an error
+/// instead of a false success.
 pub(crate) fn comfy_canvas_load(workflow: &serde_json::Value) -> Result<(), String> {
     let app = crate::bridge_app_handle().ok_or_else(|| "Desktop shell is not ready".to_string())?;
+    // The workflow is passed as a JS object literal straight to loadApiObject —
+    // no JSON.parse on the page, so no double-encoding.
     let payload = serde_json::to_string(workflow)
         .map_err(|err| format!("Could not serialize the workflow: {err}"))?;
-    let script = format!(
-        "(function(){{var h=window.__luneryComfyHost;if(!h||typeof h.loadApiJson!=='function'){{return 'agent-missing';}}try{{h.loadApiJson({payload});return 'ok';}}catch(err){{return 'load-failed';}}}})()"
+    let start = format!(
+        "(function(){{var h=window.__luneryComfyHost;if(!h||typeof h.loadApiObject!=='function'){{window.__luneryComfyLoad={{status:'agent-missing'}};return 'agent-missing';}}try{{h.loadApiObject({payload});return 'pending';}}catch(err){{window.__luneryComfyLoad={{status:'error',message:(err&&err.message)?String(err.message):'load-failed'}};return 'error';}}}})()"
     );
-    let app_for_main = app.clone();
-    run_on_main_thread_with(app, move || {
-        let window = app_for_main
-            .get_webview_window(CANVAS_WINDOW_LABEL)
-            .ok_or_else(|| "The ComfyUI canvas window is not open".to_string())?;
-        window
-            .eval(&script)
-            .map_err(|err| format!("Could not drive the canvas frontend: {err}"))
-    })
-    .and_then(|loaded| loaded)?;
-    Ok(())
+    // Bound the whole load (start eval + polling) under the Studio-side proxy
+    // timeout (10s) so the caller sees this specific error, not a generic bridge
+    // timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    let started = eval_canvas_string(&app, start, Duration::from_secs(3))?;
+    if started.trim().trim_matches('"') == "agent-missing" {
+        return Err("The ComfyUI canvas window is not ready to receive the workflow.".to_string());
+    }
+
+    // Poll the recorded outcome until it settles. loadApiJson validates node
+    // types against object_info, so allow a short window before giving up.
+    let read = "JSON.stringify(window.__luneryComfyLoad||{status:'unknown'})".to_string();
+    loop {
+        std::thread::sleep(Duration::from_millis(120));
+        let raw = eval_canvas_string(&app, read.clone(), Duration::from_secs(5))?;
+        // `raw` is the WebView's JSON-encoding of a JSON string; decode once to
+        // the inner text, then read the status field.
+        let inner = serde_json::from_str::<String>(&raw).unwrap_or_else(|_| raw.clone());
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&inner) {
+            match value.get("status").and_then(|status| status.as_str()) {
+                Some("ok") => return Ok(()),
+                Some("agent-missing") => {
+                    return Err(
+                        "The ComfyUI canvas window is not ready to receive the workflow."
+                            .to_string(),
+                    );
+                }
+                Some("error") => {
+                    let message = value
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .unwrap_or("load-failed");
+                    return Err(format!("The canvas rejected the workflow: {message}"));
+                }
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("The canvas did not confirm the workflow load in time.".to_string());
+        }
+    }
 }
 
 /// Ask the canvas window's frame agent to serialize the live graph and beacon
@@ -515,7 +633,7 @@ mod tests {
     use std::thread;
 
     fn parse(value: &str) -> Result<ForwardTarget, String> {
-        parse_http_forward_target(value)
+        parse_http_forward_target(value, None)
     }
 
     #[test]
@@ -533,6 +651,49 @@ mod tests {
         assert!(parse("https://comfy.example.com").is_err());
         assert!(parse("http://user:pass@192.168.1.5:8188").is_err());
         assert!(parse("not a url").is_err());
+    }
+
+    #[test]
+    fn pins_the_connect_address_when_one_is_supplied() {
+        // Without a pin the relay dials the hostname (legacy behavior).
+        let unpinned = parse_http_forward_target("http://comfy.internal:8188", None).expect("valid");
+        assert_eq!(unpinned.host, "comfy.internal");
+        assert_eq!(unpinned.connect_host, "comfy.internal");
+
+        // With a pin the relay dials the validated address, never re-resolving.
+        let pinned = parse_http_forward_target("http://comfy.internal:8188", Some("192.168.1.50"))
+            .expect("valid");
+        assert_eq!(pinned.host, "comfy.internal");
+        assert_eq!(pinned.connect_host, "192.168.1.50");
+    }
+
+    #[test]
+    fn dials_the_pinned_address_not_the_hostname() {
+        // The hostname is deliberately unresolvable; only the pinned loopback
+        // address can reach the echo server, proving the relay dials the pinned
+        // address and never re-resolves the hostname itself.
+        let upstream_port = spawn_echo_server();
+        let relay = ComfyCanvasRelay::default();
+        let listen_port = relay
+            .ensure_target_on_ports(
+                &format!("http://comfy.invalid:{upstream_port}"),
+                Some("127.0.0.1"),
+                &[23893],
+            )
+            .expect("relay starts")
+            .0;
+
+        let mut client = TcpStream::connect(("127.0.0.1", listen_port)).expect("connect relay");
+        let request = b"GET /system_stats HTTP/1.1\r\n\r\n";
+        client.write_all(request).expect("write");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut echoed = vec![0_u8; request.len()];
+        client.read_exact(&mut echoed).expect("echoed response");
+        assert_eq!(echoed.as_slice(), request.as_slice());
+
+        relay.stop();
     }
 
     /// Accept connections and echo every byte back until the peer closes.
@@ -587,7 +748,7 @@ mod tests {
         let upstream_port = spawn_echo_server();
         let relay = ComfyCanvasRelay::default();
         let listen_port = relay
-            .ensure_target_on_ports(&format!("http://127.0.0.1:{upstream_port}"), &[23891])
+            .ensure_target_on_ports(&format!("http://127.0.0.1:{upstream_port}"), None, &[23891])
             .expect("relay starts")
             .0;
         assert_eq!(listen_port, 23891);
@@ -611,7 +772,7 @@ mod tests {
         let (second_port, _second_accepted) = spawn_holding_server();
         let relay = ComfyCanvasRelay::default();
         let listen_port = relay
-            .ensure_target_on_ports(&format!("http://127.0.0.1:{first_port}"), &[23892])
+            .ensure_target_on_ports(&format!("http://127.0.0.1:{first_port}"), None, &[23892])
             .expect("relay starts")
             .0;
 
@@ -634,14 +795,14 @@ mod tests {
 
         // Same target: no disconnect.
         let same = relay
-            .ensure_target_on_ports(&format!("http://127.0.0.1:{first_port}"), &[23892])
+            .ensure_target_on_ports(&format!("http://127.0.0.1:{first_port}"), None, &[23892])
             .expect("same target");
         assert_eq!(same, (listen_port, false));
 
         // New target: the live pipe must be torn down promptly (EOF or reset —
         // anything but a silent open socket timing out).
         let retargeted = relay
-            .ensure_target_on_ports(&format!("http://127.0.0.1:{second_port}"), &[23892])
+            .ensure_target_on_ports(&format!("http://127.0.0.1:{second_port}"), None, &[23892])
             .expect("retarget");
         assert_eq!(retargeted, (listen_port, true));
         let started = std::time::Instant::now();
@@ -671,6 +832,7 @@ mod tests {
         let listen_port = relay
             .ensure_target_on_ports(
                 &format!("http://127.0.0.1:{upstream_port}"),
+                None,
                 &[21890, 21891],
             )
             .expect("relay starts")
@@ -686,7 +848,7 @@ mod tests {
         let relay = ComfyCanvasRelay::default();
         assert!(relay.status().is_none());
         relay
-            .ensure_target_on_ports(&format!("http://127.0.0.1:{upstream_port}"), &[22890])
+            .ensure_target_on_ports(&format!("http://127.0.0.1:{upstream_port}"), None, &[22890])
             .expect("relay starts");
         let (port, target) = relay.status().expect("status after start");
         assert_eq!(port, 22890);

@@ -180,9 +180,14 @@ export async function saveComfyConnection(input: {
           ...existing,
           name: input.name,
           endpoint: input.endpoint,
-          ...(sshStart ? { sshStart } : {}),
           updatedAt: now,
         };
+        // The save form always submits the complete intended state, so an
+        // absent sshStart means the user turned SSH start off — clear the
+        // stored pair instead of leaving a Start action the form no longer
+        // shows.
+        if (sshStart) updated.sshStart = sshStart;
+        else delete updated.sshStart;
         // Endpoint changed → the old sync snapshot describes another server.
         if (existing.endpoint !== input.endpoint) delete updated.lastSync;
         const next = {

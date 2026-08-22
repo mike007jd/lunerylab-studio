@@ -23,12 +23,30 @@ export interface ComfyCanvasReport {
 }
 
 const CACHE_KEY = "__luneryComfyCanvasReport" as const;
+const CANVAS_ENDPOINT_KEY = "__luneryComfyCanvasEndpoint" as const;
 
 const reportGlobal = globalThis as typeof globalThis & {
   [CACHE_KEY]?: ComfyCanvasReport | null;
+  [CANVAS_ENDPOINT_KEY]?: string | null;
 };
 
 reportGlobal[CACHE_KEY] = null;
+reportGlobal[CANVAS_ENDPOINT_KEY] = null;
+
+/**
+ * The connection endpoint the canvas window is currently showing. Set when the
+ * canvas is opened/retargeted, cleared when it is closed. This is the source of
+ * truth for which server a beacon belongs to — the active connection can change
+ * (activation) without the canvas navigating, so it must not be used to stamp
+ * reports. Raw stored endpoint, matching the agent's activeEndpointRaw.
+ */
+export function setCurrentCanvasEndpoint(endpoint: string | null): void {
+  reportGlobal[CANVAS_ENDPOINT_KEY] = endpoint;
+}
+
+export function getCurrentCanvasEndpoint(): string | null {
+  return reportGlobal[CANVAS_ENDPOINT_KEY] ?? null;
+}
 
 /** A report older than this is treated as absent by readers. */
 export const CANVAS_REPORT_TTL_MS = 30_000;
@@ -67,4 +85,5 @@ export function getComfyCanvasReport(): ComfyCanvasReport | null {
 
 export function resetComfyCanvasReportForTests(): void {
   reportGlobal[CACHE_KEY] = null;
+  reportGlobal[CANVAS_ENDPOINT_KEY] = null;
 }

@@ -72,6 +72,36 @@
     });
   }
 
+  // Load an already-parsed API-format object (the desktop shell passes the
+  // workflow as a JS object, not a JSON string) and record the outcome on
+  // window.__luneryComfyLoad so the shell can read a truthful load result — the
+  // macOS WebView cannot await a returned Promise across the eval boundary.
+  function loadApiObject(workflow) {
+    var target = findApp();
+    if (!target) {
+      window.__luneryComfyLoad = { status: "agent-missing" };
+      return Promise.reject(new Error("frontend-not-ready"));
+    }
+    window.__luneryComfyLoad = { status: "pending" };
+    return Promise.resolve()
+      .then(function () {
+        return target.loadApiJson(workflow);
+      })
+      .then(
+        function () {
+          window.__luneryComfyLoad = { status: "ok" };
+          return true;
+        },
+        function (error) {
+          window.__luneryComfyLoad = {
+            status: "error",
+            message: error && error.message ? String(error.message) : "load-failed",
+          };
+          throw error;
+        },
+      );
+  }
+
   // Serialize the live graph and beacon it to the Studio server so the ComfyUI
   // agent can read what the user is editing. The Studio origin is injected by
   // the desktop bridge when the canvas window is created. Failures are silent:
@@ -117,6 +147,7 @@
       window.__luneryComfyHost = {
         ready: true,
         loadApiJson: loadApiJson,
+        loadApiObject: loadApiObject,
         reportState: reportState,
       };
       return;

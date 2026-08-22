@@ -15,6 +15,30 @@ vi.mock("@/lib/hf-model-catalog", () => ({
   findHfModelEntry: mocks.findHfModelEntry,
 }));
 
+// Generation pins the validated endpoint. Stub validation and route the pinned
+// transport back through global fetch so the per-test fetch stubs still drive it.
+vi.mock("@/lib/server/comfy-endpoint", async (importActual) => {
+  const actual = await importActual<typeof import("@/lib/server/comfy-endpoint")>();
+  return {
+    ...actual,
+    validateComfyEndpoint: vi.fn(async (url: string) => ({
+      url: url.endsWith("/") ? url : `${url}/`,
+      records: [],
+    })),
+  };
+});
+
+vi.mock("@/lib/server/byok-shared", async (importActual) => {
+  const actual = await importActual<typeof import("@/lib/server/byok-shared")>();
+  return {
+    ...actual,
+    createPinnedProviderFetch:
+      () =>
+      (input: URL | RequestInfo, init?: RequestInit): Promise<Response> =>
+        (globalThis.fetch as typeof fetch)(input, init),
+  };
+});
+
 import {
   classifyComfyFamily,
   comfySize,

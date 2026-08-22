@@ -1370,10 +1370,12 @@ fn handle_bridge_request(
                 endpoint: String,
                 #[serde(default)]
                 reload: bool,
+                #[serde(default)]
+                pinned_address: Option<String>,
             }
             match serde_json::from_str::<ComfyCanvasOpenBody>(&body)
                 .map_err(|e| e.to_string())
-                .and_then(|b| comfy_canvas_open(&b.endpoint, b.reload))
+                .and_then(|b| comfy_canvas_open(&b.endpoint, b.reload, b.pinned_address.as_deref()))
             {
                 Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),

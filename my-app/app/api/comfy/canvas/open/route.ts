@@ -15,6 +15,7 @@ import {
   getActiveComfyConnection,
   getComfyConnection,
 } from "@/lib/server/comfy-connection-store";
+import { setCurrentCanvasEndpoint } from "@/lib/server/comfy-canvas-report";
 import { withSharedWorkspaceRead } from "@/lib/server/workspace-operation-gate";
 import { ensureWorkspaceRestoreReconciled } from "@/lib/server/workspace-restore-journal";
 
@@ -48,13 +49,23 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: endpointCheck.error }, { status: 400 });
       }
 
-      return proxyToBridge(bridge, "/comfy-canvas-open", {
+      const opened = await proxyToBridge(bridge, "/comfy-canvas-open", {
         method: "POST",
         body: JSON.stringify({
           endpoint: endpointCheck.url,
+          // Pin the relay to the exact address validation approved so the bridge
+          // never re-resolves the hostname (DNS-rebinding boundary).
+          ...(endpointCheck.records?.[0]?.address
+            ? { pinnedAddress: endpointCheck.records[0].address }
+            : {}),
           ...(body.reload ? { reload: true } : {}),
         }),
       });
+      // Bind graph reports to the connection the canvas now shows (raw stored
+      // endpoint, matching the agent's activeEndpointRaw). Only on success so a
+      // failed open cannot leave a stale binding.
+      if (opened.ok) setCurrentCanvasEndpoint(connection.endpoint);
+      return opened;
     });
   } catch (error) {
     return jsonError(error);

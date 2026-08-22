@@ -10,10 +10,10 @@ import { z } from "zod";
 import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { parseJsonBody } from "@/lib/server/http-validation";
 import {
+  getCurrentCanvasEndpoint,
   isComfyRelayOrigin,
   storeComfyCanvasReport,
 } from "@/lib/server/comfy-canvas-report";
-import { getActiveComfyConnection } from "@/lib/server/comfy-connection-store";
 
 export const dynamic = "force-dynamic";
 
@@ -49,12 +49,13 @@ export async function POST(request: NextRequest) {
   }
   try {
     const body = await parseJsonBody(request, canvasReportSchema);
-    // Stamp the report with the connection that is active right now so a reader
+    // Stamp the report with the connection the canvas is actually showing (set
+    // at open/retarget time) — never the merely-active connection — so a reader
     // can reject a graph that belongs to a different attached server.
     storeComfyCanvasReport({
       prompt: body.prompt,
       workflow: body.workflow,
-      connectionEndpoint: getActiveComfyConnection()?.endpoint,
+      connectionEndpoint: getCurrentCanvasEndpoint() ?? undefined,
     });
     return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
   } catch {

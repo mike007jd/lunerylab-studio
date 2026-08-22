@@ -1,9 +1,11 @@
-// Pinned-fetch client for the attached ComfyUI server and its Manager plugin.
+// Pinned-fetch client for the attached ComfyUI server.
 //
 // Every request goes to the already-validated active endpoint through the
-// DNS-pinned transport. Manager routes are best-effort: deployments without
-// ComfyUI-Manager answer 404, which the agent surfaces as "not available"
-// instead of an error.
+// DNS-pinned transport. Server-mutating Manager operations (install/reboot)
+// are intentionally not exposed here: their current contract needs versioned
+// package metadata plus a separate queue-start step, and they require a
+// deterministic authorization the agent cannot provide, so they are out of
+// scope until both are in place.
 
 import "server-only";
 import {
@@ -70,91 +72,6 @@ export async function queueComfyPrompt(
     throw new Error("ComfyUI did not return a prompt id.");
   }
   return promptId;
-}
-
-const MANAGER_INSTALLED_PATHS = ["customnode/installed", "api/customnode/installed"];
-const MANAGER_INSTALL_PATHS = ["api/manager/queue/install", "manager/queue/install"];
-const MANAGER_REBOOT_PATHS = ["api/manager/reboot", "manager/reboot"];
-
-function extractNodeNames(json: unknown): string[] {
-  const list = Array.isArray(json)
-    ? json
-    : json && typeof json === "object" && Array.isArray((json as Record<string, unknown>).custom_nodes)
-      ? ((json as Record<string, unknown>).custom_nodes as unknown[])
-      : [];
-  const names: string[] = [];
-  for (const entry of list) {
-    if (!entry || typeof entry !== "object") continue;
-    const record = entry as Record<string, unknown>;
-    const name =
-      typeof record.name === "string"
-        ? record.name
-        : typeof record.title === "string"
-          ? record.title
-          : typeof record.cnr_id === "string"
-            ? record.cnr_id
-            : null;
-    if (name) names.push(name);
-  }
-  return names;
-}
-
-export interface ManagerNodeList {
-  available: boolean;
-  nodes: string[];
-}
-
-export async function listManagerCustomNodes(
-  endpoint: ValidatedComfyEndpoint,
-): Promise<ManagerNodeList> {
-  for (const path of MANAGER_INSTALLED_PATHS) {
-    const response = await comfyRequest(endpoint, path, { timeoutMs: 8_000 });
-    if (response.ok && response.json !== null) {
-      return { available: true, nodes: extractNodeNames(response.json) };
-    }
-  }
-  return { available: false, nodes: [] };
-}
-
-export async function installManagerCustomNode(
-  endpoint: ValidatedComfyEndpoint,
-  name: string,
-): Promise<{ ok: boolean; detail: string }> {
-  for (const path of MANAGER_INSTALL_PATHS) {
-    const response = await comfyRequest(endpoint, path, {
-      method: "POST",
-      body: { name },
-      timeoutMs: 30_000,
-    });
-    if (response.status === 404) continue;
-    if (response.ok) {
-      return { ok: true, detail: "Install queued on the server (download runs in its background)." };
-    }
-    return {
-      ok: false,
-      detail: `Manager refused the install (HTTP ${response.status}).`,
-    };
-  }
-  return { ok: false, detail: "ComfyUI-Manager is not available on this server." };
-}
-
-export async function rebootViaManager(
-  endpoint: ValidatedComfyEndpoint,
-): Promise<{ ok: boolean; detail: string }> {
-  for (const path of MANAGER_REBOOT_PATHS) {
-    const response = await comfyRequest(endpoint, path, {
-      method: "POST",
-      timeoutMs: 10_000,
-    });
-    if (response.status === 404) continue;
-    return {
-      ok: response.ok,
-      detail: response.ok
-        ? "Reboot requested. The server restarts in the background; test the connection in a moment."
-        : `Manager refused the reboot (HTTP ${response.status}).`,
-    };
-  }
-  return { ok: false, detail: "ComfyUI-Manager is not available on this server." };
 }
 
 export type { ComfySystemStats };

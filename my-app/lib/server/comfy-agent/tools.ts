@@ -18,12 +18,7 @@ import {
 import { recordComfyJobStarted } from "@/lib/server/comfy-activity";
 import { refreshComfyCanvasReport } from "@/lib/server/comfy-agent/graph-state";
 import { loadWorkflowOnCanvas } from "@/lib/server/comfy-agent/canvas-bridge";
-import {
-  installManagerCustomNode,
-  listManagerCustomNodes,
-  queueComfyPrompt,
-  rebootViaManager,
-} from "@/lib/server/comfy-agent/comfy-client";
+import { queueComfyPrompt } from "@/lib/server/comfy-agent/comfy-client";
 
 export interface ComfyAgentToolContext {
   bridge: DesktopBridge;
@@ -75,6 +70,82 @@ function extractPromptText(workflow: Record<string, unknown>): string {
   return "";
 }
 
+// A ComfyUI API-format node. inputs values are literals or a link
+// [sourceNodeId, outputIndex].
+interface ComfyNode {
+  class_type?: string;
+  inputs?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+// An input value the model may set: a literal or a link to another node's
+// output. Kept permissive so any valid ComfyUI value round-trips.
+const linkValue = z.tuple([z.string().min(1), z.number()]);
+const inputValue = z.union([z.string(), z.number(), z.boolean(), linkValue]);
+
+// Targeted edit operations. The model never sends a full workflow — it can only
+// describe changes, which are merged server-side onto the lossless live graph
+// so every untouched node and parameter is preserved verbatim.
+const editOperationSchema = z.discriminatedUnion("op", [
+  z.object({
+    op: z.literal("set_input"),
+    nodeId: z.string().min(1),
+    name: z.string().min(1),
+    value: inputValue,
+  }),
+  z.object({
+    op: z.literal("set_class_type"),
+    nodeId: z.string().min(1),
+    classType: z.string().min(1),
+  }),
+  z.object({
+    op: z.literal("add_node"),
+    nodeId: z.string().min(1),
+    classType: z.string().min(1),
+    inputs: z.record(z.string(), inputValue).optional(),
+  }),
+  z.object({ op: z.literal("remove_node"), nodeId: z.string().min(1) }),
+]);
+
+type EditOperation = z.infer<typeof editOperationSchema>;
+
+/**
+ * Apply targeted edit operations to a full API-format graph in place. Throws a
+ * model-facing message when an operation references a node that does not exist
+ * (or re-adds one that does), so a stale observation cannot silently corrupt or
+ * delete the graph.
+ */
+function applyGraphOperations(
+  graph: Record<string, ComfyNode>,
+  operations: EditOperation[],
+): void {
+  for (const op of operations) {
+    if (op.op === "add_node") {
+      if (graph[op.nodeId]) {
+        throw new Error(
+          `Node "${op.nodeId}" already exists — edit it with set_input/set_class_type instead of add_node.`,
+        );
+      }
+      graph[op.nodeId] = { class_type: op.classType, inputs: op.inputs ?? {} };
+      continue;
+    }
+    const node = graph[op.nodeId];
+    if (!node) {
+      throw new Error(
+        `Node "${op.nodeId}" is not in the graph — call observe_graph again for current node ids.`,
+      );
+    }
+    if (op.op === "remove_node") {
+      delete graph[op.nodeId];
+    } else if (op.op === "set_class_type") {
+      node.class_type = op.classType;
+    } else {
+      if (!node.inputs || typeof node.inputs !== "object") node.inputs = {};
+      (node.inputs as Record<string, unknown>)[op.name] = op.value;
+    }
+  }
+}
+
 export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
   return {
     observe_graph: tool({
@@ -111,49 +182,62 @@ export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
 
     edit_graph: tool({
       description:
-        "Replace the canvas graph with a modified API-format workflow. Submit the COMPLETE workflow; unrelated nodes must be preserved verbatim.",
+        "Edit the canvas graph with targeted operations (set_input, set_class_type, add_node, remove_node). Never send a whole workflow — describe only what changes; every other node and parameter is preserved exactly. Call observe_graph first for current node ids and class_types.",
       inputSchema: z.object({
-        workflow: z.record(
-          z.string(),
-          z.object({
-            class_type: z.string().min(1),
-            inputs: z.record(z.string(), z.unknown()).optional(),
-            _meta: z.unknown().optional(),
-          }),
-        ),
+        operations: z.array(editOperationSchema).min(1).max(50),
       }),
-      execute: async ({ workflow }) => {
-        ctx.recordStep("Applying the edited graph", "edit_graph");
+      execute: async ({ operations }) => {
+        ctx.recordStep("Reading the live graph to edit", "edit_graph");
+        // Merge onto the lossless full graph, not the truncated observation, so
+        // untouched nodes and long inputs survive verbatim.
+        const report = await refreshComfyCanvasReport(ctx.bridge, ctx.activeEndpointRaw);
+        if (!report) {
+          return {
+            ok: false,
+            error:
+              "The canvas window is not open or did not report its graph. Ask the user to click 'Open canvas'.",
+          };
+        }
+        const graph = structuredClone(report.prompt) as Record<string, ComfyNode>;
         try {
-          await loadWorkflowOnCanvas(ctx.bridge, workflow);
+          applyGraphOperations(graph, operations);
+        } catch (error) {
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : "The edit could not be applied.",
+          };
+        }
+        try {
+          await loadWorkflowOnCanvas(ctx.bridge, graph);
         } catch (error) {
           return {
             ok: false,
             error:
-              error instanceof Error ? error.message : "The canvas did not accept the workflow.",
+              error instanceof Error ? error.message : "The canvas did not accept the edit.",
           };
         }
-        ctx.recordStep(`Loaded ${Object.keys(workflow).length} nodes onto the canvas`, "edit_graph");
-        return { ok: true, nodeCount: Object.keys(workflow).length };
+        ctx.recordStep(
+          `Applied ${operations.length} edit(s); graph has ${Object.keys(graph).length} nodes`,
+          "edit_graph",
+        );
+        return { ok: true, operations: operations.length, nodeCount: Object.keys(graph).length };
       },
     }),
 
     queue_prompt: tool({
       description:
-        "Queue a workflow on the attached ComfyUI server. Without an argument it queues the graph currently on the canvas. Only call when the user asks to run/generate.",
-      inputSchema: z.object({
-        workflow: z.record(z.string(), z.unknown()).optional(),
-      }),
-      execute: async ({ workflow }) => {
-        let prompt = workflow;
-        if (!prompt) {
-          const report = await refreshComfyCanvasReport(ctx.bridge, ctx.activeEndpointRaw);
-          prompt = report?.prompt;
-        }
+        "Queue the graph currently on the canvas on the attached ComfyUI server. Only call when the user asks to run/generate.",
+      inputSchema: z.object({}).strict(),
+      execute: async () => {
+        // Always queue the live canvas graph (lossless), never a model-supplied
+        // reconstruction that could drop or corrupt nodes.
+        const report = await refreshComfyCanvasReport(ctx.bridge, ctx.activeEndpointRaw);
+        const prompt = report?.prompt;
         if (!prompt || Object.keys(prompt).length === 0) {
           return {
             ok: false,
-            error: "No graph is available to queue. Open the canvas or provide a workflow.",
+            error:
+              "No graph is available to queue. Ask the user to open the canvas and load a workflow first.",
           };
         }
         ctx.recordStep("Queueing the prompt on the server", "queue_prompt");
@@ -210,62 +294,6 @@ export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
           return {
             ok: false,
             error: error instanceof Error ? error.message : "Could not read server stats.",
-          };
-        }
-      },
-    }),
-
-    list_custom_nodes: tool({
-      description:
-        "List custom nodes installed on the server via ComfyUI-Manager. Reports available:false when Manager is absent.",
-      inputSchema: z.object({}).strict(),
-      execute: async () => {
-        ctx.recordStep("Listing installed custom nodes", "list_custom_nodes");
-        try {
-          const result = await listManagerCustomNodes(ctx.endpoint);
-          return { ok: true, managerAvailable: result.available, nodes: result.nodes };
-        } catch (error) {
-          return {
-            ok: false,
-            error: error instanceof Error ? error.message : "Could not list custom nodes.",
-          };
-        }
-      },
-    }),
-
-    install_custom_node: tool({
-      description:
-        "Install a custom node on the server through ComfyUI-Manager. The download runs in the server's background; a reboot may be needed afterwards.",
-      inputSchema: z.object({
-        name: z.string().trim().min(1).max(200),
-      }),
-      execute: async ({ name }) => {
-        ctx.recordStep(`Installing custom node "${name}"`, "install_custom_node");
-        try {
-          const result = await installManagerCustomNode(ctx.endpoint, name);
-          return { ok: result.ok, detail: result.detail };
-        } catch (error) {
-          return {
-            ok: false,
-            error: error instanceof Error ? error.message : "Install failed.",
-          };
-        }
-      },
-    }),
-
-    reboot_server: tool({
-      description:
-        "Reboot the attached ComfyUI server via ComfyUI-Manager (needed after some installs). Ask the user before calling this.",
-      inputSchema: z.object({}).strict(),
-      execute: async () => {
-        ctx.recordStep("Rebooting the server via Manager", "reboot_server");
-        try {
-          const result = await rebootViaManager(ctx.endpoint);
-          return { ok: result.ok, detail: result.detail };
-        } catch (error) {
-          return {
-            ok: false,
-            error: error instanceof Error ? error.message : "Reboot failed.",
           };
         }
       },

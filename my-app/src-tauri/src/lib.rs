@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 #[cfg(not(debug_assertions))]
 use std::time::SystemTime;
@@ -367,11 +367,18 @@ pub(crate) fn bridge_app_handle() -> Option<&'static AppHandle> {
 }
 
 /// Process-global Studio server origin ("http://127.0.0.1:<port>"). The canvas
-/// window's injected agent beacons graph state to it; set during runtime boot
-/// on both dev and production paths.
-static STUDIO_ORIGIN_GLOBAL: OnceLock<String> = OnceLock::new();
-pub(crate) fn studio_origin_global() -> Option<&'static String> {
-    STUDIO_ORIGIN_GLOBAL.get()
+/// window's injected agent beacons graph state to it; refreshed on every runtime
+/// boot (dev and production) because a packaged workspace reset restarts the
+/// owned server on a new random port — a write-once cell would pin the dead
+/// pre-reset origin.
+static STUDIO_ORIGIN_GLOBAL: RwLock<Option<String>> = RwLock::new(None);
+pub(crate) fn set_studio_origin_global(origin: &str) {
+    if let Ok(mut guard) = STUDIO_ORIGIN_GLOBAL.write() {
+        *guard = Some(origin.to_string());
+    }
+}
+pub(crate) fn studio_origin_global() -> Option<String> {
+    STUDIO_ORIGIN_GLOBAL.read().ok().and_then(|guard| guard.clone())
 }
 
 #[derive(Serialize)]
@@ -1696,7 +1703,10 @@ fn boot_desktop_runtime_inner(app: &AppHandle, download_state: &Arc<DownloadStat
             if !state.lifecycle_is_current(epoch) {
                 return;
             }
-            let _ = STUDIO_ORIGIN_GLOBAL.set(runtime.url.clone());
+            set_studio_origin_global(&runtime.url);
+            // A canvas open before this reset injected the previous origin; the
+            // next open/reload picks up the refreshed value.
+            crate::comfy_canvas::refresh_canvas_agent_origin();
             if let Err(err) = navigate_and_show(app, &format!("{}/studio", runtime.url)) {
                 eprintln!("Desktop Studio navigation failed: {err}");
                 if state.lifecycle_is_current(epoch) {
