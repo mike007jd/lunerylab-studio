@@ -2,7 +2,7 @@
 // the validation/persistence logic; the workspace UI imports only from here.
 
 export interface ComfySshStart {
-  /** SSH host alias from ~/.ssh.config, e.g. "gmk". Validated by the bridge. */
+  /** SSH host alias from ~/.ssh/config, e.g. "comfy-box". Validated by the bridge. */
   hostAlias: string;
   /** Remote command that starts ComfyUI on that host, e.g. "~/ai/comfy start". */
   command: string;
