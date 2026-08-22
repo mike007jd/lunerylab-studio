@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
   listByokConnectionMeta: vi.fn(),
   isKnownLocalImageModelId: vi.fn(),
   resolveInstalledSdCppImageModel: vi.fn(),
+  getAttachedComfyConnection: vi.fn(),
+  probeComfyReachable: vi.fn(),
 }));
 
 vi.mock("@/lib/desktop-runtime", () => ({
@@ -20,6 +22,11 @@ vi.mock("@/lib/server/local-image-model-catalog", () => ({
 
 vi.mock("@/lib/server/byok-connection-store", () => ({
   listByokConnectionMeta: mocks.listByokConnectionMeta,
+}));
+
+vi.mock("@/lib/server/comfy-runtime", () => ({
+  getAttachedComfyConnection: mocks.getAttachedComfyConnection,
+  probeComfyReachable: mocks.probeComfyReachable,
 }));
 
 vi.mock("@/lib/server/byok-shared", () => ({
@@ -38,6 +45,9 @@ describe("resolveTextRuntimeSupply", () => {
     vi.clearAllMocks();
     process.env.LUNERY_DESKTOP_BRIDGE_URL = "http://127.0.0.1:49100";
     process.env.LUNERY_DESKTOP_BRIDGE_TOKEN = "test-token";
+    // No attached ComfyUI connection by default: these tests exercise the
+    // zero-config loopback autodetection path.
+    mocks.getAttachedComfyConnection.mockReturnValue(undefined);
     mocks.listByokConnectionMeta.mockReturnValue({});
     mocks.fetchDesktopStatusSnapshot.mockResolvedValue({
       providers: [],
@@ -214,5 +224,40 @@ describe("resolveTextRuntimeSupply", () => {
       sdCpp: false,
       comfyUi: true,
     });
+  });
+
+  it("probes only the attached ComfyUI connection when one is configured", async () => {
+    const attached = {
+      id: "gmk",
+      name: "gmk",
+      endpoint: "http://100.120.182.80:8188",
+      createdAt: "2026-08-21T00:00:00.000Z",
+      updatedAt: "2026-08-21T00:00:00.000Z",
+    };
+    mocks.fetchDesktopStatusSnapshot.mockResolvedValue({
+      providers: [],
+      local_runtimes: [],
+    });
+    mocks.getAttachedComfyConnection.mockReturnValue(attached);
+
+    // Attached and reachable → comfy available, and the zero-config loopback
+    // probe is never consulted.
+    mocks.probeComfyReachable.mockResolvedValue(true);
+    const fetchSpy = vi.fn(async () => new Response("not found", { status: 404 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    await expect(resolveLocalImageRuntimeAvailability()).resolves.toEqual({
+      sdCpp: false,
+      comfyUi: true,
+    });
+    expect(mocks.probeComfyReachable).toHaveBeenCalledWith(attached.endpoint);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Attached but down → comfy is down; no silent loopback fallback.
+    mocks.probeComfyReachable.mockResolvedValue(false);
+    await expect(resolveLocalImageRuntimeAvailability()).resolves.toEqual({
+      sdCpp: false,
+      comfyUi: false,
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

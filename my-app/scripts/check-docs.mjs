@@ -11,6 +11,8 @@ const repoRoot = resolve(appRoot, "..");
 const ignoredDirs = new Set([
   ".git",
   ".next",
+  // Agent-tooling session state (plan drafts etc.), not engineering docs.
+  ".zcode",
   "desktop-dist",
   "desktop-server",
   "engine",

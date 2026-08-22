@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::comfy_canvas::{
+    comfy_canvas_apply_edits, comfy_canvas_close, comfy_canvas_load, comfy_canvas_open,
+    comfy_canvas_report, comfy_canvas_status_json,
+};
+use crate::comfy_remote::comfy_ssh_start;
 use crate::download::{
     canonical_download_destination, hf_download_start_inner, DownloadCancelRequest, DownloadState,
     JobSnapshot,
@@ -1341,6 +1346,95 @@ fn handle_bridge_request(
                 Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
             }
         }
+        // Remote ComfyUI start — argv-only ssh, no local shell, hard timeout.
+        ("POST", "/comfy-ssh-start") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ComfySshStartBody {
+                host_alias: String,
+                command: String,
+            }
+            match serde_json::from_str::<ComfySshStartBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_ssh_start(&b.host_alias, &b.command))
+            {
+                Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        // ComfyUI canvas — loopback relay target + native canvas window.
+        ("POST", "/comfy-canvas-open") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ComfyCanvasOpenBody {
+                endpoint: String,
+                #[serde(default)]
+                reload: bool,
+                #[serde(default)]
+                pinned_address: Option<String>,
+            }
+            match serde_json::from_str::<ComfyCanvasOpenBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_canvas_open(&b.endpoint, b.reload, b.pinned_address.as_deref()))
+            {
+                Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        ("POST", "/comfy-canvas-close") => match comfy_canvas_close() {
+            Ok(()) => write_http_response(
+                &mut stream,
+                "200 OK",
+                &serde_json::json!({ "ok": true }).to_string(),
+            ),
+            Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+        },
+        ("GET", "/comfy-canvas-status") => match comfy_canvas_status_json() {
+            Ok(payload) => write_http_response(&mut stream, "200 OK", &payload),
+            Err(err) => bridge_error(&mut stream, "500 Internal Server Error", &err),
+        },
+        ("POST", "/comfy-canvas-load") => {
+            #[derive(Deserialize)]
+            struct ComfyCanvasLoadBody {
+                workflow: serde_json::Value,
+            }
+            match serde_json::from_str::<ComfyCanvasLoadBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_canvas_load(&b.workflow))
+            {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "ok": true }).to_string(),
+                ),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        ("POST", "/comfy-canvas-apply-edits") => {
+            #[derive(Deserialize)]
+            struct ComfyCanvasApplyEditsBody {
+                edits: serde_json::Value,
+            }
+            match serde_json::from_str::<ComfyCanvasApplyEditsBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_canvas_apply_edits(&b.edits))
+            {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "ok": true }).to_string(),
+                ),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        ("POST", "/comfy-canvas-report") => match comfy_canvas_report() {
+            Ok(()) => write_http_response(
+                &mut stream,
+                "200 OK",
+                &serde_json::json!({ "ok": true }).to_string(),
+            ),
+            Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+        },
         _ => bridge_error(&mut stream, "404 Not Found", "Unknown desktop bridge route"),
     }
 }

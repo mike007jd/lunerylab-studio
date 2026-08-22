@@ -22,6 +22,7 @@ import type {
 } from "@/lib/types/api";
 import { findByokProvider, type ByokModelRole } from "@/lib/byok-providers";
 import { listByokConnectionMeta } from "@/lib/server/byok-connection-store";
+import { getAttachedComfyConnection, probeComfyReachable } from "@/lib/server/comfy-runtime";
 import {
   fetchConfiguredProviderIds,
   fetchDesktopStatusSnapshot,
@@ -209,6 +210,13 @@ export async function resolveLocalImageRuntimeAvailability(): Promise<LocalImage
   const sdCpp = status.local_runtimes.some(
     (runtime) => runtime.id === "sd-cpp" && runtime.status === "ready",
   );
+  // An attached ComfyUI connection is the explicit user choice: probe it and
+  // only it. Zero-config loopback autodetection applies when nothing is attached.
+  const attachedComfy = getAttachedComfyConnection();
+  if (attachedComfy) {
+    const reachable = await probeComfyReachable(attachedComfy.endpoint).catch(() => false);
+    return { sdCpp, comfyUi: reachable };
+  }
   const comfyUiProbe = await probeEndpoint("http://127.0.0.1:8188").catch(() => null);
   return { sdCpp, comfyUi: Boolean(comfyUiProbe?.reachable) };
 }
@@ -241,6 +249,21 @@ async function tryResolveLocal(
       };
     }
     if (explicitLocalModel && !requestedLocalImageModel) return null;
+    // Attached ComfyUI connection wins: it is the explicit user choice, so a
+    // down server means comfy is down — no silent fallthrough to whatever
+    // ComfyUI happens to run on this machine's loopback.
+    const attachedComfy = getAttachedComfyConnection();
+    if (attachedComfy) {
+      const reachable = await probeComfyReachable(attachedComfy.endpoint).catch(() => false);
+      if (!reachable) return null;
+      return {
+        capability,
+        backend: "local",
+        localRuntime: "comfyui",
+        endpoint: attachedComfy.endpoint,
+        warnings: [],
+      };
+    }
     endpointsToProbe = ["http://127.0.0.1:8188"];
   } else {
     const llama = status.local_runtimes.find(

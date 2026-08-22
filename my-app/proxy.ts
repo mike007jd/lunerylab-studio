@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { isDesktopOnlyRoute, isDesktopRuntime } from "@/lib/desktop-runtime";
 import { buildCsp } from "@/lib/csp";
 import { PUBLIC_SITE_DOWNLOAD_URL } from "@/lib/public-site";
+import { isComfyRelayOrigin } from "@/lib/server/comfy-canvas-report";
 
 const DESKTOP_WEBVIEW_ORIGINS = [
   "tauri://localhost",
@@ -151,13 +152,18 @@ export async function proxy(request: NextRequest) {
   }
 
   // CSRF: state-changing API requests must present an Origin/Referer that
-  // matches this app's origin. (No auth — single-user local app.)
+  // matches this app's origin. (No auth — single-user local app.) The canvas
+  // graph beacon is the one exception: it arrives FROM the ComfyUI canvas
+  // window, whose origin is the loopback relay, and validates its own origin
+  // contract inside the route.
   if (isApiRoute(pathname) && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
     const expected = isDesktopRuntime() ? expectedAppOrigins() : expectedWebOrigin(request);
     const origin = request.headers.get("origin");
     const refOrigin = refererOrigin(request.headers.get("referer"));
     const presented = origin ?? refOrigin;
-    if (!presented || !expected.includes(presented)) {
+    const relayBeacon =
+      pathname === "/api/comfy/canvas/report" && isComfyRelayOrigin(origin);
+    if ((!presented || !expected.includes(presented)) && !relayBeacon) {
       return new NextResponse("Forbidden", { status: 403 });
     }
   }

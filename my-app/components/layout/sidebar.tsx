@@ -8,6 +8,7 @@ import {
   Layers,
   Plus,
   Settings,
+  Workflow,
   X,
 } from "@/components/ui/icons";
 import { Button } from "@/components/ui/button";
@@ -63,6 +64,7 @@ const MAIN_NAV_CONFIG: NavConfigItem[] = [
   { href: "/studio", icon: Bot, labelKey: "nav.studio" },
   { href: "/projects", icon: Layers, labelKey: "nav.projects" },
   { href: "/library", icon: FolderOpen, labelKey: "nav.library" },
+  { href: "/comfy", icon: Workflow, labelKey: "nav.comfy" },
 ];
 
 // Shared row chrome + active matcher so the in-content nav items and the

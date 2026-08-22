@@ -1,0 +1,65 @@
+// Canvas graph beacon target.
+//
+// The ComfyUI canvas window pushes its serialized graph here so the ComfyUI
+// agent can read it. This is the one endpoint a canvas-origin page may call, so
+// it carries explicit CORS grants scoped to the loopback relay (plain-http
+// canvases) or the exact https origin the canvas is currently attached to —
+// every other origin is rejected.
+
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { isDesktopRuntime } from "@/lib/desktop-runtime";
+import { parseJsonBody } from "@/lib/server/http-validation";
+import {
+  getCurrentCanvasEndpoint,
+  isComfyReportOrigin,
+  storeComfyCanvasReport,
+} from "@/lib/server/comfy-canvas-report";
+
+export const dynamic = "force-dynamic";
+
+const canvasReportSchema = z
+  .object({
+    prompt: z.record(z.string(), z.unknown()),
+    workflow: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+
+function corsHeaders(origin: string | null): Record<string, string> {
+  return {
+    "access-control-allow-origin": origin ?? "",
+    "access-control-allow-methods": "POST, OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "access-control-max-age": "600",
+    vary: "Origin",
+  };
+}
+
+export async function OPTIONS(request: NextRequest) {
+  const origin = request.headers.get("origin");
+  if (!isComfyReportOrigin(origin) || !isDesktopRuntime()) {
+    return new NextResponse(null, { status: 403 });
+  }
+  return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
+}
+
+export async function POST(request: NextRequest) {
+  const origin = request.headers.get("origin");
+  if (!isComfyReportOrigin(origin) || !isDesktopRuntime()) {
+    return new NextResponse(null, { status: 403 });
+  }
+  try {
+    const body = await parseJsonBody(request, canvasReportSchema);
+    // Stamp the report with the connection the canvas is actually showing (set
+    // at open/retarget time) — never the merely-active connection — so a reader
+    // can reject a graph that belongs to a different attached server.
+    storeComfyCanvasReport({
+      prompt: body.prompt,
+      workflow: body.workflow,
+      connectionEndpoint: getCurrentCanvasEndpoint() ?? undefined,
+    });
+    return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
+  } catch {
+    return NextResponse.json({ error: "invalid_body" }, { status: 400, headers: corsHeaders(origin) });
+  }
+}

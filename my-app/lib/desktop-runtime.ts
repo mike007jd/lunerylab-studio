@@ -31,6 +31,7 @@ export const WEB_WORKSPACE_ROUTES = [
   "/library",
   "/settings",
   "/canvas",
+  "/comfy",
   "/tools",
   "/workflow-kits",
   "/billing",

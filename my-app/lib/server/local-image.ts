@@ -37,6 +37,14 @@ import { findHfModelEntry } from "@/lib/hf-model-catalog";
 import { findImportedModel } from "@/lib/server/imported-model-registry";
 import { localImageDimensions } from "@/lib/server/generation-dimensions";
 import { normalizeGenerationParameters, randomGenerationSeed } from "@/lib/generation-parameters";
+import { recordComfyJobFinished, recordComfyJobStarted } from "@/lib/server/comfy-activity";
+import { validateComfyEndpoint } from "@/lib/server/comfy-endpoint";
+import { createPinnedProviderFetch } from "@/lib/server/byok-shared";
+
+// Every ComfyUI request goes through the DNS-pinned transport built from the
+// validated endpoint, so the hostname resolved and trust-checked at validation
+// time is the exact address every request connects to.
+type ComfyFetch = typeof fetch;
 
 // ---------------------------------------------------------------------------
 // Model-family workflow profiles
@@ -211,13 +219,27 @@ const ABORT_ERROR = new ApiError({
   retryable: false,
 });
 
+/**
+ * Compose a ComfyUI request URL from the validated endpoint. Building through
+ * URL (rather than string concatenation) normalizes a trailing slash away so a
+ * pasted "http://host:8188/" cannot produce "http://host:8188//prompt", and
+ * preserves any reverse-proxy sub-path on the endpoint.
+ */
+function comfyUrl(baseUrl: string, path: string, search?: URLSearchParams): string {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const url = new URL(path, base);
+  if (search) url.search = search.toString();
+  return url.toString();
+}
+
 async function queueWorkflow(
+  transport: ComfyFetch,
   baseUrl: string,
   workflow: ComfyWorkflow,
   abortSignal?: AbortSignal,
 ): Promise<string> {
   if (abortSignal?.aborted) throw ABORT_ERROR;
-  const response = await fetch(`${baseUrl}/prompt`, {
+  const response = await transport(comfyUrl(baseUrl, "prompt"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ prompt: workflow }),
@@ -245,6 +267,7 @@ async function queueWorkflow(
 }
 
 async function pollHistory(
+  transport: ComfyFetch,
   baseUrl: string,
   promptId: string,
   abortSignal?: AbortSignal,
@@ -256,7 +279,7 @@ async function pollHistory(
     if (abortSignal?.aborted) throw ABORT_ERROR;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     if (abortSignal?.aborted) throw ABORT_ERROR;
-    const response = await fetch(`${baseUrl}/history/${promptId}`, {
+    const response = await transport(comfyUrl(baseUrl, `history/${promptId}`), {
       cache: "no-store",
       signal: requestSignal(5_000, abortSignal),
     });
@@ -286,6 +309,7 @@ async function pollHistory(
 }
 
 async function fetchOutputImage(
+  transport: ComfyFetch,
   baseUrl: string,
   entry: ComfyHistoryEntry,
   abortSignal?: AbortSignal,
@@ -300,7 +324,7 @@ async function fetchOutputImage(
         subfolder: first.subfolder,
         type: first.type,
       });
-      const response = await fetch(`${baseUrl}/view?${params.toString()}`, {
+      const response = await transport(comfyUrl(baseUrl, "view", params), {
         signal: requestSignal(30_000, abortSignal),
       });
       if (!response.ok) {
@@ -328,15 +352,19 @@ async function fetchOutputImage(
  * interrupt it if it is currently executing. Best-effort — failures here must
  * not mask the original abort.
  */
-async function cancelComfyJob(baseUrl: string, promptId: string): Promise<void> {
+async function cancelComfyJob(
+  transport: ComfyFetch,
+  baseUrl: string,
+  promptId: string,
+): Promise<void> {
   await Promise.allSettled([
-    fetch(`${baseUrl}/queue`, {
+    transport(comfyUrl(baseUrl, "queue"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ delete: [promptId] }),
       signal: AbortSignal.timeout(2_000),
     }),
-    fetch(`${baseUrl}/interrupt`, {
+    transport(comfyUrl(baseUrl, "interrupt"), {
       method: "POST",
       signal: AbortSignal.timeout(2_000),
     }),
@@ -431,41 +459,62 @@ export async function generateImagesLocal(
   };
   const { width, height } = comfySize(input.aspectRatio, profile.baseDim);
 
+  // Re-validate and pin the endpoint here so generation connects to the exact
+  // address the trust check approved — the raw stored URL alone would let the
+  // hostname resolve to a new (possibly internal) address after validation.
+  const endpointCheck = await validateComfyEndpoint(endpoint);
+  if ("error" in endpointCheck) {
+    throw new ApiError({
+      status: 502,
+      code: "provider_error",
+      message: `The attached ComfyUI endpoint is not usable: ${endpointCheck.error}`,
+      retryable: false,
+    });
+  }
+  const transport = createPinnedProviderFetch(endpointCheck);
+  const baseUrl = endpointCheck.url;
+
   const abortSignal = input.abortSignal;
   // Track queued/running prompt ids so a Stop can cancel them on the server, not
   // just sever the local fetch.
   const activePromptIds = new Set<string>();
   const onAbort = () => {
-    for (const id of activePromptIds) void cancelComfyJob(endpoint, id);
+    for (const id of activePromptIds) void cancelComfyJob(transport, baseUrl, id);
   };
   abortSignal?.addEventListener("abort", onAbort);
 
   const generateOne = async (index: number) => {
     let promptId: string | null = null;
     const seed = requestedParameters.seed ?? randomGenerationSeed();
+    const workflow = buildTxt2ImgWorkflow({
+      checkpointName,
+      prompt: input.prompt,
+      seed,
+      negativePrompt: requestedParameters.negativePrompt,
+      profile: appliedProfile,
+      width,
+      height,
+    });
     try {
-      promptId = await queueWorkflow(
-        endpoint,
-        buildTxt2ImgWorkflow({
-          checkpointName,
-          prompt: input.prompt,
-          seed,
-          negativePrompt: requestedParameters.negativePrompt,
-          profile: appliedProfile,
-          width,
-          height,
-        }),
-        abortSignal,
-      );
+      promptId = await queueWorkflow(transport, baseUrl, workflow, abortSignal);
       activePromptIds.add(promptId);
+      // Surface the job to the /comfy workspace so it can load this exact
+      // graph into the embedded canvas and show live progress.
+      recordComfyJobStarted({
+        id: promptId,
+        endpoint,
+        workflow,
+        prompt: input.prompt,
+      });
       // Close the window where abort fires after the server queued the job but
       // before onAbort could see this id — cancel it on the server right away.
       if (abortSignal?.aborted) {
-        void cancelComfyJob(endpoint, promptId);
+        void cancelComfyJob(transport, baseUrl, promptId);
         throw ABORT_ERROR;
       }
-      const historyEntry = await pollHistory(endpoint, promptId, abortSignal);
-      const bytes = await fetchOutputImage(endpoint, historyEntry, abortSignal);
+      const historyEntry = await pollHistory(transport, baseUrl, promptId, abortSignal);
+      const bytes = await fetchOutputImage(transport, baseUrl, historyEntry, abortSignal);
+      recordComfyJobFinished(endpoint, promptId, "completed");
       images.push({
         bytes,
         mimeType: "image/png",
@@ -478,6 +527,13 @@ export async function generateImagesLocal(
         },
       });
     } catch (error) {
+      if (promptId) {
+        recordComfyJobFinished(
+          endpoint,
+          promptId,
+          abortSignal?.aborted ? "cancelled" : "failed",
+        );
+      }
       warnings.push(
         `candidate_${index + 1}: ${error instanceof ApiError ? error.code : "generation_error"}`,
       );

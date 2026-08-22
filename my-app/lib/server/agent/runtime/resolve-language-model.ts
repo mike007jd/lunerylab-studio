@@ -11,17 +11,23 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { LanguageModel } from "ai";
 import { ApiError } from "@/lib/server/errors";
 import { resolveByokLanguageModel } from "@/lib/server/byok-llm";
-import type { StudioRuntimeSupply } from "@/lib/server/runtime-supply";
+import type {
+  RuntimeSupplyTarget,
+  StudioRuntimeSupply,
+} from "@/lib/server/runtime-supply";
 
 interface ResolvedModel {
   model: LanguageModel;
 }
 
-export async function resolveAgentLanguageModel(
-  supply: StudioRuntimeSupply,
+/**
+ * Resolve a single text supply target into a model handle. Shared by agents
+ * that only need text (e.g. the ComfyUI workspace agent) so they don't have
+ * to fabricate a full StudioRuntimeSupply.
+ */
+export async function resolveTextTargetLanguageModel(
+  target: RuntimeSupplyTarget,
 ): Promise<ResolvedModel> {
-  const target = supply.text;
-
   if (target.backend === "local" && target.endpoint && target.modelId) {
     const provider = createOpenAICompatible({
       name: "local",
@@ -46,4 +52,10 @@ export async function resolveAgentLanguageModel(
     message: "No local or BYOK LLM backend is configured for the agent.",
     retryable: false,
   });
+}
+
+export async function resolveAgentLanguageModel(
+  supply: StudioRuntimeSupply,
+): Promise<ResolvedModel> {
+  return resolveTextTargetLanguageModel(supply.text);
 }

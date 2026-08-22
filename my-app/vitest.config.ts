@@ -4,6 +4,9 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": new URL("./", import.meta.url).pathname,
+      // `import "server-only"` throws outside an RSC bundle; stub it so server
+      // modules (comfy agent tools, canvas report cache) load under vitest.
+      "server-only": new URL("./test/server-only-stub.ts", import.meta.url).pathname,
     },
   },
   test: {

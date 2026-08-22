@@ -1,3 +1,5 @@
+mod comfy_canvas;
+mod comfy_remote;
 mod download;
 mod engine_lifecycle;
 mod engine_llama;
@@ -17,6 +19,7 @@ mod secrets;
 mod security;
 mod vram_probe;
 
+use crate::comfy_canvas::stop_comfy_canvas_relay;
 use crate::download::DownloadState;
 use crate::engine_llama::{bridge_stop_llama, llama_engine_slot};
 use crate::engine_mlx::{bridge_stop_mlx, mlx_engine_slot, mlx_job_slot, mlx_progress_slot};
@@ -51,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 #[cfg(not(debug_assertions))]
 use std::time::SystemTime;
@@ -353,6 +356,29 @@ impl Drop for DesktopServerState {
 static RESIDENCY_GLOBAL: OnceLock<Arc<ResidencyManager>> = OnceLock::new();
 pub(crate) fn residency_global() -> Option<&'static Arc<ResidencyManager>> {
     RESIDENCY_GLOBAL.get()
+}
+
+/// Process-global AppHandle so bridge threads (no Tauri State) can manage the
+/// ComfyUI canvas window. Set once during setup, before any bridge request can
+/// arrive (the bridge starts after setup on both dev and production paths).
+static BRIDGE_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+pub(crate) fn bridge_app_handle() -> Option<&'static AppHandle> {
+    BRIDGE_APP_HANDLE.get()
+}
+
+/// Process-global Studio server origin ("http://127.0.0.1:<port>"). The canvas
+/// window's injected agent beacons graph state to it; refreshed on every runtime
+/// boot (dev and production) because a packaged workspace reset restarts the
+/// owned server on a new random port — a write-once cell would pin the dead
+/// pre-reset origin.
+static STUDIO_ORIGIN_GLOBAL: RwLock<Option<String>> = RwLock::new(None);
+pub(crate) fn set_studio_origin_global(origin: &str) {
+    if let Ok(mut guard) = STUDIO_ORIGIN_GLOBAL.write() {
+        *guard = Some(origin.to_string());
+    }
+}
+pub(crate) fn studio_origin_global() -> Option<String> {
+    STUDIO_ORIGIN_GLOBAL.read().ok().and_then(|guard| guard.clone())
 }
 
 #[derive(Serialize)]
@@ -1677,6 +1703,10 @@ fn boot_desktop_runtime_inner(app: &AppHandle, download_state: &Arc<DownloadStat
             if !state.lifecycle_is_current(epoch) {
                 return;
             }
+            set_studio_origin_global(&runtime.url);
+            // A canvas open before this reset injected the previous origin; the
+            // next open/reload picks up the refreshed value.
+            crate::comfy_canvas::refresh_canvas_agent_origin();
             if let Err(err) = navigate_and_show(app, &format!("{}/studio", runtime.url)) {
                 eprintln!("Desktop Studio navigation failed: {err}");
                 if state.lifecycle_is_current(epoch) {
@@ -1929,6 +1959,22 @@ pub fn run() {
         .manage(desktop_state)
         .manage(Arc::clone(&download_state))
         .setup(move |app| {
+            // Make the handle reachable from bridge threads for ComfyUI canvas
+            // window management (open/focus/close/eval).
+            let _ = BRIDGE_APP_HANDLE.set(app.handle().clone());
+            // The main window is declared `create: false` in tauri.conf.json.
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .first()
+                .cloned()
+                .ok_or("Main window config is missing")?;
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)
+                .map_err(|err| Box::<dyn std::error::Error>::from(err.to_string()))?
+                .build()
+                .map_err(|err| Box::<dyn std::error::Error>::from(err.to_string()))?;
+
             // Acquire the resolved-profile OS advisory lock before dev bridge,
             // stale PID cleanup, runtime spawn, or PGlite open. A second instance
             // that races past single-instance must not run backend PID cleanup.
@@ -2074,6 +2120,7 @@ pub fn run() {
             bridge_stop_llama();
             bridge_stop_sd();
             bridge_stop_mlx();
+            stop_comfy_canvas_relay();
         }
     });
 }
