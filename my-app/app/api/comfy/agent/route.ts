@@ -3,7 +3,7 @@
 // Same UIMessage stream protocol as /api/chat (data-agent-status/step/error/
 // backend parts) but a ComfyUI-specific toolset: the agent reads and edits the
 // live graph on the native canvas window, queues runs on the attached server,
-// lists model files, and installs custom nodes through ComfyUI-Manager.
+// lists model files, and reads server stats.
 //
 // Model supply follows the platform rule: the Settings-selected text model
 // only — no default, no fallback. Nothing configured fails before the stream

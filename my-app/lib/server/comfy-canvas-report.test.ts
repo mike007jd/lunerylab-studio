@@ -3,7 +3,9 @@ import {
   CANVAS_REPORT_TTL_MS,
   getComfyCanvasReport,
   isComfyRelayOrigin,
+  isComfyReportOrigin,
   resetComfyCanvasReportForTests,
+  setCurrentCanvasEndpoint,
   storeComfyCanvasReport,
 } from "@/lib/server/comfy-canvas-report";
 
@@ -58,5 +60,29 @@ describe("isComfyRelayOrigin", () => {
     expect(isComfyRelayOrigin("https://127.0.0.1:8189")).toBe(false);
     expect(isComfyRelayOrigin("not a url")).toBe(false);
     expect(isComfyRelayOrigin(null)).toBe(false);
+  });
+});
+
+describe("isComfyReportOrigin", () => {
+  it("accepts the relay origin regardless of the current canvas endpoint", () => {
+    expect(isComfyReportOrigin("http://127.0.0.1:8189")).toBe(true);
+  });
+
+  it("accepts the exact https origin the canvas is currently attached to", () => {
+    setCurrentCanvasEndpoint("https://comfy.example.com:8443/api");
+    expect(isComfyReportOrigin("https://comfy.example.com:8443")).toBe(true);
+    // A different https origin, or the same host over http, is still rejected.
+    expect(isComfyReportOrigin("https://evil.example.com")).toBe(false);
+    expect(isComfyReportOrigin("http://comfy.example.com:8443")).toBe(false);
+  });
+
+  it("does not authorize any https origin when the canvas is on a plain-http server", () => {
+    setCurrentCanvasEndpoint("http://192.168.1.10:8188");
+    expect(isComfyReportOrigin("https://192.168.1.10:8188")).toBe(false);
+  });
+
+  it("rejects everything when no canvas endpoint is bound", () => {
+    setCurrentCanvasEndpoint(null);
+    expect(isComfyReportOrigin("https://comfy.example.com")).toBe(false);
   });
 });

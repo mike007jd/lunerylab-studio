@@ -3,6 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   refreshComfyCanvasReport: vi.fn(),
   loadWorkflowOnCanvas: vi.fn(),
+  applyWidgetEditsOnCanvas: vi.fn(),
+  queueComfyPrompt: vi.fn(),
+  cancelComfyPrompt: vi.fn(),
+  trackComfyAgentJob: vi.fn(),
+  recordComfyJobStarted: vi.fn(),
+  recordComfyJobFinished: vi.fn(),
 }));
 
 vi.mock("@/lib/server/comfy-agent/graph-state", () => ({
@@ -11,6 +17,21 @@ vi.mock("@/lib/server/comfy-agent/graph-state", () => ({
 
 vi.mock("@/lib/server/comfy-agent/canvas-bridge", () => ({
   loadWorkflowOnCanvas: mocks.loadWorkflowOnCanvas,
+  applyWidgetEditsOnCanvas: mocks.applyWidgetEditsOnCanvas,
+}));
+
+vi.mock("@/lib/server/comfy-agent/comfy-client", () => ({
+  queueComfyPrompt: mocks.queueComfyPrompt,
+  cancelComfyPrompt: mocks.cancelComfyPrompt,
+}));
+
+vi.mock("@/lib/server/comfy-agent/job-monitor", () => ({
+  trackComfyAgentJob: mocks.trackComfyAgentJob,
+}));
+
+vi.mock("@/lib/server/comfy-activity", () => ({
+  recordComfyJobStarted: mocks.recordComfyJobStarted,
+  recordComfyJobFinished: mocks.recordComfyJobFinished,
 }));
 
 import {
@@ -23,19 +44,23 @@ import {
 type Parseable = { safeParse: (value: unknown) => { success: boolean } };
 type Executor = (input: unknown, options: unknown) => Promise<Record<string, unknown>>;
 
-function toolContext(): ComfyAgentToolContext {
+function toolContext(overrides: Partial<ComfyAgentToolContext> = {}): ComfyAgentToolContext {
   return {
     bridge: { url: "http://127.0.0.1:1", token: "t" } as never,
     endpoint: { url: "http://127.0.0.1:8188/" } as never,
     activeEndpointRaw: "http://127.0.0.1:8188",
     abortSignal: new AbortController().signal,
     recordStep: () => {},
+    ...overrides,
   };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.loadWorkflowOnCanvas.mockResolvedValue(undefined);
+  mocks.applyWidgetEditsOnCanvas.mockResolvedValue(undefined);
+  mocks.queueComfyPrompt.mockResolvedValue("prompt-1");
+  mocks.cancelComfyPrompt.mockResolvedValue(undefined);
 });
 
 describe("edit_graph input schema", () => {
@@ -130,6 +155,49 @@ describe("edit_graph merge", () => {
     expect(result.ok).toBe(false);
     expect(mocks.loadWorkflowOnCanvas).not.toHaveBeenCalled();
   });
+
+  it("applies pure literal widget edits in place to preserve layout", async () => {
+    mocks.refreshComfyCanvasReport.mockResolvedValue({
+      prompt: fullGraph(),
+      receivedAt: new Date().toISOString(),
+    });
+    const { edit_graph } = buildComfyAgentToolset(toolContext());
+    const result = await (edit_graph.execute as unknown as Executor)(
+      {
+        operations: [
+          { op: "set_input", nodeId: "3", name: "cfg", value: 6 },
+          { op: "set_input", nodeId: "6", name: "text", value: "a snowy peak" },
+        ],
+      },
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    // Layout-preserving live path, never a whole-graph reload.
+    expect(mocks.applyWidgetEditsOnCanvas).toHaveBeenCalledTimes(1);
+    expect(mocks.loadWorkflowOnCanvas).not.toHaveBeenCalled();
+    const edits = mocks.applyWidgetEditsOnCanvas.mock.calls[0]![1];
+    expect(edits).toEqual([
+      { nodeId: "3", name: "cfg", value: 6 },
+      { nodeId: "6", name: "text", value: "a snowy peak" },
+    ]);
+  });
+
+  it("routes a set_input link rewrite through the reload path, not the widget path", async () => {
+    mocks.refreshComfyCanvasReport.mockResolvedValue({
+      prompt: fullGraph(),
+      receivedAt: new Date().toISOString(),
+    });
+    const { edit_graph } = buildComfyAgentToolset(toolContext());
+    const result = await (edit_graph.execute as unknown as Executor)(
+      { operations: [{ op: "set_input", nodeId: "3", name: "model", value: ["4", 0] }] },
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    expect(mocks.loadWorkflowOnCanvas).toHaveBeenCalledTimes(1);
+    expect(mocks.applyWidgetEditsOnCanvas).not.toHaveBeenCalled();
+  });
 });
 
 describe("observe_graph", () => {
@@ -167,6 +235,49 @@ describe("observe_graph", () => {
       ok: boolean;
     };
     expect(result.ok).toBe(false);
+  });
+});
+
+describe("queue_prompt lifecycle", () => {
+  function report() {
+    return {
+      prompt: { "9": { class_type: "SaveImage", inputs: { images: ["8", 0] } } },
+      receivedAt: new Date().toISOString(),
+    };
+  }
+
+  it("queues, records started, and hands off to the terminal-state watcher", async () => {
+    mocks.refreshComfyCanvasReport.mockResolvedValue(report());
+    const { queue_prompt } = buildComfyAgentToolset(toolContext());
+    const result = await (queue_prompt.execute as unknown as Executor)({}, {});
+
+    expect(result).toEqual({ ok: true, promptId: "prompt-1" });
+    expect(mocks.recordComfyJobStarted).toHaveBeenCalledTimes(1);
+    expect(mocks.trackComfyAgentJob).toHaveBeenCalledTimes(1);
+    expect(mocks.cancelComfyPrompt).not.toHaveBeenCalled();
+  });
+
+  it("cancels the job on the server when the run was already stopped", async () => {
+    mocks.refreshComfyCanvasReport.mockResolvedValue(report());
+    const controller = new AbortController();
+    controller.abort();
+    const { queue_prompt } = buildComfyAgentToolset(
+      toolContext({ abortSignal: controller.signal }),
+    );
+    const result = await (queue_prompt.execute as unknown as Executor)({}, {});
+
+    expect(result.ok).toBe(false);
+    expect(mocks.cancelComfyPrompt).toHaveBeenCalledWith(
+      expect.anything(),
+      "prompt-1",
+    );
+    expect(mocks.recordComfyJobFinished).toHaveBeenCalledWith(
+      "http://127.0.0.1:8188",
+      "prompt-1",
+      "cancelled",
+    );
+    // A stopped run must not leave a live watcher polling a cancelled job.
+    expect(mocks.trackComfyAgentJob).not.toHaveBeenCalled();
   });
 });
 

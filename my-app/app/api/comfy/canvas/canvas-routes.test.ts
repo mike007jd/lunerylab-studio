@@ -34,6 +34,8 @@ vi.mock("@/lib/server/workspace-restore-journal", () => ({
 import { POST as openPost } from "@/app/api/comfy/canvas/open/route";
 import { POST as closePost } from "@/app/api/comfy/canvas/close/route";
 import { POST as loadPost } from "@/app/api/comfy/canvas/load/route";
+import { GET as statusGet } from "@/app/api/comfy/canvas/status/route";
+import { setCurrentCanvasEndpoint } from "@/lib/server/comfy-canvas-report";
 
 function request(path: string, body?: unknown): NextRequest {
   return new NextRequest(`http://localhost${path}`, {
@@ -184,5 +186,47 @@ describe("/api/comfy/canvas/load", () => {
 
     expect(response.status).toBe(400);
     expect(mocks.proxyToBridge).not.toHaveBeenCalled();
+  });
+});
+
+describe("/api/comfy/canvas/status", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.requireDesktopBridge.mockReturnValue({ url: "http://127.0.0.1:49152", token: "t" });
+  });
+
+  afterEach(() => {
+    setCurrentCanvasEndpoint(null);
+  });
+
+  it("reports the bound endpoint when the window is open", async () => {
+    setCurrentCanvasEndpoint("http://192.168.1.143:8188");
+    mocks.proxyToBridge.mockImplementation(() => NextResponse.json({ open: true }));
+
+    const response = await statusGet();
+
+    await expect(response.json()).resolves.toEqual({
+      open: true,
+      endpoint: "http://192.168.1.143:8188",
+    });
+  });
+
+  it("does not leak a stale bound endpoint when the window is closed", async () => {
+    setCurrentCanvasEndpoint("http://192.168.1.143:8188");
+    mocks.proxyToBridge.mockImplementation(() => NextResponse.json({ open: false }));
+
+    const response = await statusGet();
+
+    await expect(response.json()).resolves.toEqual({ open: false, endpoint: null });
+  });
+
+  it("treats an unreachable bridge as closed", async () => {
+    mocks.proxyToBridge.mockImplementation(() =>
+      NextResponse.json({ error: "bridge_unreachable" }, { status: 503 }),
+    );
+
+    const response = await statusGet();
+
+    await expect(response.json()).resolves.toEqual({ open: false, endpoint: null });
   });
 });

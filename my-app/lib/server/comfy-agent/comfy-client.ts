@@ -23,15 +23,17 @@ export interface ComfyRawResponse {
 export async function comfyRequest(
   endpoint: ValidatedComfyEndpoint,
   path: string,
-  init: { method?: string; body?: unknown; timeoutMs?: number } = {},
+  init: { method?: string; body?: unknown; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<ComfyRawResponse> {
   const transport = createPinnedProviderFetch(endpoint);
+  const timeout = AbortSignal.timeout(init.timeoutMs ?? 15_000);
+  const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
   let response: Response;
   try {
     response = await transport(new URL(path, endpoint.url), {
       method: init.method ?? "GET",
       cache: "no-store",
-      signal: AbortSignal.timeout(init.timeoutMs ?? 15_000),
+      signal,
       ...(init.body === undefined
         ? {}
         : {
@@ -51,11 +53,13 @@ export async function comfyRequest(
 export async function queueComfyPrompt(
   endpoint: ValidatedComfyEndpoint,
   prompt: Record<string, unknown>,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
   const response = await comfyRequest(endpoint, "prompt", {
     method: "POST",
     body: { prompt, client_id: "lunery-agent" },
     timeoutMs: 20_000,
+    signal: abortSignal,
   });
   if (!response.ok) {
     const errorText =
@@ -72,6 +76,69 @@ export async function queueComfyPrompt(
     throw new Error("ComfyUI did not return a prompt id.");
   }
   return promptId;
+}
+
+/**
+ * Cancel a queued/running prompt on the server: delete it from the queue if it
+ * has not started and interrupt it if it is executing. Best-effort — a failure
+ * here must not mask the reason cancellation was requested (a user Stop).
+ */
+export async function cancelComfyPrompt(
+  endpoint: ValidatedComfyEndpoint,
+  promptId: string,
+): Promise<void> {
+  await Promise.allSettled([
+    comfyRequest(endpoint, "queue", {
+      method: "POST",
+      body: { delete: [promptId] },
+      timeoutMs: 4_000,
+    }),
+    comfyRequest(endpoint, "interrupt", { method: "POST", timeoutMs: 4_000 }),
+  ]);
+}
+
+export type ComfyTerminalStatus = "completed" | "failed";
+
+interface ComfyHistoryStatus {
+  status?: { completed?: boolean; status_str?: string };
+}
+
+/**
+ * Poll `/history/{promptId}` until the job reaches a terminal state. Resolves
+ * with "completed"/"failed", or null when `timeoutMs` elapses without a verdict
+ * (the caller then leaves the last-known state rather than lying). Throws an
+ * AbortError as soon as `abortSignal` fires so the caller can cancel the job.
+ */
+export async function pollComfyJobUntilTerminal(
+  endpoint: ValidatedComfyEndpoint,
+  promptId: string,
+  abortSignal: AbortSignal,
+  { timeoutMs = 30 * 60_000, intervalMs = 1_500 }: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<ComfyTerminalStatus | null> {
+  const throwIfAborted = () => {
+    if (abortSignal.aborted) throw new DOMException("Aborted", "AbortError");
+  };
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    throwIfAborted();
+    let response: ComfyRawResponse;
+    try {
+      response = await comfyRequest(endpoint, `history/${promptId}`, {
+        timeoutMs: 5_000,
+        signal: abortSignal,
+      });
+    } catch {
+      throwIfAborted();
+      continue; // transient — the next tick retries
+    }
+    if (!response.ok || !response.json || typeof response.json !== "object") continue;
+    const entry = (response.json as Record<string, ComfyHistoryStatus>)[promptId];
+    if (entry?.status?.completed) return "completed";
+    if (entry?.status?.status_str === "error") return "failed";
+  }
+  return null;
 }
 
 export type { ComfySystemStats };

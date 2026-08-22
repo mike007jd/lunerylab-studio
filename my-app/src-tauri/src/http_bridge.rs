@@ -8,8 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::comfy_canvas::{
-    comfy_canvas_close, comfy_canvas_load, comfy_canvas_open, comfy_canvas_report,
-    comfy_canvas_status_json,
+    comfy_canvas_apply_edits, comfy_canvas_close, comfy_canvas_load, comfy_canvas_open,
+    comfy_canvas_report, comfy_canvas_status_json,
 };
 use crate::comfy_remote::comfy_ssh_start;
 use crate::download::{
@@ -1401,6 +1401,23 @@ fn handle_bridge_request(
             match serde_json::from_str::<ComfyCanvasLoadBody>(&body)
                 .map_err(|e| e.to_string())
                 .and_then(|b| comfy_canvas_load(&b.workflow))
+            {
+                Ok(()) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "ok": true }).to_string(),
+                ),
+                Err(err) => bridge_error(&mut stream, "400 Bad Request", &err),
+            }
+        }
+        ("POST", "/comfy-canvas-apply-edits") => {
+            #[derive(Deserialize)]
+            struct ComfyCanvasApplyEditsBody {
+                edits: serde_json::Value,
+            }
+            match serde_json::from_str::<ComfyCanvasApplyEditsBody>(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| comfy_canvas_apply_edits(&b.edits))
             {
                 Ok(()) => write_http_response(
                     &mut stream,

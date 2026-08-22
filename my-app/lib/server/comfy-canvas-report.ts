@@ -51,7 +51,7 @@ export function getCurrentCanvasEndpoint(): string | null {
 /** A report older than this is treated as absent by readers. */
 export const CANVAS_REPORT_TTL_MS = 30_000;
 
-/** The canvas window is only ever served from the bridge's loopback relay. */
+/** Plain-http canvases are served from the bridge's loopback relay. */
 export function isComfyRelayOrigin(origin: string | null): boolean {
   if (!origin) return false;
   let url: URL;
@@ -65,6 +65,39 @@ export function isComfyRelayOrigin(origin: string | null): boolean {
     url.hostname === "127.0.0.1" &&
     /^(8189|819[0-9])$/.test(url.port)
   );
+}
+
+/**
+ * True when `origin` is the exact origin the canvas is currently attached to for
+ * a direct-https server. Plain-http canvases load through the loopback relay
+ * (isComfyRelayOrigin); https canvases can't sit behind a loopback TLS relay, so
+ * they load the remote origin directly and their beacon carries that https
+ * origin. Authorizing only the single origin the canvas was opened against (set
+ * at open time via setCurrentCanvasEndpoint) lets https attachments report their
+ * graph without opening the report route to arbitrary remotes.
+ */
+export function isCurrentCanvasHttpsOrigin(origin: string | null): boolean {
+  if (!origin) return false;
+  const endpoint = getCurrentCanvasEndpoint();
+  if (!endpoint) return false;
+  let target: URL;
+  let candidate: URL;
+  try {
+    target = new URL(endpoint);
+    candidate = new URL(origin);
+  } catch {
+    return false;
+  }
+  // Only https attachments load directly; http always goes through the relay.
+  return target.protocol === "https:" && candidate.origin === target.origin;
+}
+
+/**
+ * Origins allowed to POST a graph beacon: the loopback relay (plain-http
+ * canvases) or the exact https origin the canvas is currently attached to.
+ */
+export function isComfyReportOrigin(origin: string | null): boolean {
+  return isComfyRelayOrigin(origin) || isCurrentCanvasHttpsOrigin(origin);
 }
 
 export function storeComfyCanvasReport(

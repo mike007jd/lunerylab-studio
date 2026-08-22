@@ -15,10 +15,14 @@ import {
   fetchComfySystemStats,
   type ValidatedComfyEndpoint,
 } from "@/lib/server/comfy-endpoint";
-import { recordComfyJobStarted } from "@/lib/server/comfy-activity";
+import { recordComfyJobFinished, recordComfyJobStarted } from "@/lib/server/comfy-activity";
 import { refreshComfyCanvasReport } from "@/lib/server/comfy-agent/graph-state";
-import { loadWorkflowOnCanvas } from "@/lib/server/comfy-agent/canvas-bridge";
-import { queueComfyPrompt } from "@/lib/server/comfy-agent/comfy-client";
+import {
+  applyWidgetEditsOnCanvas,
+  loadWorkflowOnCanvas,
+} from "@/lib/server/comfy-agent/canvas-bridge";
+import { cancelComfyPrompt, queueComfyPrompt } from "@/lib/server/comfy-agent/comfy-client";
+import { trackComfyAgentJob } from "@/lib/server/comfy-agent/job-monitor";
 
 export interface ComfyAgentToolContext {
   bridge: DesktopBridge;
@@ -146,6 +150,28 @@ function applyGraphOperations(
   }
 }
 
+// A single literal widget-value edit applied directly on the live frontend node.
+interface WidgetEdit {
+  nodeId: string;
+  name: string;
+  value: string | number | boolean;
+}
+
+/**
+ * When every operation is a `set_input` carrying a literal value (not a link
+ * `[nodeId, slot]`), return them as widget edits so edit_graph can mutate the
+ * live graph in place and preserve layout. Any structural op (add/remove/retype)
+ * or a link rewrite returns null, routing the batch through the reload path.
+ */
+function collectWidgetEdits(operations: EditOperation[]): WidgetEdit[] | null {
+  const edits: WidgetEdit[] = [];
+  for (const op of operations) {
+    if (op.op !== "set_input" || Array.isArray(op.value)) return null;
+    edits.push({ nodeId: op.nodeId, name: op.name, value: op.value });
+  }
+  return edits;
+}
+
 export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
   return {
     observe_graph: tool({
@@ -198,6 +224,9 @@ export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
               "The canvas window is not open or did not report its graph. Ask the user to click 'Open canvas'.",
           };
         }
+        // Validate against the lossless live graph regardless of the apply path,
+        // so a stale node id gives the model a precise error instead of a canvas
+        // failure.
         const graph = structuredClone(report.prompt) as Record<string, ComfyNode>;
         try {
           applyGraphOperations(graph, operations);
@@ -207,8 +236,18 @@ export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
             error: error instanceof Error ? error.message : "The edit could not be applied.",
           };
         }
+        // Pure widget-value edits are applied in place on the live frontend
+        // graph so node positions, groups, and every untouched widget survive.
+        // Structural edits (add/remove/rewire/retype) reload the merged
+        // API-format graph — that re-lays-out, but a structural change already
+        // implies a layout change.
+        const widgetEdits = collectWidgetEdits(operations);
         try {
-          await loadWorkflowOnCanvas(ctx.bridge, graph);
+          if (widgetEdits) {
+            await applyWidgetEditsOnCanvas(ctx.bridge, widgetEdits);
+          } else {
+            await loadWorkflowOnCanvas(ctx.bridge, graph);
+          }
         } catch (error) {
           return {
             ok: false,
@@ -242,13 +281,23 @@ export function buildComfyAgentToolset(ctx: ComfyAgentToolContext) {
         }
         ctx.recordStep("Queueing the prompt on the server", "queue_prompt");
         try {
-          const promptId = await queueComfyPrompt(ctx.endpoint, prompt);
+          const promptId = await queueComfyPrompt(ctx.endpoint, prompt, ctx.abortSignal);
           recordComfyJobStarted({
             id: promptId,
             endpoint: ctx.activeEndpointRaw,
             workflow: prompt,
             prompt: extractPromptText(prompt),
           });
+          // The user hit Stop in the window between the server accepting the
+          // prompt and this returning — cancel it instead of leaving it running.
+          if (ctx.abortSignal.aborted) {
+            await cancelComfyPrompt(ctx.endpoint, promptId).catch(() => undefined);
+            recordComfyJobFinished(ctx.activeEndpointRaw, promptId, "cancelled");
+            return { ok: false, error: "The run was stopped before it started." };
+          }
+          // Detached watcher: drive the job to a terminal state (and cancel it on
+          // Stop) so the activity feed never strands a phantom running job.
+          void trackComfyAgentJob(ctx.endpoint, ctx.activeEndpointRaw, promptId, ctx.abortSignal);
           ctx.recordStep(`Queued prompt ${promptId}`, "queue_prompt");
           return { ok: true, promptId };
         } catch (error) {

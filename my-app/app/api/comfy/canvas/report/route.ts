@@ -1,9 +1,10 @@
 // Canvas graph beacon target.
 //
-// The ComfyUI canvas window (origin = the loopback relay, 127.0.0.1:8189-8199)
-// pushes its serialized graph here so the ComfyUI agent can read it. This is
-// the one endpoint a remote-origin page may call, so it carries explicit CORS
-// grants scoped to relay origins only — every other origin is rejected.
+// The ComfyUI canvas window pushes its serialized graph here so the ComfyUI
+// agent can read it. This is the one endpoint a canvas-origin page may call, so
+// it carries explicit CORS grants scoped to the loopback relay (plain-http
+// canvases) or the exact https origin the canvas is currently attached to —
+// every other origin is rejected.
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
@@ -11,7 +12,7 @@ import { isDesktopRuntime } from "@/lib/desktop-runtime";
 import { parseJsonBody } from "@/lib/server/http-validation";
 import {
   getCurrentCanvasEndpoint,
-  isComfyRelayOrigin,
+  isComfyReportOrigin,
   storeComfyCanvasReport,
 } from "@/lib/server/comfy-canvas-report";
 
@@ -36,7 +37,7 @@ function corsHeaders(origin: string | null): Record<string, string> {
 
 export async function OPTIONS(request: NextRequest) {
   const origin = request.headers.get("origin");
-  if (!isComfyRelayOrigin(origin) || !isDesktopRuntime()) {
+  if (!isComfyReportOrigin(origin) || !isDesktopRuntime()) {
     return new NextResponse(null, { status: 403 });
   }
   return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
@@ -44,7 +45,7 @@ export async function OPTIONS(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   const origin = request.headers.get("origin");
-  if (!isComfyRelayOrigin(origin) || !isDesktopRuntime()) {
+  if (!isComfyReportOrigin(origin) || !isDesktopRuntime()) {
     return new NextResponse(null, { status: 403 });
   }
   try {

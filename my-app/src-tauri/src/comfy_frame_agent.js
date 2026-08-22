@@ -102,6 +102,63 @@
       );
   }
 
+  // Apply literal widget-value edits to the live graph in place. Unlike
+  // loadApiObject (which rebuilds the graph from API format and drops the user's
+  // node arrangement), this resolves each node by id and mutates the matching
+  // widget, preserving positions, groups, and every untouched widget. Synchronous
+  // — the return value ("ok" | "error" | "agent-missing") is the outcome, and it
+  // is also recorded on window.__luneryComfyEdit for a precise error message.
+  function applyWidgetEdits(edits) {
+    var target = findApp();
+    if (!target || !target.graph || typeof target.graph.getNodeById !== "function") {
+      window.__luneryComfyEdit = { status: "agent-missing" };
+      return "agent-missing";
+    }
+    try {
+      var list = edits || [];
+      for (var i = 0; i < list.length; i++) {
+        var edit = list[i];
+        var node = target.graph.getNodeById(Number(edit.nodeId));
+        if (!node) {
+          throw new Error("Node " + edit.nodeId + " is not on the canvas");
+        }
+        var widgets = node.widgets || [];
+        var widget = null;
+        for (var j = 0; j < widgets.length; j++) {
+          if (widgets[j] && widgets[j].name === edit.name) {
+            widget = widgets[j];
+            break;
+          }
+        }
+        if (!widget) {
+          throw new Error("Node " + edit.nodeId + " has no '" + edit.name + "' field");
+        }
+        widget.value = edit.value;
+        // Some widgets (combos, seed controls) mirror state through a callback;
+        // fire it when present so the change is reflected everywhere the widget
+        // tracks it. A widget-specific throw must not abort the whole batch.
+        if (typeof widget.callback === "function") {
+          try {
+            widget.callback(edit.value, target.canvas, node);
+          } catch {
+            /* widget-specific side effect failed; the value is still set */
+          }
+        }
+      }
+      if (typeof target.graph.setDirtyCanvas === "function") {
+        target.graph.setDirtyCanvas(true, true);
+      }
+      window.__luneryComfyEdit = { status: "ok" };
+      return "ok";
+    } catch (error) {
+      window.__luneryComfyEdit = {
+        status: "error",
+        message: error && error.message ? String(error.message) : "edit-failed",
+      };
+      return "error";
+    }
+  }
+
   // Serialize the live graph and beacon it to the Studio server so the ComfyUI
   // agent can read what the user is editing. The Studio origin is injected by
   // the desktop bridge when the canvas window is created. Failures are silent:
@@ -148,6 +205,7 @@
         ready: true,
         loadApiJson: loadApiJson,
         loadApiObject: loadApiObject,
+        applyWidgetEdits: applyWidgetEdits,
         reportState: reportState,
       };
       return;

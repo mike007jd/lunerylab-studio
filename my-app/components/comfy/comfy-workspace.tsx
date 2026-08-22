@@ -65,6 +65,10 @@ export function ComfyWorkspace({
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [startOutput, setStartOutput] = useState<StartOutput | null>(null);
   const [canvasOpen, setCanvasOpen] = useState(false);
+  // The connection endpoint the native canvas window is actually attached to
+  // (server truth), so the UI can detect and repair drift from the active
+  // connection instead of trusting a mount-local flag.
+  const [canvasEndpoint, setCanvasEndpoint] = useState<string | null>(null);
   const [canvasBusy, setCanvasBusy] = useState(false);
   const [activityJobs, setActivityJobs] = useState<ComfyActivityJob[]>([]);
 
@@ -75,6 +79,7 @@ export function ComfyWorkspace({
       ) ?? state.connections[0],
     [state],
   );
+
 
   const refreshState = useCallback(async () => {
     try {
@@ -201,6 +206,7 @@ export function ComfyWorkspace({
           }),
         });
         setCanvasOpen(true);
+        setCanvasEndpoint(activeConnection.endpoint);
       } catch (error) {
         setActionError(toErrorMessage(error, t("comfy.canvasOpenFailed")));
       } finally {
@@ -216,12 +222,88 @@ export function ComfyWorkspace({
     try {
       await fetchJson("/api/comfy/canvas/close", { method: "POST", body: "{}" });
       setCanvasOpen(false);
+      setCanvasEndpoint(null);
     } catch (error) {
       setActionError(toErrorMessage(error, t("comfy.canvasCloseFailed")));
     } finally {
       setCanvasBusy(false);
     }
   }, [t]);
+
+  // Reconcile UI state with the native canvas window's reality: hydrate the
+  // open flag on mount (a fresh page load starts blind), notice a window the
+  // user closed directly, and — the drift the review flagged — retarget the
+  // window when it is attached to a different server than the active connection,
+  // or close it when that server was deleted. Server truth (open + bound
+  // endpoint) comes from /api/comfy/canvas/status.
+  const reconcileCanvas = useCallback(async () => {
+    let statusOpen = false;
+    let statusEndpoint: string | null = null;
+    try {
+      const result = await fetchJson<{ open: boolean; endpoint: string | null }>(
+        "/api/comfy/canvas/status",
+        { cache: "no-store" },
+      );
+      statusOpen = result.open;
+      statusEndpoint = result.endpoint;
+    } catch {
+      // Transient bridge hiccup — keep the last known state.
+      return;
+    }
+    setCanvasOpen(statusOpen);
+    setCanvasEndpoint(statusEndpoint);
+    if (!statusOpen) return;
+    // Read the authoritative connection list here (not component state, which may
+    // lag a just-completed mutation) so a delete/edit is reflected immediately.
+    let current: ComfyConnectionState;
+    try {
+      current = await fetchJson<ComfyConnectionState>("/api/comfy/connections", {
+        cache: "no-store",
+      });
+    } catch {
+      return;
+    }
+    const active =
+      current.connections.find((connection) => connection.id === current.activeConnectionId) ??
+      current.connections[0];
+    if (!active) return;
+    // Canvas is attached to a server that no longer exists → close it.
+    if (
+      statusEndpoint &&
+      !current.connections.some((connection) => connection.endpoint === statusEndpoint)
+    ) {
+      await closeCanvas();
+      return;
+    }
+    // Canvas drifted from the active connection → retarget it atomically.
+    if (statusEndpoint !== active.endpoint) {
+      try {
+        await fetchJson("/api/comfy/canvas/open", {
+          method: "POST",
+          body: JSON.stringify({ id: active.id }),
+        });
+        setCanvasEndpoint(active.endpoint);
+      } catch (error) {
+        setActionError(toErrorMessage(error, t("comfy.canvasOpenFailed")));
+      }
+    }
+  }, [closeCanvas, t]);
+
+  // Hydrate on mount and poll slowly so a directly-closed window is noticed.
+  // The initial kick is deferred off the effect body (async boundary) so the
+  // status-driven setState is not a synchronous cascade render.
+  useEffect(() => {
+    const kickoff = window.setTimeout(() => {
+      void reconcileCanvas();
+    }, 0);
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === "visible") void reconcileCanvas();
+    }, 5_000);
+    return () => {
+      window.clearTimeout(kickoff);
+      window.clearInterval(interval);
+    };
+  }, [reconcileCanvas]);
 
   const handleActivate = useCallback(
     async (id: string) => {
@@ -232,19 +314,16 @@ export function ComfyWorkspace({
           body: JSON.stringify({ id }),
         });
         await refreshState();
-        // An open canvas follows the newly activated server: the bridge
-        // retargets its relay and navigates the window without a manual reload.
-        if (canvasOpen) {
-          await fetchJson("/api/comfy/canvas/open", {
-            method: "POST",
-            body: JSON.stringify({ id }),
-          });
-        }
+        // An open canvas follows the newly activated server. Reconcile against
+        // the window's real state rather than a mount-local flag, so activation
+        // after a remount (flag still false) can't strand the canvas on the
+        // previous server.
+        await reconcileCanvas();
       } catch (error) {
         setActionError(toErrorMessage(error, t("comfy.activateFailed")));
       }
     },
-    [refreshState, canvasOpen, t],
+    [refreshState, reconcileCanvas, t],
   );
 
   const handleSync = useCallback(async () => {
@@ -316,6 +395,10 @@ export function ComfyWorkspace({
 
   useEffect(() => {
     if (!canvasOpen || !activeConnectionId || !runningStudioJob) return;
+    // Only push a job onto the canvas when the window is actually attached to the
+    // active connection — otherwise a drifted canvas would load this server's
+    // workflow onto a different machine.
+    if (canvasEndpoint !== activeEndpoint) return;
     if (loadedJobsRef.current.connectionId !== activeConnectionId) {
       loadedJobsRef.current = { connectionId: activeConnectionId, ids: new Set() };
     }
@@ -325,7 +408,7 @@ export function ComfyWorkspace({
       method: "POST",
       body: JSON.stringify({ workflow: runningStudioJob.workflow }),
     }).catch(() => setActionError(t("comfy.canvasLoadFailed")));
-  }, [canvasOpen, activeConnectionId, runningStudioJob, t]);
+  }, [canvasOpen, canvasEndpoint, activeEndpoint, activeConnectionId, runningStudioJob, t]);
 
   const statusBadgeVariant =
     displayStatus === "online"
@@ -504,7 +587,12 @@ export function ComfyWorkspace({
           open={managerOpen}
           onOpenChange={setManagerOpen}
           state={state}
-          onChanged={refreshState}
+          onChanged={async () => {
+            await refreshState();
+            // An edited endpoint or a deleted connection must re-point or close
+            // an open canvas rather than leave it on stale server state.
+            await reconcileCanvas();
+          }}
           onActivate={handleActivate}
         />
       ) : null}

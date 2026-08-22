@@ -33,3 +33,36 @@ export async function loadWorkflowOnCanvas(
     });
   }
 }
+
+/** One literal widget-value edit applied on an existing live frontend node. */
+export interface CanvasWidgetEdit {
+  nodeId: string;
+  name: string;
+  value: string | number | boolean;
+}
+
+/**
+ * Apply literal widget-value edits directly on the live frontend graph so node
+ * positions, groups, and untouched widget state are preserved (reloading the
+ * API-format graph would rebuild the layout). The frontend resolves each node by
+ * id and each field by widget name, surfacing an unknown node/field as an error
+ * here rather than silently dropping the edit.
+ */
+export async function applyWidgetEditsOnCanvas(
+  bridge: DesktopBridge,
+  edits: CanvasWidgetEdit[],
+): Promise<void> {
+  const response: NextResponse = await proxyToBridge(bridge, "/comfy-canvas-apply-edits", {
+    method: "POST",
+    body: JSON.stringify({ edits }),
+    timeoutMs: 8_000,
+  });
+  if (!response.ok) {
+    throw new ApiError({
+      status: 502,
+      code: "canvas_edit_failed",
+      message: "The ComfyUI canvas window did not accept the edit.",
+      retryable: true,
+    });
+  }
+}

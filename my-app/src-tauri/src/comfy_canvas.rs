@@ -602,6 +602,43 @@ pub(crate) fn comfy_canvas_load(workflow: &serde_json::Value) -> Result<(), Stri
     }
 }
 
+/// Apply literal widget-value edits to the live frontend graph in place via the
+/// injected frame agent (`window.__luneryComfyHost.applyWidgetEdits`). Unlike
+/// `comfy_canvas_load` this preserves node positions, groups, and untouched
+/// widget state. applyWidgetEdits is synchronous, so its return value already
+/// carries the outcome; an "error" result is expanded with the recorded message.
+pub(crate) fn comfy_canvas_apply_edits(edits: &serde_json::Value) -> Result<(), String> {
+    let app = crate::bridge_app_handle().ok_or_else(|| "Desktop shell is not ready".to_string())?;
+    let payload = serde_json::to_string(edits)
+        .map_err(|err| format!("Could not serialize the edits: {err}"))?;
+    let apply = format!(
+        "(function(){{var h=window.__luneryComfyHost;if(!h||typeof h.applyWidgetEdits!=='function'){{window.__luneryComfyEdit={{status:'agent-missing'}};return 'agent-missing';}}try{{return h.applyWidgetEdits({payload});}}catch(err){{window.__luneryComfyEdit={{status:'error',message:(err&&err.message)?String(err.message):'edit-failed'}};return 'error';}}}})()"
+    );
+    let result = eval_canvas_string(&app, apply, Duration::from_secs(5))?;
+    match result.trim().trim_matches('"') {
+        "ok" => Ok(()),
+        "agent-missing" => {
+            Err("The ComfyUI canvas window is not ready to receive the edit.".to_string())
+        }
+        _ => {
+            // "error" (or an unexpected value) — surface the recorded reason.
+            let read = "JSON.stringify(window.__luneryComfyEdit||{status:'unknown'})".to_string();
+            let raw = eval_canvas_string(&app, read, Duration::from_secs(3))?;
+            let inner = serde_json::from_str::<String>(&raw).unwrap_or_else(|_| raw.clone());
+            let message = serde_json::from_str::<serde_json::Value>(&inner)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "edit-failed".to_string());
+            Err(format!("The canvas rejected the edit: {message}"))
+        }
+    }
+}
+
 /// Ask the canvas window's frame agent to serialize the live graph and beacon
 /// it to the Studio server (`/api/comfy/canvas/report`). The beacon itself is
 /// asynchronous — callers poll the report cache for the fresh snapshot.
